@@ -9,7 +9,7 @@ MapAnything model class defined using UniCeption modules.
 
 import warnings
 from functools import partial
-from typing import Any, Callable, Dict, List, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -36,7 +36,10 @@ from uniception.models.info_sharing.alternating_attention_transformer import (
     MultiViewAlternatingAttentionTransformer,
     MultiViewAlternatingAttentionTransformerIFR,
 )
-from uniception.models.info_sharing.base import MultiViewTransformerInput
+from uniception.models.info_sharing.base import (
+    MultiViewTransformerInput,
+    MultiViewTransformerOutput,
+)
 from uniception.models.info_sharing.cross_attention_transformer import (
     MultiViewCrossAttentionTransformer,
     MultiViewCrossAttentionTransformerIFR,
@@ -100,6 +103,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         load_specific_pretrained_submodules: bool = False,
         specific_pretrained_submodules: list = None,
         torch_hub_force_reload: bool = False,
+        store_info_sharing_intermediate_features: bool = False,
+        info_sharing_storage_device: Optional[Union[str, torch.device]] = None,
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -130,6 +135,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self.load_specific_pretrained_submodules = load_specific_pretrained_submodules
         self.specific_pretrained_submodules = specific_pretrained_submodules
         self.torch_hub_force_reload = torch_hub_force_reload
+        self.store_info_sharing_intermediate_features = (
+            store_info_sharing_intermediate_features
+        )
+        self.info_sharing_storage_device = info_sharing_storage_device
+        self._stored_info_sharing_features: Optional[Dict[str, Any]] = None
         self.class_init_args = {
             "name": self.name,
             "encoder_config": self.encoder_config,
@@ -140,6 +150,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             "load_specific_pretrained_submodules": self.load_specific_pretrained_submodules,
             "specific_pretrained_submodules": self.specific_pretrained_submodules,
             "torch_hub_force_reload": self.torch_hub_force_reload,
+            "store_info_sharing_intermediate_features": self.store_info_sharing_intermediate_features,
+            "info_sharing_storage_device": self.info_sharing_storage_device,
         }
 
         # Get relevant parameters from the configs
@@ -314,6 +326,16 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         else:
             raise ValueError(
                 f"Invalid info_sharing_return_type: {self.info_sharing_return_type}. Valid options: ['no_intermediate_features', 'intermediate_features']"
+            )
+
+        if (
+            self.store_info_sharing_intermediate_features
+            and self.info_sharing_return_type != "intermediate_features"
+        ):
+            warnings.warn(
+                "store_info_sharing_intermediate_features=True but info_sharing_return_type is not 'intermediate_features'. "
+                "Only the final information sharing features will be captured.",
+                stacklevel=2,
             )
 
     def _initialize_prediction_heads(self, pred_head_config):
@@ -1501,6 +1523,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         Returns:
             List[dict]: A list containing the final outputs for all N views.
+
+        Notes:
+            When ``store_info_sharing_intermediate_features`` is enabled, the final and
+            intermediate multi-view transformer features from this forward pass can be
+            retrieved using :meth:`get_info_sharing_intermediate_features`.
         """
         # Get input shape of the images, number of views, and batch size per view
         batch_size_per_view, _, height, width = views[0]["img"].shape
@@ -1532,6 +1559,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             features=all_encoder_features_across_views,
             additional_input_tokens=input_scale_token,
         )
+        intermediate_info_sharing_multi_view_feat: Optional[
+            List[MultiViewTransformerOutput]
+        ] = None
         if self.info_sharing_return_type == "no_intermediate_features":
             final_info_sharing_multi_view_feat = self.info_sharing(info_sharing_input)
         elif self.info_sharing_return_type == "intermediate_features":
@@ -1539,6 +1569,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 final_info_sharing_multi_view_feat,
                 intermediate_info_sharing_multi_view_feat,
             ) = self.info_sharing(info_sharing_input)
+
+        if self.store_info_sharing_intermediate_features:
+            self._stored_info_sharing_features = self._capture_info_sharing_features(
+                final_info_sharing_multi_view_feat,
+                intermediate_info_sharing_multi_view_feat,
+            )
+        else:
+            self._stored_info_sharing_features = None
 
         if self.pred_head_type == "linear":
             # Stack the features for all views
@@ -1906,6 +1944,70 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
 
         return res
+
+    def _clone_tensor_for_storage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Detach, clone, and optionally move a tensor for intermediate storage."""
+
+        clone = tensor.detach().clone()
+        target_device = self.info_sharing_storage_device
+        if target_device is not None:
+            try:
+                clone = clone.to(target_device)
+            except (RuntimeError, ValueError) as exc:
+                warnings.warn(
+                    f"Failed to move stored info sharing tensor to '{target_device}': {exc}. Keeping on original device.",
+                    stacklevel=2,
+                )
+        return clone
+
+    def _clone_multi_view_output(
+        self, output: MultiViewTransformerOutput
+    ) -> MultiViewTransformerOutput:
+        """Create a storage-friendly copy of a ``MultiViewTransformerOutput``."""
+
+        cloned_features = [
+            self._clone_tensor_for_storage(feature) for feature in output.features
+        ]
+        cloned_additional_tokens = (
+            self._clone_tensor_for_storage(output.additional_token_features)
+            if output.additional_token_features is not None
+            else None
+        )
+        return MultiViewTransformerOutput(
+            features=cloned_features,
+            additional_token_features=cloned_additional_tokens,
+        )
+
+    def _capture_info_sharing_features(
+        self,
+        final_output: MultiViewTransformerOutput,
+        intermediate_outputs: Optional[List[MultiViewTransformerOutput]],
+    ) -> Dict[str, Any]:
+        """Clone information sharing outputs for later inspection."""
+
+        stored: Dict[str, Any] = {
+            "return_type": self.info_sharing_return_type,
+            "info_sharing_type": self.info_sharing_type,
+            "final": self._clone_multi_view_output(final_output),
+        }
+
+        if intermediate_outputs is not None:
+            stored["intermediate"] = [
+                self._clone_multi_view_output(output)
+                for output in intermediate_outputs
+            ]
+        else:
+            stored["intermediate"] = None
+
+        return stored
+
+    def get_info_sharing_intermediate_features(self, clear: bool = False):
+        """Return the cached information sharing features captured during ``forward``."""
+
+        stored = self._stored_info_sharing_features
+        if clear:
+            self._stored_info_sharing_features = None
+        return stored
 
     def _configure_geometric_input_config(
         self,
