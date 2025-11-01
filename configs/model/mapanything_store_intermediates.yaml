@@ -1,3 +1,5 @@
+# MapAnything configuration that enables caching alternating-attention transformer features
+# during inference. Derived from the default mapanything config with storage toggles enabled.
 defaults:
   - default
   - encoder: dinov2_large
@@ -5,18 +7,14 @@ defaults:
   - pred_head: dpt_pose_scale
   - task: images_only
 
-# String for model factory
 model_str: "mapanything"
-# Model config
 model_config:
   name: "mapanything"
   encoder_config: ${model.encoder}
   info_sharing_config: ${model.info_sharing}
   pred_head_config: ${model.pred_head}
   geometric_input_config: ${model.task}
-  # Toggle caching of alternating-attention features from MapAnything's info-sharing transformer.
-  store_info_sharing_intermediate_features: false
-  # Optional device where cached info-sharing tensors should be moved (e.g., "cpu").
-  info_sharing_storage_device: null
-# Image Normalization Type
+  store_info_sharing_intermediate_features: true
+  info_sharing_storage_device: "cpu"
+
 data_norm_type: ${model.encoder.data_norm_type}

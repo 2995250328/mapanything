@@ -165,6 +165,32 @@ for i, pred in enumerate(predictions):
     img_no_norm = pred["img_no_norm"]         # Denormalized input images for visualization (B, H, W, 3)
 ```
 
+### Capturing Alternating-Attention Features
+
+MapAnything can optionally cache the alternating-attention (AA) transformer tensors
+emitted during a forward pass. Enable the storage flag either directly when
+instantiating the model or by selecting the dedicated Hydra config
+`model=mapanything_store_intermediates`:
+
+```python
+model = MapAnything.from_pretrained(
+    "facebook/map-anything",
+    store_info_sharing_intermediate_features=True,
+    info_sharing_storage_device="cpu",  # or any valid torch.device string
+).to(device)
+
+predictions = model.infer(views)
+
+# Retrieve (and optionally clear) the cached AA features for inspection or export.
+aa_cache = model.get_info_sharing_intermediate_features(clear=True)
+torch.save(aa_cache, "aa_features.pt")
+```
+
+When using Hydra-based entry points (e.g., the benchmarking scripts), select the
+`mapa_24v_store_intermediates.sh` helper which loads the
+`configs/model/mapanything_store_intermediates.yaml` preset to capture the same
+set of AA features automatically.
+
 ### Multi-Modal Inference
 
 MapAnything supports flexible combinations of geometric inputs for enhanced metric reconstruction. Steps to try it out:
