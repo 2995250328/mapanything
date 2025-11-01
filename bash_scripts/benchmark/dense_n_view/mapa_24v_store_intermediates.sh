@@ -26,7 +26,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_views=$num_views \
         batch_size=$batch_size \
         model=mapanything_store_intermediates \
-        model/task=images_only \
+        model/task=images_and_full_geometry \
         model.encoder.uses_torch_hub=True \
         model.pretrained="${root_pretrained_checkpoints_dir}/facebook_map-anything.pth" \
         +model.memory_efficient_inference=True \

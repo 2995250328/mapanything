@@ -189,7 +189,11 @@ torch.save(aa_cache, "aa_features.pt")
 When using Hydra-based entry points (e.g., the benchmarking scripts), select the
 `mapa_24v_store_intermediates.sh` helper which loads the
 `configs/model/mapanything_store_intermediates.yaml` preset to capture the same
-set of AA features automatically.
+set of AA features automatically. The preset now pins the task configuration to
+`model/task=images_and_full_geometry` so that images are always paired with ray
+directions, depths, and camera poses (including their metric scale factors) when
+AA tensors are recorded. Apply the same override if you compose a custom Hydra
+run.
 
 ### Multi-Modal Inference
 

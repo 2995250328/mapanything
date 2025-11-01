@@ -5,7 +5,7 @@ defaults:
   - encoder: dinov2_large
   - info_sharing: aat_ifr_24_layers
   - pred_head: dpt_pose_scale
-  - task: images_only
+  - task: images_and_full_geometry
 
 model_str: "mapanything"
 model_config:
