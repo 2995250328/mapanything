@@ -23,6 +23,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         depth=24,
         num_heads=16,
         intermediate_layer_idx=[4, 11, 17, 23],
+        store_intermediate_features: bool = False,
+        intermediate_storage_device: str = "cpu",
     ):
         super().__init__()
 
@@ -32,6 +34,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
+            store_intermediate_features=store_intermediate_features,
+            intermediate_storage_device=intermediate_storage_device,
         )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(
@@ -49,6 +53,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             intermediate_layer_idx=intermediate_layer_idx,
         )
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+
+    def get_intermediate_features(self):
+        """Return the alternating-attention intermediates from the last forward pass."""
+
+        return self.aggregator.get_intermediate_features()
 
     def forward(
         self,

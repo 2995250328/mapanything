@@ -31,6 +31,8 @@ ALLOWED_VIEW_KEYS = {
     "ray_directions",  # Optional - ray directions in camera frame
     "intrinsics",  # Optional - pinhole camera intrinsics (conflicts with ray_directions)
     "camera_poses",  # Optional - camera poses
+    "extrinsics",  # Optional - camera extrinsics (cam2world or world2cam)
+    "extrinsics_type",  # Optional - descriptor for extrinsics convention
     "is_metric_scale",  # Optional - whether inputs are metric scale
     "true_shape",  # Optional - original image shape
     "idx",  # Optional - index of the view
@@ -41,7 +43,8 @@ REQUIRED_KEYS = {"img", "data_norm_type"}
 
 # Define conflicting keys that cannot be used together
 CONFLICTING_KEYS = [
-    ("intrinsics", "ray_directions")  # Both represent camera projection
+    ("intrinsics", "ray_directions"),  # Both represent camera projection
+    ("camera_poses", "extrinsics"),
 ]
 
 
@@ -184,8 +187,13 @@ def validate_input_views_for_inference(
                 )
 
         # Track views with camera poses
-        if "camera_poses" in provided_keys:
+        if "camera_poses" in provided_keys or "extrinsics" in provided_keys:
             views_with_poses.append(view_idx)
+
+        if "extrinsics_type" in provided_keys and "extrinsics" not in provided_keys:
+            raise ValueError(
+                f"View {view_idx} provides 'extrinsics_type' without 'extrinsics'."
+            )
 
     # Cross-view constraint: If any view has camera_poses, view 0 must have them too
     if views_with_poses and 0 not in views_with_poses:
@@ -207,7 +215,7 @@ def preprocess_input_views_for_inference(
     The following steps are performed:
     1. Convert intrinsics to ray directions when required. If ray directions are already provided, unit normalize them.
     2. Convert depth_z to depth_along_ray
-    3. Convert camera_poses to the expected input keys (camera_pose_quats and camera_pose_trans)
+    3. Convert camera_poses / extrinsics to the expected input keys (camera_pose_quats and camera_pose_trans)
     4. Default is_metric_scale to True when not provided
 
     Args:
@@ -250,7 +258,7 @@ def preprocess_input_views_for_inference(
             processed_view["depth_along_ray"] = depth_along_ray
             del processed_view["depth_z"]
 
-        # Step 3: Convert camera_poses to expected input keys
+        # Step 3: Convert camera_poses / extrinsics to expected input keys
         if "camera_poses" in view:
             camera_poses = view["camera_poses"]
             if isinstance(camera_poses, tuple) and len(camera_poses) == 2:
@@ -269,6 +277,46 @@ def preprocess_input_views_for_inference(
                     f"or a tensor of (B, 4, 4) transformation matrices."
                 )
             del processed_view["camera_poses"]
+        elif "extrinsics" in view:
+            extrinsics = view["extrinsics"]
+            extrinsics = torch.as_tensor(
+                extrinsics,
+                device=view["img"].device,
+                dtype=view["img"].dtype,
+            )
+
+            if extrinsics.ndim < 2 or extrinsics.shape[-2] not in (3, 4):
+                raise ValueError(
+                    f"View {view_idx}: extrinsics must have shape (..., 3, 4) or (..., 4, 4)."
+                )
+
+            if extrinsics.ndim == 2:
+                extrinsics = extrinsics.unsqueeze(0)
+
+            if extrinsics.shape[-2:] == (3, 4):
+                last_row = torch.zeros(*extrinsics.shape[:-2], 1, 4, device=extrinsics.device, dtype=extrinsics.dtype)
+                last_row[..., 0, 3] = 1.0
+                extrinsics = torch.cat([extrinsics, last_row], dim=-2)
+
+            extrinsics_type = view.get("extrinsics_type", "cam2world")
+            extrinsics_type = str(extrinsics_type).lower()
+            if extrinsics_type in {"world_to_camera", "world2camera", "w2c"}:
+                pose_mats = torch.linalg.inv(extrinsics)
+            elif extrinsics_type in {"cam2world", "camera_to_world", "c2w"}:
+                pose_mats = extrinsics
+            else:
+                raise ValueError(
+                    f"View {view_idx}: Unknown extrinsics_type '{extrinsics_type}'. "
+                    "Supported values: 'cam2world', 'camera_to_world', 'c2w', 'world_to_camera', 'world2camera', 'w2c'."
+                )
+
+            rotation_matrices = pose_mats[:, :3, :3]
+            translation_vectors = pose_mats[:, :3, 3]
+            quats = rotation_matrix_to_quaternion(rotation_matrices)
+            processed_view["camera_pose_quats"] = quats
+            processed_view["camera_pose_trans"] = translation_vectors
+            del processed_view["extrinsics"]
+            processed_view.pop("extrinsics_type", None)
 
         # Step 4: Default is_metric_scale to True when not provided
         if "is_metric_scale" not in processed_view:

@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -47,6 +47,10 @@ class Aggregator(nn.Module):
         qk_norm (bool): Whether to apply QK normalization.
         rope_freq (int): Base frequency for rotary embedding. -1 to disable.
         init_values (float): Init scale for layer scale.
+        store_intermediate_features (bool): Whether to retain intermediate tokens from each alternating-attention
+            block. When True, call :meth:`get_intermediate_features` after ``forward`` to retrieve them. (default: False)
+        intermediate_storage_device (str): Optional device string (e.g., "cpu") where the stored intermediate
+            features should be moved. If ``None`` the tensors are cloned on their current device. (default: None)
     """
 
     def __init__(
@@ -68,6 +72,8 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        store_intermediate_features: bool = False,
+        intermediate_storage_device: Optional[Union[str, torch.device]] = None,
     ):
         super().__init__()
 
@@ -119,6 +125,9 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.store_intermediate_features = store_intermediate_features
+        self.intermediate_storage_device = intermediate_storage_device
+        self._stored_intermediate_features = None
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -286,8 +295,15 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        stored_frame_intermediates = [] if self.store_intermediate_features else None
+        stored_global_intermediates = [] if self.store_intermediate_features else None
+        stored_concat_intermediates = [] if self.store_intermediate_features else None
+        self._stored_intermediate_features = None
 
         for _ in range(self.aa_block_num):
+            frame_intermediates = None
+            global_intermediates = None
+
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = (
@@ -304,17 +320,53 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            for i in range(len(frame_intermediates)):
+            if frame_intermediates is None or global_intermediates is None:
+                raise ValueError(
+                    "aa_order must include both 'frame' and 'global' attention blocks"
+                )
+
+            if len(frame_intermediates) != len(global_intermediates):
+                raise RuntimeError(
+                    "Mismatched number of frame and global intermediates after attention"
+                )
+
+            for frame_feat_tokens, global_feat_tokens in zip(
+                frame_intermediates, global_intermediates
+            ):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat(
-                    [frame_intermediates[i], global_intermediates[i]], dim=-1
+                    [frame_feat_tokens, global_feat_tokens], dim=-1
                 )
                 output_list.append(concat_inter)
 
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+                if self.store_intermediate_features:
+                    target_device = self.intermediate_storage_device
+                    frame_feat = frame_feat_tokens.detach().clone()
+                    global_feat = global_feat_tokens.detach().clone()
+                    concat_feat = concat_inter.detach().clone()
+
+                    if target_device is not None:
+                        frame_feat = frame_feat.to(target_device)
+                        global_feat = global_feat.to(target_device)
+                        concat_feat = concat_feat.to(target_device)
+
+                    stored_frame_intermediates.append(frame_feat)
+                    stored_global_intermediates.append(global_feat)
+                    stored_concat_intermediates.append(concat_feat)
+
+        if self.store_intermediate_features:
+            self._stored_intermediate_features = {
+                "frame": stored_frame_intermediates,
+                "global": stored_global_intermediates,
+                "concatenated": stored_concat_intermediates,
+            }
+
         return output_list, self.patch_start_idx
+
+    def get_intermediate_features(self):
+        """Return the intermediate features captured during the last forward pass."""
+
+        return self._stored_intermediate_features
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """

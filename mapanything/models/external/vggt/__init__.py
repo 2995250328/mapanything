@@ -32,6 +32,8 @@ class VGGTWrapper(torch.nn.Module):
         intermediate_layer_idx=[4, 11, 17, 23],
         load_custom_ckpt=False,
         custom_ckpt_path=None,
+        store_intermediate_features=False,
+        intermediate_storage_device="cpu",
     ):
         super().__init__()
         self.name = name
@@ -59,6 +61,8 @@ class VGGTWrapper(torch.nn.Module):
                 depth=depth,
                 num_heads=num_heads,
                 intermediate_layer_idx=intermediate_layer_idx,
+                store_intermediate_features=store_intermediate_features,
+                intermediate_storage_device=intermediate_storage_device,
             )
 
         # Get the dtype for VGGT inference

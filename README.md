@@ -352,11 +352,12 @@ predictions = model.infer(
 - `intrinsics` OR `ray_directions`: Camera calibration (cannot provide both since they are redundant)
 - `depth_z`: Z-depth maps (requires calibration info)
 - `camera_poses`: OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world poses as 4×4 matrices or (quaternions, translations)
+- `extrinsics`: Camera extrinsics as 3×4 or 4×4 matrices. Use `extrinsics_type` to specify whether matrices are `cam2world` (default) or `world_to_camera`/`w2c`.
 - `is_metric_scale`: Whether inputs are in metric scale
 
 **Key constraints for `model.infer`:**
 - If `depth_z` is provided, must also provide `intrinsics` or `ray_directions`
-- If any view has `camera_poses`, the first view (reference) must also have them
+- If any view has `camera_poses` or `extrinsics`, the first view (reference) must also have them
 - Cannot provide both `intrinsics` and `ray_directions` simultaneously (they are redundant)
 
 The above constraints are enforced in the inference API. However, if desired, the underlying `model.forward` can support any arbitrary combination of inputs (a total of 64 configurations; without counting per view flexibility).
