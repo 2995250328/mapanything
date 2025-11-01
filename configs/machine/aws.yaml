@@ -1,0 +1,28 @@
+defaults:
+  - default
+
+# 根目录：存放所有数据集
+# 例如：/home/xwh/mapanything_project/datasets
+root_data_dir: "/mnt/storage/xwh/mapanything-dataset/wai_data"
+
+# 数据集元数据目录
+# 存放预处理过程中生成的元数据，例如共视性矩阵等
+# 例如：/home/xwh/mapanything_project/metadata
+mapanything_dataset_metadata_dir: "/mnt/storage/xwh/map-anything/mapanything_dataset_metadata"
+
+# 存放自定义模型的预训练权重的根目录
+# 例如：/home/xwh/mapanything_project/pretrained_checkpoints
+root_pretrained_checkpoints_dir: "/home/xwh/project/map-anything/checkpoints"
+
+# 存放所有实验输出（日志、模型权重等）的根目录
+# 这是最重要的路径，之前的错误就是因为它引起的
+# 例如：/home/xwh/mapanything_project/experiments
+root_experiments_dir: "/home/xwh/project/map-anything-experiments"
+
+# 存放 UniCeption 预训练权重的根目录
+# 例如：/home/xwh/mapanything_project/uniception_checkpoints
+root_uniception_pretrained_checkpoints_dir: "/home/xwh/project/map-anything/uniception_checkpoints"
+
+# 存放外部评测数据集的根目录
+# 例如：/home/xwh/mapanything_project/external_benchmark_data
+external_benchmark_data_root_data_dir: "/mnt/storage/xwh/mapanything-dataset/wai_data"
