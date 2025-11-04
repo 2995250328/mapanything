@@ -2053,6 +2053,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
     def _create_info_sharing_run_directory(self) -> Optional[Path]:
         if self.info_sharing_storage_path is None:
+            self._info_sharing_storage_run_dir = None
             return None
 
         base_dir = self.info_sharing_storage_path
