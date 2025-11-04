@@ -165,6 +165,42 @@ for i, pred in enumerate(predictions):
     img_no_norm = pred["img_no_norm"]         # Denormalized input images for visualization (B, H, W, 3)
 ```
 
+### Capturing Alternating-Attention Features
+
+MapAnything can optionally cache the alternating-attention (AA) transformer tensors
+emitted during a forward pass. Enable the storage flag either directly when
+instantiating the model or by selecting the dedicated Hydra config
+`model=mapanything_store_intermediates`:
+
+```python
+from pathlib import Path
+
+model = MapAnything.from_pretrained(
+    "facebook/map-anything",
+    store_info_sharing_intermediate_features=True,
+    info_sharing_storage_path=Path("aa_feature_cache"),
+).to(device)
+
+predictions = model.infer(views)
+
+# Retrieve (and optionally clear) the cached AA metadata. When a storage path is
+# configured, each entry contains the file system locations of the serialized
+# tensors for every alternating-attention block.
+aa_cache = model.get_info_sharing_intermediate_features(clear=True)
+print(aa_cache["final"]["features"][0]["path"])
+```
+
+When using Hydra-based entry points (e.g., the benchmarking scripts), select the
+`mapa_24v_store_intermediates.sh` helper which loads the
+`configs/model/mapanything_store_intermediates.yaml` preset to capture the same
+set of AA features automatically. The preset now pins the task configuration to
+`model/task=images_and_full_geometry` so that images are always paired with ray
+directions, depths, and camera poses (including their metric scale factors) when
+AA tensors are recorded. It also sets `info_sharing.module_args.indices` to
+`[0, ..., depth-1]` so every alternating-attention block is persisted to disk via
+`info_sharing_storage_path`. Apply the same override if you compose a custom
+Hydra run.
+
 ### Multi-Modal Inference
 
 MapAnything supports flexible combinations of geometric inputs for enhanced metric reconstruction. Steps to try it out:
@@ -352,11 +388,12 @@ predictions = model.infer(
 - `intrinsics` OR `ray_directions`: Camera calibration (cannot provide both since they are redundant)
 - `depth_z`: Z-depth maps (requires calibration info)
 - `camera_poses`: OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world poses as 4×4 matrices or (quaternions, translations)
+- `extrinsics`: Camera extrinsics as 3×4 or 4×4 matrices. Use `extrinsics_type` to specify whether matrices are `cam2world` (default) or `world_to_camera`/`w2c`.
 - `is_metric_scale`: Whether inputs are in metric scale
 
 **Key constraints for `model.infer`:**
 - If `depth_z` is provided, must also provide `intrinsics` or `ray_directions`
-- If any view has `camera_poses`, the first view (reference) must also have them
+- If any view has `camera_poses` or `extrinsics`, the first view (reference) must also have them
 - Cannot provide both `intrinsics` and `ray_directions` simultaneously (they are redundant)
 
 The above constraints are enforced in the inference API. However, if desired, the underlying `model.forward` can support any arbitrary combination of inputs (a total of 64 configurations; without counting per view flexibility).
