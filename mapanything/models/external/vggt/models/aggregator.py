@@ -5,6 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -51,6 +54,8 @@ class Aggregator(nn.Module):
             block. When True, call :meth:`get_intermediate_features` after ``forward`` to retrieve them. (default: False)
         intermediate_storage_device (str): Optional device string (e.g., "cpu") where the stored intermediate
             features should be moved. If ``None`` the tensors are cloned on their current device. (default: None)
+        intermediate_storage_path (str or Path): Optional directory where intermediate tensors should be serialized
+            to disk. When provided, stored metadata will reference files on disk instead of in-memory tensors.
     """
 
     def __init__(
@@ -74,6 +79,7 @@ class Aggregator(nn.Module):
         init_values=0.01,
         store_intermediate_features: bool = False,
         intermediate_storage_device: Optional[Union[str, torch.device]] = None,
+        intermediate_storage_path: Optional[Union[str, Path]] = None,
     ):
         super().__init__()
 
@@ -127,6 +133,12 @@ class Aggregator(nn.Module):
         self.aa_block_size = aa_block_size
         self.store_intermediate_features = store_intermediate_features
         self.intermediate_storage_device = intermediate_storage_device
+        self.intermediate_storage_path = (
+            Path(intermediate_storage_path).expanduser()
+            if intermediate_storage_path is not None
+            else None
+        )
+        self._storage_run_uuid: Optional[str] = None
         self._stored_intermediate_features = None
 
         # Validate that depth is divisible by aa_block_size
@@ -298,7 +310,15 @@ class Aggregator(nn.Module):
         stored_frame_intermediates = [] if self.store_intermediate_features else None
         stored_global_intermediates = [] if self.store_intermediate_features else None
         stored_concat_intermediates = [] if self.store_intermediate_features else None
+        storage_run_dir = (
+            self._prepare_storage_run_directory()
+            if self.store_intermediate_features
+            and self.intermediate_storage_path is not None
+            else None
+        )
         self._stored_intermediate_features = None
+
+        block_counter = 0
 
         for _ in range(self.aa_block_num):
             frame_intermediates = None
@@ -341,18 +361,43 @@ class Aggregator(nn.Module):
 
                 if self.store_intermediate_features:
                     target_device = self.intermediate_storage_device
-                    frame_feat = frame_feat_tokens.detach().clone()
-                    global_feat = global_feat_tokens.detach().clone()
-                    concat_feat = concat_inter.detach().clone()
+                    if storage_run_dir is not None:
+                        frame_meta = self._store_tensor_to_disk(
+                            frame_feat_tokens,
+                            storage_run_dir,
+                            block_counter,
+                            "frame",
+                        )
+                        global_meta = self._store_tensor_to_disk(
+                            global_feat_tokens,
+                            storage_run_dir,
+                            block_counter,
+                            "global",
+                        )
+                        concat_meta = self._store_tensor_to_disk(
+                            concat_inter,
+                            storage_run_dir,
+                            block_counter,
+                            "concatenated",
+                        )
+                    else:
+                        frame_feat = frame_feat_tokens.detach().clone()
+                        global_feat = global_feat_tokens.detach().clone()
+                        concat_feat = concat_inter.detach().clone()
 
-                    if target_device is not None:
-                        frame_feat = frame_feat.to(target_device)
-                        global_feat = global_feat.to(target_device)
-                        concat_feat = concat_feat.to(target_device)
+                        if target_device is not None:
+                            frame_feat = frame_feat.to(target_device)
+                            global_feat = global_feat.to(target_device)
+                            concat_feat = concat_feat.to(target_device)
 
-                    stored_frame_intermediates.append(frame_feat)
-                    stored_global_intermediates.append(global_feat)
-                    stored_concat_intermediates.append(concat_feat)
+                        frame_meta = frame_feat
+                        global_meta = global_feat
+                        concat_meta = concat_feat
+
+                    stored_frame_intermediates.append(frame_meta)
+                    stored_global_intermediates.append(global_meta)
+                    stored_concat_intermediates.append(concat_meta)
+                    block_counter += 1
 
         if self.store_intermediate_features:
             self._stored_intermediate_features = {
@@ -360,13 +405,54 @@ class Aggregator(nn.Module):
                 "global": stored_global_intermediates,
                 "concatenated": stored_concat_intermediates,
             }
+            if storage_run_dir is not None:
+                self._stored_intermediate_features["storage_directory"] = str(
+                    storage_run_dir
+                )
 
         return output_list, self.patch_start_idx
 
     def get_intermediate_features(self):
-        """Return the intermediate features captured during the last forward pass."""
+        """Return the intermediate features captured during the last forward pass.
+
+        When ``intermediate_storage_path`` is set the returned dictionary contains
+        file metadata (including ``storage_directory`` and per-block paths). If the
+        path is ``None`` the lists contain in-memory tensors.
+        """
 
         return self._stored_intermediate_features
+
+    def _prepare_storage_run_directory(self) -> Path:
+        base_dir = self.intermediate_storage_path
+        assert base_dir is not None
+        base_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = base_dir / (
+            datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            + f"_{uuid.uuid4().hex[:8]}"
+        )
+        run_dir.mkdir(parents=True, exist_ok=False)
+        self._storage_run_uuid = run_dir.name
+        return run_dir
+
+    def _store_tensor_to_disk(
+        self,
+        tensor: torch.Tensor,
+        run_dir: Path,
+        block_index: int,
+        kind: str,
+    ) -> dict:
+        block_dir = run_dir / f"block_{block_index:03d}"
+        block_dir.mkdir(parents=True, exist_ok=True)
+        file_path = block_dir / f"{kind}.pt"
+        tensor_to_save = tensor.detach().cpu()
+        torch.save(tensor_to_save, file_path)
+        return {
+            "path": str(file_path),
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "block_index": block_index,
+            "kind": kind,
+        }
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """

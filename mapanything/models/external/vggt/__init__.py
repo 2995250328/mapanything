@@ -34,6 +34,7 @@ class VGGTWrapper(torch.nn.Module):
         custom_ckpt_path=None,
         store_intermediate_features=False,
         intermediate_storage_device="cpu",
+        intermediate_storage_path=None,
     ):
         super().__init__()
         self.name = name
@@ -48,12 +49,19 @@ class VGGTWrapper(torch.nn.Module):
                 print("Loading facebook/VGGT-1B from huggingface cache ...")
                 self.model = VGGT.from_pretrained(
                     "facebook/VGGT-1B",
+                    store_intermediate_features=store_intermediate_features,
+                    intermediate_storage_device=intermediate_storage_device,
+                    intermediate_storage_path=intermediate_storage_path,
                 )
             else:
                 # Initialize the 1B VGGT model
                 print("Re-downloading facebook/VGGT-1B ...")
                 self.model = VGGT.from_pretrained(
-                    "facebook/VGGT-1B", force_download=True
+                    "facebook/VGGT-1B",
+                    force_download=True,
+                    store_intermediate_features=store_intermediate_features,
+                    intermediate_storage_device=intermediate_storage_device,
+                    intermediate_storage_path=intermediate_storage_path,
                 )
         else:
             # Load the VGGT class
@@ -63,6 +71,7 @@ class VGGTWrapper(torch.nn.Module):
                 intermediate_layer_idx=intermediate_layer_idx,
                 store_intermediate_features=store_intermediate_features,
                 intermediate_storage_device=intermediate_storage_device,
+                intermediate_storage_path=intermediate_storage_path,
             )
 
         # Get the dtype for VGGT inference

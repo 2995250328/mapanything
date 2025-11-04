@@ -15,6 +15,12 @@ model_config:
   pred_head_config: ${model.pred_head}
   geometric_input_config: ${model.task}
   store_info_sharing_intermediate_features: true
-  info_sharing_storage_device: "cpu"
+  info_sharing_storage_device: null
+  info_sharing_storage_path: "${hydra:run.dir}/aa_features"
+
+model:
+  info_sharing:
+    module_args:
+      indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 
 data_norm_type: ${model.encoder.data_norm_type}

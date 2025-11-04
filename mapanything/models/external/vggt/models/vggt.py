@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -25,6 +27,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         intermediate_layer_idx=[4, 11, 17, 23],
         store_intermediate_features: bool = False,
         intermediate_storage_device: str = "cpu",
+        intermediate_storage_path: Optional[str] = None,
     ):
         super().__init__()
 
@@ -36,6 +39,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             num_heads=num_heads,
             store_intermediate_features=store_intermediate_features,
             intermediate_storage_device=intermediate_storage_device,
+            intermediate_storage_path=intermediate_storage_path,
         )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(

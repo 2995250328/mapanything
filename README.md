@@ -173,17 +173,21 @@ instantiating the model or by selecting the dedicated Hydra config
 `model=mapanything_store_intermediates`:
 
 ```python
+from pathlib import Path
+
 model = MapAnything.from_pretrained(
     "facebook/map-anything",
     store_info_sharing_intermediate_features=True,
-    info_sharing_storage_device="cpu",  # or any valid torch.device string
+    info_sharing_storage_path=Path("aa_feature_cache"),
 ).to(device)
 
 predictions = model.infer(views)
 
-# Retrieve (and optionally clear) the cached AA features for inspection or export.
+# Retrieve (and optionally clear) the cached AA metadata. When a storage path is
+# configured, each entry contains the file system locations of the serialized
+# tensors for every alternating-attention block.
 aa_cache = model.get_info_sharing_intermediate_features(clear=True)
-torch.save(aa_cache, "aa_features.pt")
+print(aa_cache["final"]["features"][0]["path"])
 ```
 
 When using Hydra-based entry points (e.g., the benchmarking scripts), select the
@@ -192,8 +196,10 @@ When using Hydra-based entry points (e.g., the benchmarking scripts), select the
 set of AA features automatically. The preset now pins the task configuration to
 `model/task=images_and_full_geometry` so that images are always paired with ray
 directions, depths, and camera poses (including their metric scale factors) when
-AA tensors are recorded. Apply the same override if you compose a custom Hydra
-run.
+AA tensors are recorded. It also sets `info_sharing.module_args.indices` to
+`[0, ..., depth-1]` so every alternating-attention block is persisted to disk via
+`info_sharing_storage_path`. Apply the same override if you compose a custom
+Hydra run.
 
 ### Multi-Modal Inference
 

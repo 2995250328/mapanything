@@ -8,7 +8,10 @@ MapAnything model class defined using UniCeption modules.
 """
 
 import warnings
+from datetime import datetime
 from functools import partial
+from pathlib import Path
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
@@ -105,6 +108,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         torch_hub_force_reload: bool = False,
         store_info_sharing_intermediate_features: bool = False,
         info_sharing_storage_device: Optional[Union[str, torch.device]] = None,
+        info_sharing_storage_path: Optional[Union[str, Path]] = None,
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -122,6 +126,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             load_specific_pretrained_submodules (bool): Whether to load specific pretrained submodules. (default: False)
             specific_pretrained_submodules (list): List of specific pretrained submodules to load. Must be provided when load_specific_pretrained_submodules is True. (default: None)
             torch_hub_force_reload (bool): Whether to force reload the encoder from torch hub. (default: False)
+            store_info_sharing_intermediate_features (bool): Enable caching the info-sharing transformer's outputs. (default: False)
+            info_sharing_storage_device (str or torch.device, optional): Device to move cached tensors to when storing in memory. Ignored when ``info_sharing_storage_path`` is provided.
+            info_sharing_storage_path (str or Path, optional): Directory where cached info-sharing tensors should be serialized to disk. When set, cached metadata references saved files instead of in-memory tensors.
         """
         super().__init__()
 
@@ -139,6 +146,12 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             store_info_sharing_intermediate_features
         )
         self.info_sharing_storage_device = info_sharing_storage_device
+        self.info_sharing_storage_path = (
+            Path(info_sharing_storage_path).expanduser()
+            if info_sharing_storage_path is not None
+            else None
+        )
+        self._info_sharing_storage_run_dir: Optional[Path] = None
         self._stored_info_sharing_features: Optional[Dict[str, Any]] = None
         self.class_init_args = {
             "name": self.name,
@@ -152,6 +165,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             "torch_hub_force_reload": self.torch_hub_force_reload,
             "store_info_sharing_intermediate_features": self.store_info_sharing_intermediate_features,
             "info_sharing_storage_device": self.info_sharing_storage_device,
+            "info_sharing_storage_path": str(self.info_sharing_storage_path)
+            if self.info_sharing_storage_path is not None
+            else None,
         }
 
         # Get relevant parameters from the configs
@@ -1960,41 +1976,118 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 )
         return clone
 
-    def _clone_multi_view_output(
-        self, output: MultiViewTransformerOutput
-    ) -> MultiViewTransformerOutput:
-        """Create a storage-friendly copy of a ``MultiViewTransformerOutput``."""
+    def _write_tensor_to_disk(
+        self,
+        tensor: torch.Tensor,
+        run_dir: Path,
+        tag: str,
+        label: str,
+    ) -> Dict[str, Any]:
+        """Serialize a tensor to disk and return its metadata."""
 
-        cloned_features = [
-            self._clone_tensor_for_storage(feature) for feature in output.features
+        target_dir = run_dir / tag
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"{label}.pt"
+        tensor_to_save = tensor.detach().cpu()
+        torch.save(tensor_to_save, file_path)
+        return {
+            "path": str(file_path),
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "tag": tag,
+            "label": label,
+        }
+
+    def _serialize_multi_view_output(
+        self,
+        output: MultiViewTransformerOutput,
+        run_dir: Optional[Path],
+        tag: str,
+        block_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Convert a transformer output into stored metadata or tensors."""
+
+        block_tag = tag
+        if block_index is not None:
+            block_tag = f"{tag}_{block_index:03d}"
+
+        if run_dir is None:
+            return MultiViewTransformerOutput(
+                features=[
+                    self._clone_tensor_for_storage(feature)
+                    for feature in output.features
+                ],
+                additional_token_features=(
+                    self._clone_tensor_for_storage(
+                        output.additional_token_features
+                    )
+                    if output.additional_token_features is not None
+                    else None
+                ),
+            )
+
+        stored_features = [
+            self._write_tensor_to_disk(
+                feature, run_dir, block_tag, f"view_{view_idx:02d}"
+            )
+            for view_idx, feature in enumerate(output.features)
         ]
-        cloned_additional_tokens = (
-            self._clone_tensor_for_storage(output.additional_token_features)
+        stored_additional = (
+            self._write_tensor_to_disk(
+                output.additional_token_features,
+                run_dir,
+                block_tag,
+                "additional_tokens",
+            )
             if output.additional_token_features is not None
             else None
         )
-        return MultiViewTransformerOutput(
-            features=cloned_features,
-            additional_token_features=cloned_additional_tokens,
+
+        return {
+            "storage": "disk",
+            "tag": block_tag,
+            "block_index": block_index,
+            "features": stored_features,
+            "additional_token_features": stored_additional,
+        }
+
+    def _create_info_sharing_run_directory(self) -> Optional[Path]:
+        if self.info_sharing_storage_path is None:
+            return None
+
+        base_dir = self.info_sharing_storage_path
+        base_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = base_dir / (
+            datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            + f"_{uuid.uuid4().hex[:8]}"
         )
+        run_dir.mkdir(parents=True, exist_ok=False)
+        self._info_sharing_storage_run_dir = run_dir
+        return run_dir
 
     def _capture_info_sharing_features(
         self,
         final_output: MultiViewTransformerOutput,
         intermediate_outputs: Optional[List[MultiViewTransformerOutput]],
     ) -> Dict[str, Any]:
-        """Clone information sharing outputs for later inspection."""
+        """Clone or serialize information sharing outputs for later inspection."""
+
+        run_dir = self._create_info_sharing_run_directory()
 
         stored: Dict[str, Any] = {
             "return_type": self.info_sharing_return_type,
             "info_sharing_type": self.info_sharing_type,
-            "final": self._clone_multi_view_output(final_output),
+            "storage_mode": "disk" if run_dir is not None else "memory",
+            "storage_directory": str(run_dir) if run_dir is not None else None,
+            "final": self._serialize_multi_view_output(
+                final_output, run_dir, "final"
+            ),
         }
 
         if intermediate_outputs is not None:
             stored["intermediate"] = [
-                self._clone_multi_view_output(output)
-                for output in intermediate_outputs
+                self._serialize_multi_view_output(output, run_dir, "intermediate", idx)
+                for idx, output in enumerate(intermediate_outputs)
             ]
         else:
             stored["intermediate"] = None
@@ -2002,7 +2095,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         return stored
 
     def get_info_sharing_intermediate_features(self, clear: bool = False):
-        """Return the cached information sharing features captured during ``forward``."""
+        """Return the cached information sharing features captured during ``forward``.
+
+        When ``info_sharing_storage_path`` is set the returned dictionary contains
+        file metadata (including ``storage_directory`` and per-tensor paths) and the
+        ``storage_mode`` key is ``"disk"``. If the path is ``None`` the dictionary
+        stores ``MultiViewTransformerOutput`` instances and ``storage_mode`` is
+        ``"memory"``.
+        """
 
         stored = self._stored_info_sharing_features
         if clear:
