@@ -53,3 +53,8 @@ Use the provided python script `download_tav2_wb.py`.
 ## UnrealStereo4K
 Use the provided python script `download_unrealstereo4k.py`.
 **Source:** [UnrealStereo4K](https://github.com/fabiotosi92/SMD-Nets?tab=readme-ov-file#datasets)
+
+## 7Scenes
+Use the provided python script `download_7scenes.py` to grab the RGB-D sequences
+and clone the pseudo ground-truth repository.
+**Source:** [7Scenes](https://www.microsoft.com/en-us/research/project/rgb-d-dataset-7-scenes/)

@@ -1,0 +1,14 @@
+original_root: # path containing pgt_7scenes_* folders (e.g. /mnt/storage/xwh/7Scenes)
+root: # target path for wai-formatted 7Scenes data
+
+dataset_name: seven_scenes
+version: 0.1
+overwrite: True
+
+default_focal_length: 585.0
+image_width: 640
+image_height: 480
+invalid_depth_values: [0, 65535]
+
+scene_filters:
+  - process_state_not: [conversion, finished]

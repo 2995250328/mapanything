@@ -20,6 +20,7 @@ We also provide a HuggingFace dataset which contains the [pre-computed metadata]
 12. ✅ [Spring](https://spring-benchmark.org/)
 13. ✅ [TartanAirV2 Wide Baseline](https://uniflowmatch.github.io/)
 14. ✅ [UnrealStereo4K](https://github.com/fabiotosi92/SMD-Nets)
+15. ✅ [7Scenes](https://www.microsoft.com/en-us/research/project/rgb-d-dataset-7-scenes/)
 
 ## Download Instructions:
 
@@ -124,6 +125,37 @@ python -m wai_processing.scripts.covisibility \
 python -m wai_processing.scripts.run_moge \
           root="/fsx/xrtech/dryrun_tmp/eth3d" \
           batch_size=1 # MoGe stage doesn't support nested tensors
+```
+
+### Quick Start Example for 7Scenes
+
+The 7Scenes pipeline mirrors other RGB-D datasets but requires the
+`visloc_pseudo_gt_limitations` repository for pseudo ground-truth poses and per
+frame focal lengths. The helper script automates download, conversion, and the
+post-processing stages:
+
+```bash
+cd <path to map-anything>
+
+# Arguments: <processed_root> <wai_output_dir> <conda_env>
+bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
+          /mnt/storage/xwh/7Scenes \
+          /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
+          wai_processing
+```
+
+To run the stages manually:
+
+```bash
+python data_processing/wai_processing/download_scripts/download_7scenes.py \
+          --target_dir /mnt/storage/xwh/7Scenes/downloads \
+          --extract_dir /mnt/storage/xwh/7Scenes/7scenes_source \
+          --pgt_dir /mnt/storage/xwh/7Scenes/visloc_pseudo_gt_limitations \
+          --stages download extract pgt
+
+python -m wai_processing.scripts.conversion.seven_scenes \
+          original_root=/mnt/storage/xwh/7Scenes \
+          root=/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes
 ```
 
 ### Batch Processing using SLURM
