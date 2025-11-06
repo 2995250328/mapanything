@@ -19,6 +19,7 @@ from mapanything.datasets.wai.mpsd import MPSDWAI  # noqa
 from mapanything.datasets.wai.mvs_synth import MVSSynthWAI  # noqa
 from mapanything.datasets.wai.paralleldomain4d import ParallelDomain4DWAI  # noqa
 from mapanything.datasets.wai.sailvos3d import SAILVOS3DWAI  # noqa
+from mapanything.datasets.wai.seven_scenes import SevenScenesWAI  # noqa
 from mapanything.datasets.wai.scannetpp import ScanNetPPWAI  # noqa
 from mapanything.datasets.wai.spring import SpringWAI  # noqa
 from mapanything.datasets.wai.tav2_wb import TartanAirV2WBWAI  # noqa

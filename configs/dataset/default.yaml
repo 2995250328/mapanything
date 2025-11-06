@@ -10,6 +10,7 @@ defaults:
   - mvs_synth_wai: default
   - paralleldomain4d_wai: default
   - sailvos3d_wai: default
+  - seven_scenes_wai: default
   - scannetpp_wai: default
   - spring_wai: default
   - tav2_wb_wai: default
