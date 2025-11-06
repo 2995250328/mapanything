@@ -18,7 +18,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
 
     echo "Running $dataset with batch_size=$batch_size, num_views=$num_views (AA feature capture enabled)"
 
-    run_dir="${root_experiments_dir}/mapanything/benchmarking/dense_${num_views}_view/mapa_24v_store_intermediates"
+    run_dir_cli='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_24v_store_intermediates'
 
     python3 \
         benchmarking/dense_n_view/benchmark.py \
@@ -33,7 +33,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model.encoder.uses_torch_hub=True \
         model.pretrained="${root_pretrained_checkpoints_dir}/facebook_map-anything.pth" \
         +model.memory_efficient_inference=True \
-        hydra.run.dir="$run_dir"
+        hydra.run.dir="$run_dir_cli"
 
-    echo "Finished $dataset with AA feature capture. Each run writes an info_sharing_outputs.pt file under $run_dir/aa_features."
+    echo "Finished $dataset with AA feature capture. Each run writes an info_sharing_outputs.pt file under ${run_dir_cli}/aa_features."
 done
