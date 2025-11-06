@@ -419,7 +419,12 @@ def calculate_auc_np(r_error, t_error, max_threshold=30):
     bins = np.arange(max_threshold + 1)
     histogram, _ = np.histogram(max_errors, bins=bins)
     num_pairs = float(len(max_errors))
-    normalized_histogram = histogram.astype(float) / num_pairs
+
+    if num_pairs == 0:
+        normalized_histogram = np.zeros_like(histogram, dtype=float)
+    else:
+        normalized_histogram = histogram.astype(float) / num_pairs
+
     return np.mean(np.cumsum(normalized_histogram)), normalized_histogram
 
 
