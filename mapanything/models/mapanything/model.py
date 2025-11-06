@@ -8,8 +8,11 @@ MapAnything model class defined using UniCeption modules.
 """
 
 import warnings
+from datetime import datetime
 from functools import partial
-from typing import Any, Callable, Dict, List, Tuple, Type, Union
+from pathlib import Path
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -36,7 +39,10 @@ from uniception.models.info_sharing.alternating_attention_transformer import (
     MultiViewAlternatingAttentionTransformer,
     MultiViewAlternatingAttentionTransformerIFR,
 )
-from uniception.models.info_sharing.base import MultiViewTransformerInput
+from uniception.models.info_sharing.base import (
+    MultiViewTransformerInput,
+    MultiViewTransformerOutput,
+)
 from uniception.models.info_sharing.cross_attention_transformer import (
     MultiViewCrossAttentionTransformer,
     MultiViewCrossAttentionTransformerIFR,
@@ -100,6 +106,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         load_specific_pretrained_submodules: bool = False,
         specific_pretrained_submodules: list = None,
         torch_hub_force_reload: bool = False,
+        store_info_sharing_intermediate_features: bool = False,
+        info_sharing_storage_device: Optional[Union[str, torch.device]] = None,
+        info_sharing_storage_path: Optional[Union[str, Path]] = None,
     ):
         """
         Multi-view model containing an image encoder fused with optional geometric modalities followed by a multi-view attention transformer and respective downstream heads.
@@ -117,6 +126,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             load_specific_pretrained_submodules (bool): Whether to load specific pretrained submodules. (default: False)
             specific_pretrained_submodules (list): List of specific pretrained submodules to load. Must be provided when load_specific_pretrained_submodules is True. (default: None)
             torch_hub_force_reload (bool): Whether to force reload the encoder from torch hub. (default: False)
+            store_info_sharing_intermediate_features (bool): Enable caching the info-sharing transformer's outputs. (default: False)
+            info_sharing_storage_device (str or torch.device, optional): Device to move cached tensors to when storing in memory. Ignored when ``info_sharing_storage_path`` is provided.
+            info_sharing_storage_path (str or Path, optional): Directory where cached info-sharing tensors should be serialized to disk. When set, cached metadata references saved files instead of in-memory tensors.
         """
         super().__init__()
 
@@ -130,6 +142,17 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self.load_specific_pretrained_submodules = load_specific_pretrained_submodules
         self.specific_pretrained_submodules = specific_pretrained_submodules
         self.torch_hub_force_reload = torch_hub_force_reload
+        self.store_info_sharing_intermediate_features = (
+            store_info_sharing_intermediate_features
+        )
+        self.info_sharing_storage_device = info_sharing_storage_device
+        self.info_sharing_storage_path = (
+            Path(info_sharing_storage_path).expanduser()
+            if info_sharing_storage_path is not None
+            else None
+        )
+        self._info_sharing_storage_run_dir: Optional[Path] = None
+        self._stored_info_sharing_features: Optional[Dict[str, Any]] = None
         self.class_init_args = {
             "name": self.name,
             "encoder_config": self.encoder_config,
@@ -140,6 +163,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             "load_specific_pretrained_submodules": self.load_specific_pretrained_submodules,
             "specific_pretrained_submodules": self.specific_pretrained_submodules,
             "torch_hub_force_reload": self.torch_hub_force_reload,
+            "store_info_sharing_intermediate_features": self.store_info_sharing_intermediate_features,
+            "info_sharing_storage_device": self.info_sharing_storage_device,
+            "info_sharing_storage_path": str(self.info_sharing_storage_path)
+            if self.info_sharing_storage_path is not None
+            else None,
         }
 
         # Get relevant parameters from the configs
@@ -314,6 +342,16 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         else:
             raise ValueError(
                 f"Invalid info_sharing_return_type: {self.info_sharing_return_type}. Valid options: ['no_intermediate_features', 'intermediate_features']"
+            )
+
+        if (
+            self.store_info_sharing_intermediate_features
+            and self.info_sharing_return_type != "intermediate_features"
+        ):
+            warnings.warn(
+                "store_info_sharing_intermediate_features=True but info_sharing_return_type is not 'intermediate_features'. "
+                "Only the final information sharing features will be captured.",
+                stacklevel=2,
             )
 
     def _initialize_prediction_heads(self, pred_head_config):
@@ -1501,6 +1539,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         Returns:
             List[dict]: A list containing the final outputs for all N views.
+
+        Notes:
+            When ``store_info_sharing_intermediate_features`` is enabled, the final and
+            intermediate multi-view transformer features from this forward pass can be
+            retrieved using :meth:`get_info_sharing_intermediate_features`.
         """
         # Get input shape of the images, number of views, and batch size per view
         batch_size_per_view, _, height, width = views[0]["img"].shape
@@ -1532,6 +1575,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             features=all_encoder_features_across_views,
             additional_input_tokens=input_scale_token,
         )
+        intermediate_info_sharing_multi_view_feat: Optional[
+            List[MultiViewTransformerOutput]
+        ] = None
         if self.info_sharing_return_type == "no_intermediate_features":
             final_info_sharing_multi_view_feat = self.info_sharing(info_sharing_input)
         elif self.info_sharing_return_type == "intermediate_features":
@@ -1539,6 +1585,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 final_info_sharing_multi_view_feat,
                 intermediate_info_sharing_multi_view_feat,
             ) = self.info_sharing(info_sharing_input)
+
+        if self.store_info_sharing_intermediate_features:
+            self._stored_info_sharing_features = self._capture_info_sharing_features(
+                final_info_sharing_multi_view_feat,
+                intermediate_info_sharing_multi_view_feat,
+            )
+        else:
+            self._stored_info_sharing_features = None
 
         if self.pred_head_type == "linear":
             # Stack the features for all views
@@ -1906,6 +1960,155 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
 
         return res
+
+    def _clone_tensor_for_storage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Detach, clone, and optionally move a tensor for intermediate storage."""
+
+        clone = tensor.detach().clone()
+        target_device = self.info_sharing_storage_device
+        if target_device is not None:
+            try:
+                clone = clone.to(target_device)
+            except (RuntimeError, ValueError) as exc:
+                warnings.warn(
+                    f"Failed to move stored info sharing tensor to '{target_device}': {exc}. Keeping on original device.",
+                    stacklevel=2,
+                )
+        return clone
+
+    def _write_tensor_to_disk(
+        self,
+        tensor: torch.Tensor,
+        run_dir: Path,
+        tag: str,
+        label: str,
+    ) -> Dict[str, Any]:
+        """Serialize a tensor to disk and return its metadata."""
+
+        target_dir = run_dir / tag
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"{label}.pt"
+        tensor_to_save = tensor.detach().cpu()
+        torch.save(tensor_to_save, file_path)
+        return {
+            "path": str(file_path),
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "tag": tag,
+            "label": label,
+        }
+
+    def _serialize_multi_view_output(
+        self,
+        output: MultiViewTransformerOutput,
+        run_dir: Optional[Path],
+        tag: str,
+        block_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Convert a transformer output into stored metadata or tensors."""
+
+        block_tag = tag
+        if block_index is not None:
+            block_tag = f"{tag}_{block_index:03d}"
+
+        if run_dir is None:
+            return MultiViewTransformerOutput(
+                features=[
+                    self._clone_tensor_for_storage(feature)
+                    for feature in output.features
+                ],
+                additional_token_features=(
+                    self._clone_tensor_for_storage(
+                        output.additional_token_features
+                    )
+                    if output.additional_token_features is not None
+                    else None
+                ),
+            )
+
+        stored_features = [
+            self._write_tensor_to_disk(
+                feature, run_dir, block_tag, f"view_{view_idx:02d}"
+            )
+            for view_idx, feature in enumerate(output.features)
+        ]
+        stored_additional = (
+            self._write_tensor_to_disk(
+                output.additional_token_features,
+                run_dir,
+                block_tag,
+                "additional_tokens",
+            )
+            if output.additional_token_features is not None
+            else None
+        )
+
+        return {
+            "storage": "disk",
+            "tag": block_tag,
+            "block_index": block_index,
+            "features": stored_features,
+            "additional_token_features": stored_additional,
+        }
+
+    def _create_info_sharing_run_directory(self) -> Optional[Path]:
+        if self.info_sharing_storage_path is None:
+            self._info_sharing_storage_run_dir = None
+            return None
+
+        base_dir = self.info_sharing_storage_path
+        base_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = base_dir / (
+            datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            + f"_{uuid.uuid4().hex[:8]}"
+        )
+        run_dir.mkdir(parents=True, exist_ok=False)
+        self._info_sharing_storage_run_dir = run_dir
+        return run_dir
+
+    def _capture_info_sharing_features(
+        self,
+        final_output: MultiViewTransformerOutput,
+        intermediate_outputs: Optional[List[MultiViewTransformerOutput]],
+    ) -> Dict[str, Any]:
+        """Clone or serialize information sharing outputs for later inspection."""
+
+        run_dir = self._create_info_sharing_run_directory()
+
+        stored: Dict[str, Any] = {
+            "return_type": self.info_sharing_return_type,
+            "info_sharing_type": self.info_sharing_type,
+            "storage_mode": "disk" if run_dir is not None else "memory",
+            "storage_directory": str(run_dir) if run_dir is not None else None,
+            "final": self._serialize_multi_view_output(
+                final_output, run_dir, "final"
+            ),
+        }
+
+        if intermediate_outputs is not None:
+            stored["intermediate"] = [
+                self._serialize_multi_view_output(output, run_dir, "intermediate", idx)
+                for idx, output in enumerate(intermediate_outputs)
+            ]
+        else:
+            stored["intermediate"] = None
+
+        return stored
+
+    def get_info_sharing_intermediate_features(self, clear: bool = False):
+        """Return the cached information sharing features captured during ``forward``.
+
+        When ``info_sharing_storage_path`` is set the returned dictionary contains
+        file metadata (including ``storage_directory`` and per-tensor paths) and the
+        ``storage_mode`` key is ``"disk"``. If the path is ``None`` the dictionary
+        stores ``MultiViewTransformerOutput`` instances and ``storage_mode`` is
+        ``"memory"``.
+        """
+
+        stored = self._stored_info_sharing_features
+        if clear:
+            self._stored_info_sharing_features = None
+        return stored
 
     def _configure_geometric_input_config(
         self,
