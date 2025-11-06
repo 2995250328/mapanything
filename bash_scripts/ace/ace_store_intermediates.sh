@@ -11,7 +11,7 @@ export HYDRA_FULL_ERROR=1
 # Example batch size / view configuration for capturing alternating-attention features
 # while storing serialized tensors under the ACE workspace.
 batch_sizes_and_views=(
-    "1 100 benchmark_518_eth3d_snpp_tav2"
+    "1 2 benchmark_518_seven_scenes"
 )
 
 for combo in "${batch_sizes_and_views[@]}"; do
