@@ -1976,80 +1976,69 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 )
         return clone
 
-    def _write_tensor_to_disk(
-        self,
-        tensor: torch.Tensor,
-        run_dir: Path,
-        tag: str,
-        label: str,
-    ) -> Dict[str, Any]:
-        """Serialize a tensor to disk and return its metadata."""
-
-        target_dir = run_dir / tag
-        target_dir.mkdir(parents=True, exist_ok=True)
-        file_path = target_dir / f"{label}.pt"
-        tensor_to_save = tensor.detach().cpu()
-        torch.save(tensor_to_save, file_path)
-        return {
-            "path": str(file_path),
-            "shape": tuple(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "tag": tag,
-            "label": label,
-        }
-
     def _serialize_multi_view_output(
         self,
         output: MultiViewTransformerOutput,
-        run_dir: Optional[Path],
+    ) -> MultiViewTransformerOutput:
+        """Clone a transformer output for in-memory storage."""
+
+        return MultiViewTransformerOutput(
+            features=[
+                self._clone_tensor_for_storage(feature)
+                for feature in output.features
+            ],
+            additional_token_features=(
+                self._clone_tensor_for_storage(
+                    output.additional_token_features
+                )
+                if output.additional_token_features is not None
+                else None
+            ),
+        )
+
+    def _prepare_output_for_disk(
+        self,
+        output: MultiViewTransformerOutput,
         tag: str,
-        block_index: Optional[int] = None,
+        block_index: Optional[int],
     ) -> Dict[str, Any]:
-        """Convert a transformer output into stored metadata or tensors."""
+        """Detach tensors to CPU and package them for serialization."""
 
-        block_tag = tag
-        if block_index is not None:
-            block_tag = f"{tag}_{block_index:03d}"
-
-        if run_dir is None:
-            return MultiViewTransformerOutput(
-                features=[
-                    self._clone_tensor_for_storage(feature)
-                    for feature in output.features
-                ],
-                additional_token_features=(
-                    self._clone_tensor_for_storage(
-                        output.additional_token_features
-                    )
-                    if output.additional_token_features is not None
-                    else None
-                ),
-            )
-
-        stored_features = [
-            self._write_tensor_to_disk(
-                feature, run_dir, block_tag, f"view_{view_idx:02d}"
-            )
-            for view_idx, feature in enumerate(output.features)
-        ]
-        stored_additional = (
-            self._write_tensor_to_disk(
-                output.additional_token_features,
-                run_dir,
-                block_tag,
-                "additional_tokens",
-            )
+        block_tag = tag if block_index is None else f"{tag}_{block_index:03d}"
+        features = [tensor.detach().cpu() for tensor in output.features]
+        additional = (
+            output.additional_token_features.detach().cpu()
             if output.additional_token_features is not None
             else None
         )
-
         return {
-            "storage": "disk",
             "tag": block_tag,
             "block_index": block_index,
-            "features": stored_features,
-            "additional_token_features": stored_additional,
+            "features": features,
+            "additional_token_features": additional,
         }
+
+    def _summarize_disk_block(self, block: Dict[str, Any]) -> Dict[str, Any]:
+        """Create lightweight metadata for a serialized transformer block."""
+
+        return {
+            "tag": block["tag"],
+            "block_index": block["block_index"],
+            "num_views": len(block["features"]),
+            "feature_shapes": [tuple(tensor.shape) for tensor in block["features"]],
+            "has_additional_tokens": block["additional_token_features"] is not None,
+        }
+
+    def _write_info_sharing_payload(
+        self,
+        run_dir: Path,
+        payload: Dict[str, Any],
+    ) -> Path:
+        """Persist the serialized alternating-attention payload to a single file."""
+
+        file_path = run_dir / "info_sharing_outputs.pt"
+        torch.save(payload, file_path)
+        return file_path
 
     def _create_info_sharing_run_directory(self) -> Optional[Path]:
         if self.info_sharing_storage_path is None:
@@ -2075,23 +2064,54 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         run_dir = self._create_info_sharing_run_directory()
 
-        stored: Dict[str, Any] = {
-            "return_type": self.info_sharing_return_type,
-            "info_sharing_type": self.info_sharing_type,
-            "storage_mode": "disk" if run_dir is not None else "memory",
-            "storage_directory": str(run_dir) if run_dir is not None else None,
-            "final": self._serialize_multi_view_output(
-                final_output, run_dir, "final"
-            ),
-        }
+        if run_dir is None:
+            stored: Dict[str, Any] = {
+                "return_type": self.info_sharing_return_type,
+                "info_sharing_type": self.info_sharing_type,
+                "storage_mode": "memory",
+                "storage_directory": None,
+                "storage_file": None,
+                "final": self._serialize_multi_view_output(final_output),
+                "intermediate": [
+                    self._serialize_multi_view_output(output)
+                    for output in intermediate_outputs
+                ]
+                if intermediate_outputs is not None
+                else None,
+            }
+            return stored
 
-        if intermediate_outputs is not None:
-            stored["intermediate"] = [
-                self._serialize_multi_view_output(output, run_dir, "intermediate", idx)
+        final_block = self._prepare_output_for_disk(final_output, "final", None)
+        intermediate_blocks = (
+            [
+                self._prepare_output_for_disk(output, "intermediate", idx)
                 for idx, output in enumerate(intermediate_outputs)
             ]
-        else:
-            stored["intermediate"] = None
+            if intermediate_outputs is not None
+            else None
+        )
+
+        payload: Dict[str, Any] = {
+            "return_type": self.info_sharing_return_type,
+            "info_sharing_type": self.info_sharing_type,
+            "final": final_block,
+            "intermediate": intermediate_blocks,
+        }
+        storage_file = self._write_info_sharing_payload(run_dir, payload)
+
+        stored = {
+            "return_type": self.info_sharing_return_type,
+            "info_sharing_type": self.info_sharing_type,
+            "storage_mode": "disk",
+            "storage_directory": str(run_dir),
+            "storage_file": str(storage_file),
+            "final": self._summarize_disk_block(final_block),
+            "intermediate": (
+                [self._summarize_disk_block(block) for block in intermediate_blocks]
+                if intermediate_blocks is not None
+                else None
+            ),
+        }
 
         return stored
 
@@ -2099,7 +2119,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         """Return the cached information sharing features captured during ``forward``.
 
         When ``info_sharing_storage_path`` is set the returned dictionary contains
-        file metadata (including ``storage_directory`` and per-tensor paths) and the
+        file metadata (including ``storage_directory`` and ``storage_file``) and the
         ``storage_mode`` key is ``"disk"``. If the path is ``None`` the dictionary
         stores ``MultiViewTransformerOutput`` instances and ``storage_mode`` is
         ``"memory"``.
@@ -2109,6 +2129,55 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         if clear:
             self._stored_info_sharing_features = None
         return stored
+
+    @staticmethod
+    def load_info_sharing_features_from_file(
+        path: Union[str, Path],
+        map_location: Optional[Union[str, torch.device]] = None,
+        as_outputs: bool = True,
+    ) -> Dict[str, Any]:
+        """Load serialized alternating-attention features from disk.
+
+        Args:
+            path: File produced by :meth:`_write_info_sharing_payload`.
+            map_location: Optional device mapping forwarded to ``torch.load``.
+            as_outputs: When ``True`` the tensors are wrapped in
+                :class:`MultiViewTransformerOutput` objects. Otherwise, the raw
+                serialized dictionary is returned.
+
+        Returns:
+            Dictionary mirroring the structure of
+            :meth:`get_info_sharing_intermediate_features` but populated with the
+            tensors stored on disk.
+        """
+
+        file_path = Path(path).expanduser()
+        payload = torch.load(file_path, map_location=map_location)
+
+        if not as_outputs:
+            return payload
+
+        def _to_output(block: Optional[Dict[str, Any]]):
+            if block is None:
+                return None
+            return MultiViewTransformerOutput(
+                features=block["features"],
+                additional_token_features=block["additional_token_features"],
+            )
+
+        intermediate_payload = payload.get("intermediate")
+        intermediate_outputs = (
+            [_to_output(block) for block in intermediate_payload]
+            if intermediate_payload is not None
+            else None
+        )
+
+        return {
+            "return_type": payload.get("return_type"),
+            "info_sharing_type": payload.get("info_sharing_type"),
+            "final": _to_output(payload.get("final")),
+            "intermediate": intermediate_outputs,
+        }
 
     def _configure_geometric_input_config(
         self,

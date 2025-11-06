@@ -34,5 +34,5 @@ for combo in "${batch_sizes_and_views[@]}"; do
         +model.memory_efficient_inference=True \
         hydra.run.dir="$run_dir"
 
-    echo "Finished $dataset with AA feature capture. Serialized tensors live under $run_dir/aa_features."
+    echo "Finished $dataset with AA feature capture. Each run writes an info_sharing_outputs.pt file under $run_dir/aa_features."
 done

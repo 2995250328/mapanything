@@ -184,10 +184,17 @@ model = MapAnything.from_pretrained(
 predictions = model.infer(views)
 
 # Retrieve (and optionally clear) the cached AA metadata. When a storage path is
-# configured, each entry contains the file system locations of the serialized
-# tensors for every alternating-attention block.
+# configured, the dictionary points at a single ``info_sharing_outputs.pt`` file
+# containing every alternating-attention block.
 aa_cache = model.get_info_sharing_intermediate_features(clear=True)
-print(aa_cache["final"]["features"][0]["path"])
+if aa_cache["storage_mode"] == "disk":
+    disk_payload = MapAnything.load_info_sharing_features_from_file(
+        aa_cache["storage_file"],
+        map_location="cpu",
+    )
+    print(disk_payload["final"].features[0].shape)
+else:
+    print(aa_cache["final"].features[0].shape)
 ```
 
 When using Hydra-based entry points (e.g., the benchmarking scripts), you can
@@ -209,7 +216,10 @@ so that images are always paired with ray directions, depths, and camera poses
 (including their metric scale factors) when AA tensors are recorded. They also
 set `info_sharing.module_args.indices` to `[0, ..., depth-1]` so every
 alternating-attention block is persisted to disk via `info_sharing_storage_path`.
-Apply the same override if you compose a custom Hydra run.
+When disk capture is enabled, all blocks for a forward pass are saved inside a
+single `info_sharing_outputs.pt` file that can be reloaded with
+`MapAnything.load_info_sharing_features_from_file`. Apply the same override if
+you compose a custom Hydra run.
 
 ### Multi-Modal Inference
 
