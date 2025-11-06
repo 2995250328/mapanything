@@ -27,12 +27,39 @@ CALIB_SUFFIX = ".calibration.txt"
 def _discover_scene_keys(cfg) -> list[str]:
     original_root = Path(cfg.original_root)
     scene_keys: list[str] = []
+    dataset_whitelist_cfg = cfg.get("dataset_whitelist")
+    dataset_whitelist = (
+        {entry.lower() for entry in dataset_whitelist_cfg}
+        if dataset_whitelist_cfg
+        else None
+    )
+    split_whitelist_cfg = cfg.get("split_whitelist")
+    split_whitelist = (
+        {entry.lower() for entry in split_whitelist_cfg}
+        if split_whitelist_cfg
+        else None
+    )
+    sequence_whitelist_cfg = cfg.get("sequence_whitelist")
+    if sequence_whitelist_cfg:
+        sequence_whitelist_full = {entry for entry in sequence_whitelist_cfg}
+        sequence_whitelist_short = {
+            entry.split("/")[-1] for entry in sequence_whitelist_cfg
+        }
+    else:
+        sequence_whitelist_full = set()
+        sequence_whitelist_short = set()
+
     for scene_dir in sorted(original_root.glob("pgt_7scenes_*")):
         if not scene_dir.is_dir():
             continue
         dataset_name = scene_dir.name.replace("pgt_7scenes_", "", 1)
+        if dataset_whitelist and dataset_name.lower() not in dataset_whitelist:
+            continue
         for split_dir in sorted(scene_dir.iterdir()):
             if not split_dir.is_dir():
+                continue
+            split_name = split_dir.name
+            if split_whitelist and split_name.lower() not in split_whitelist:
                 continue
             rgb_dir = split_dir / "rgb"
             if not rgb_dir.exists():
@@ -41,7 +68,12 @@ def _discover_scene_keys(cfg) -> list[str]:
             for image_file in natsorted(rgb_dir.glob(f"*{RGB_SUFFIX}")):
                 prefix = image_file.name.replace(RGB_SUFFIX, "")
                 seq_name = prefix.split("-frame")[0]
-                scene_key = f"{dataset_name}/{split_dir.name}/{seq_name}"
+                scene_key = f"{dataset_name}/{split_name}/{seq_name}"
+                if sequence_whitelist_full and (
+                    scene_key not in sequence_whitelist_full
+                    and seq_name not in sequence_whitelist_short
+                ):
+                    continue
                 if scene_key not in scene_keys:
                     scene_keys.append(scene_key)
     return scene_keys

@@ -29,9 +29,11 @@ BASE_URL = (
 VISLOC_REPO_URL = "https://github.com/tsattler/visloc_pseudo_gt_limitations.git"
 
 
-def build_download_map() -> dict[str, str]:
+def build_download_map(selected_scenes: Iterable[str] | None = None) -> dict[str, str]:
     """Return a mapping from archive names to their download URLs."""
-    return {f"{scene}.zip": f"{BASE_URL}/{scene}.zip" for scene in SCENE_NAMES}
+
+    scenes = list(selected_scenes) if selected_scenes else list(SCENE_NAMES)
+    return {f"{scene}.zip": f"{BASE_URL}/{scene}.zip" for scene in scenes}
 
 
 def _collect_all_zips(target_dir: Path) -> Iterable[Path]:
@@ -89,6 +91,15 @@ def main() -> None:
         help="Pipeline stages to run.",
     )
     parser.add_argument(
+        "--scenes",
+        nargs="+",
+        choices=SCENE_NAMES,
+        help=(
+            "Optional subset of scene names to download/extract. Defaults to all "
+            "7Scenes sequences when omitted."
+        ),
+    )
+    parser.add_argument(
         "--update_pgt",
         action="store_true",
         help="Update an existing pseudo-GT clone by running 'git pull'.",
@@ -107,14 +118,24 @@ def main() -> None:
     stages = set(args.stages)
     run_all = "all" in stages
 
+    if args.scenes:
+        selected_scenes = tuple(dict.fromkeys(args.scenes))
+        print(f"Restricting download/extraction to scenes: {', '.join(selected_scenes)}")
+    else:
+        selected_scenes = None
+
     if run_all or "download" in stages:
         print("Downloading 7Scenes archives ...")
-        parallel_download(target_dir, build_download_map(), n_workers=args.n_workers)
+        parallel_download(
+            target_dir,
+            build_download_map(selected_scenes),
+            n_workers=args.n_workers,
+        )
 
     if run_all or "extract" in stages:
         print("Extracting scene archives ...")
         extract_dir.mkdir(parents=True, exist_ok=True)
-        for archive_name in build_download_map():
+        for archive_name in build_download_map(selected_scenes):
             archive_path = target_dir / archive_name
             scene_extract_dir = extract_dir / archive_path.stem
             scene_extract_dir.mkdir(parents=True, exist_ok=True)

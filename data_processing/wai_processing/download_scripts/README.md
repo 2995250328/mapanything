@@ -56,5 +56,6 @@ Use the provided python script `download_unrealstereo4k.py`.
 
 ## 7Scenes
 Use the provided python script `download_7scenes.py` to grab the RGB-D sequences
-and clone the pseudo ground-truth repository.
+and clone the pseudo ground-truth repository. Pass `--scenes chess` (or a
+space-separated list) to quickly download a subset for smoke testing.
 **Source:** [7Scenes](https://www.microsoft.com/en-us/research/project/rgb-d-dataset-7-scenes/)

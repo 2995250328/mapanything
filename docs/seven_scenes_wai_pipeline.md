@@ -17,6 +17,7 @@ python data_processing/wai_processing/download_scripts/download_7scenes.py \
 - `--target_dir`：保存原始 ZIP 压缩包的位置。
 - `--extract_dir`：解压后保留原始目录结构的位置（每个场景包含多个 `seq-XX` 子目录）。
 - `--pgt_dir`：可选参数，用于指定伪真值仓库的克隆路径。加上 `--update_pgt` 可更新已有仓库。
+- `--scenes`：可选参数，若只想快速验证单个场景（例如 `--scenes chess`），可在下载与解压阶段仅处理少量数据。
 
 脚本会自动两层解压所有 ZIP 文件，确保 `7scenes_source/<scene>/seq-XX` 结构完整，供后续生成 `pgt_7scenes_*` 结构时使用。
 
@@ -56,6 +57,8 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
     /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
     wai_processing
 ```
+
+若只想对某几个场景进行转换，可在命令末尾追加 `--datasets chess`（或使用逗号分隔的列表，如 `--datasets chess,heads`）。脚本会自动把该过滤条件传递给转换配置，仅为指定场景生成 WAI 数据。
 
 脚本依次执行：
 
@@ -97,6 +100,7 @@ chess_train_seq-01/
 ## 5. 配置文件与批处理
 
 - `configs/conversion/seven_scenes.yaml`：控制原始路径、默认焦距、深度无效值等参数。
+- 同一配置还新增了 `dataset_whitelist`、`split_whitelist` 与 `sequence_whitelist` 三个可选过滤项，可在调试阶段只转换少量场景、分割或序列；留空即处理全部数据。
 - `configs/launch/seven_scenes.yaml`：提供与其他数据集一致的 SLURM 批处理配置，可在集群上批量运行。
 
 ## 6. 目录组织建议

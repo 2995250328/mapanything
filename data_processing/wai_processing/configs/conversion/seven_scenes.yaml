@@ -10,5 +10,10 @@ image_width: 640
 image_height: 480
 invalid_depth_values: [0, 65535]
 
+# Optional filters to accelerate smoke tests. Leave empty to process all scenes.
+dataset_whitelist: []  # e.g. [chess]
+split_whitelist: []    # e.g. [train]
+sequence_whitelist: [] # e.g. [chess/train/seq-01]
+
 scene_filters:
   - process_state_not: [conversion, finished]

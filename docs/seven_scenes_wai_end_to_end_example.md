@@ -32,6 +32,7 @@ python data_processing/wai_processing/download_scripts/download_7scenes.py \
 - `downloads/` 会保存官方 ZIP 包。
 - `7scenes_source/` 会展开为 `scene/seq-XX/frame-XXXXXX.*` 的原始结构。
 - `visloc_pseudo_gt_limitations/` 是后续生成 PGT 位姿所需的仓库（可用 `--update_pgt` 更新）。
+- 若只是想快速验证流程，可额外指定 `--scenes chess`（或其它场景名），脚本会只下载并解压对应数据。
 
 ## 2. 生成 `pgt_7scenes_*` 结构
 
@@ -64,6 +65,8 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
     original_depth_unit=millimeter \
     default_focal_length=585.0
 ```
+
+在命令末尾追加 `--datasets chess` 可只转换 `chess` 场景（多个场景可用逗号分隔，例如 `--datasets chess,heads`），便于先运行小规模验证。
 
 脚本内部依次调用：
 
