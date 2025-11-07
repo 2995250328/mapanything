@@ -1,0 +1,11 @@
+# Evaluation entrypoint for AA feature fusion.
+defaults:
+  - default
+  - dataset: seven_scenes_wai/test/default
+  - _self_
+
+evaluation:
+  batch_size: 1
+  num_workers: 2
+  output_dir: ${hydra:run.dir}
+  metrics: []

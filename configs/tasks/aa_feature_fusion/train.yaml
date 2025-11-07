@@ -1,0 +1,19 @@
+# Training entrypoint for AA feature fusion.
+defaults:
+  - default
+  - _self_
+
+training:
+  max_epochs: 10
+  log_every_n_steps: 20
+  output_dir: ${hydra:run.dir}
+
+optimizer:
+  name: adamw
+  learning_rate: 1e-4
+  weight_decay: 0.01
+
+scheduler:
+  name: cosine
+  warmup_steps: 1000
+  total_steps: 100000

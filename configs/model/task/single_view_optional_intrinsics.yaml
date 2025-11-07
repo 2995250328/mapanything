@@ -1,0 +1,18 @@
+# Task config tailored for single-view inference with optional geometric signals.
+defaults:
+  - default
+
+# Always enable deterministic sampling when geometric inputs are provided.
+overall_prob: 1.0
+# Disable random dropout of views/geometric modalities.
+dropout_prob: 0.0
+
+# Toggle individual modalities. These defaults mirror "images only" but keep
+# intrinsics available when supplied alongside the single view.
+ray_dirs_prob: 1.0
+depth_prob: 0.0
+cam_prob: 0.0
+sparse_depth_prob: 0.0
+sparsification_removal_percent: 0.0
+depth_scale_norm_all_prob: 0.0
+pose_scale_norm_all_prob: 0.0

@@ -1,0 +1,27 @@
+# Base configuration for the AA feature fusion task pipeline.
+defaults:
+  - model: mapanything
+  - model/task: single_view_optional_intrinsics
+  - dataset: seven_scenes_wai/train/default
+  - _self_
+
+fusion:
+  stored_feature_file: null  # path to info_sharing_outputs.pt from a multi-view capture run
+  map_location: cpu
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+
+single_view:
+  include_intrinsics: true
+  include_depth: false
+  include_pose: false
+  include_scale: false
+
+training:
+  max_epochs: 1
+  log_every_n_steps: 10
+  output_dir: ${hydra:run.dir}
+
+assessment:
+  notes: "Populate training/evaluation settings as the task matures."
