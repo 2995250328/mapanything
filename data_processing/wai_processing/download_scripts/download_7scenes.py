@@ -49,6 +49,27 @@ def _collect_all_zips(target_dir: Path) -> Iterable[Path]:
         yield path
 
 
+def _scene_is_already_extracted(extract_dir: Path, scene: str) -> bool:
+    """Return True when the scene folder looks fully extracted."""
+
+    scene_dir = extract_dir / scene
+    if not scene_dir.is_dir():
+        return False
+
+    has_sequences = any(
+        child.is_dir() and child.name.startswith("seq-") for child in scene_dir.iterdir()
+    )
+    if not has_sequences:
+        return False
+
+    has_splits = any(
+        child.is_file()
+        and child.name.lower() in {"trainsplit.txt", "testsplit.txt"}
+        for child in scene_dir.iterdir()
+    )
+    return has_splits
+
+
 def _clone_visloc_repo(dest: Path, update: bool) -> None:
     """Clone or update the visloc pseudo-GT repository."""
     if dest.exists():
@@ -133,12 +154,25 @@ def main() -> None:
         selected_scenes = None
 
     if run_all or "download" in stages:
-        print("Downloading 7Scenes archives ...")
-        parallel_download(
-            target_dir,
-            build_download_map(selected_scenes),
-            n_workers=args.n_workers,
-        )
+        download_map = build_download_map(selected_scenes)
+        if extract_dir.exists():
+            download_map = {
+                name: url
+                for name, url in download_map.items()
+                if not _scene_is_already_extracted(extract_dir, Path(name).stem)
+            }
+        if download_map:
+            print("Downloading 7Scenes archives ...")
+            parallel_download(
+                target_dir,
+                download_map,
+                n_workers=args.n_workers,
+            )
+        else:
+            print(
+                "All requested scenes already exist in"
+                f" {extract_dir}. Skipping download stage."
+            )
 
     if run_all or "extract" in stages:
         print("Extracting scene archives ...")
@@ -146,6 +180,12 @@ def main() -> None:
         for archive_name in build_download_map(selected_scenes):
             archive_path = target_dir / archive_name
             scene_extract_dir = extract_dir / archive_path.stem
+            if _scene_is_already_extracted(extract_dir, archive_path.stem):
+                print(
+                    f"Scene '{archive_path.stem}' already extracted at"
+                    f" {scene_extract_dir}, skipping."
+                )
+                continue
             scene_extract_dir.mkdir(parents=True, exist_ok=True)
             extract_zip_archives(
                 archive_path.parent,
