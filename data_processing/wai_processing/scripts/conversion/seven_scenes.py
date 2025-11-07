@@ -116,14 +116,22 @@ def _parse_calibration(calib_path: Path, cfg) -> tuple[float, float, float, floa
     return float(fx), float(fy), float(cx), float(cy)
 
 
-def _load_depth(depth_path: Path, invalid_values: set[int]) -> np.ndarray:
+def _load_depth(
+    depth_path: Path, invalid_values: set[int], device: torch.device
+) -> np.ndarray:
     with Image.open(depth_path) as depth_pil:
-        depth = np.array(depth_pil, dtype=np.uint16)
-    mask = np.isin(depth, list(invalid_values))
-    depth = depth.astype(np.float32)
-    depth[mask] = 0.0
+        depth_np = np.array(depth_pil, dtype=np.uint16)
+
+    depth = torch.from_numpy(depth_np).to(device=device, dtype=torch.float32)
+
+    if invalid_values:
+        invalid_mask = torch.zeros_like(depth, dtype=torch.bool)
+        for value in invalid_values:
+            invalid_mask |= depth == float(value)
+        depth = depth.masked_fill(invalid_mask, 0.0)
+
     depth *= 1.0 / 1000.0
-    return depth
+    return depth.cpu().numpy()
 
 
 def _sequence_filters(cfg):
@@ -159,6 +167,15 @@ def process_seven_scenes_scene(cfg, scene_key: str):
     depth_out_dir.mkdir(parents=True, exist_ok=True)
 
     invalid_values = set(cfg.get("invalid_depth_values", [0, 65535]))
+    requested_device = cfg.get("device", "cpu")
+    if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
+        logger.warning(
+            "CUDA 不可用，转换流程将改为在 CPU 上执行 (请求的设备为 %s)",
+            requested_device,
+        )
+        device = torch.device("cpu")
+    else:
+        device = torch.device(requested_device)
     sequence_whitelist_full, sequence_whitelist_short = _sequence_filters(cfg)
 
     image_files = natsorted(rgb_dir.glob(f"*{RGB_SUFFIX}"))
@@ -208,7 +225,7 @@ def process_seven_scenes_scene(cfg, scene_key: str):
         if not target_image_path.exists():
             target_image_path.symlink_to(image_path.resolve())
 
-        depth = _load_depth(depth_path, invalid_values)
+        depth = _load_depth(depth_path, invalid_values, device)
         rel_depth_path = Path("depth") / f"{base_name}.exr"
         store_data(target_scene_root / rel_depth_path, torch.from_numpy(depth), "depth")
 

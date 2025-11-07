@@ -53,12 +53,19 @@ MapAnything 的转换脚本期望看到如下的预处理结果：
 
 ```bash
 bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
+    --device cuda \
+    --moge-batch-size 8 \
     /mnt/storage/xwh/7Scenes \
     /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
     wai_processing
 ```
 
-若只想对某几个场景进行转换，可在命令末尾追加 `--datasets chess`（或使用逗号分隔的列表，如 `--datasets chess,heads`）。脚本会自动把该过滤条件传递给转换配置，仅为指定场景生成 WAI 数据。
+若只想对某几个场景进行转换，可在命令末尾追加 `--datasets chess`（或使用逗号分隔的列表，如 `--datasets chess,heads`）。脚本还支持：
+
+- `--device`：显式指定 PyTorch 设备（默认为 `cuda`，可改为 `cpu` 或 `cuda:1` 等）。转换阶段会在该设备上执行深度数据的清理、`covisibility` 计算以及 `MoGe` 推理。
+- `--moge-batch-size`：覆盖 `MoGe` 的推理批大小，值越大越能填满 GPU，但也需要更多显存。
+
+脚本会自动把场景过滤条件和设备配置传递给转换与后处理脚本，仅为指定场景生成 WAI 数据。
 
 脚本依次执行：
 
@@ -83,7 +90,7 @@ pgt_7scenes_chess/
 脚本按以下步骤处理每一帧：
 
 1. **图像链接**：在目标 WAI 目录下创建指向原图像的符号链接，保持零拷贝。
-2. **深度重映射**：读取 16-bit 深度 PNG，将 0 和 65535 视为无效值并归零，剩余深度由毫米转换为米，保存为 EXR 文件（`store_data(..., "depth")`）。
+2. **深度重映射**：读取 16-bit 深度 PNG，将 0 和 65535 视为无效值并归零，剩余深度由毫米转换为米，保存为 EXR 文件（`store_data(..., "depth")`）。若指定 `device=cuda`，掩码和单位转换会在 GPU 上执行，随后再写回 CPU。
 3. **位姿加载**：读取 `*.pose.txt` 中的 4x4 相机到世界变换矩阵，直接写入 `scene_meta.json`。
 4. **相机内参**：从 `*.calibration.txt` 解析 `fx, fy, cx, cy`，若文件为空则回退到配置中定义的默认焦距和图像中心。
 5. **WAI 元数据**：为每个帧生成包含 `image`、`depth`、`transform_matrix` 以及分辨率、焦距、主点等信息的条目。
@@ -104,7 +111,7 @@ chess_train/
 
 ## 5. 配置文件与批处理
 
-- `configs/conversion/seven_scenes.yaml`：控制原始路径、默认焦距、深度无效值等参数。
+- `configs/conversion/seven_scenes.yaml`：控制原始路径、默认焦距、深度无效值等参数，可通过 `device` 字段选择在 CPU 还是 GPU 上执行深度清理。
 - 同一配置还新增了 `dataset_whitelist`、`split_whitelist` 与 `sequence_whitelist` 三个可选过滤项，可在调试阶段只转换少量场景、分割或序列；留空即处理全部数据。
 - `configs/launch/seven_scenes.yaml`：提供与其他数据集一致的 SLURM 批处理配置，可在集群上批量运行。
 
@@ -129,6 +136,6 @@ chess_train/
 
 - 转换脚本默认将深度单位视作毫米，如果自定义数据源请确认单位一致。
 - 若 `calibration` 目录缺失或为空，脚本会回退到配置中的默认焦距（585.0）以及 `(320, 240)` 主点。
-- 运行 `covisibility` 和 `run_moge` 阶段需要 GPU/CPU 资源，建议参考仓库中其他数据集的资源配置。
+- 运行 `covisibility` 和 `run_moge` 阶段需要 GPU/CPU 资源，建议参考仓库中其他数据集的资源配置；必要时可以通过 `--device cpu` 改为纯 CPU 推理。
 
 至此，7Scenes 的下载、处理与 WAI 格式转化流程即告完成。

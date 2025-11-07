@@ -59,6 +59,8 @@ cd -
 
 ```bash
 bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
+    --device cuda \
+    --moge-batch-size 8 \
     "$DATA_ROOT" \
     "$WAI_ROOT" \
     "$CONDA_ENV" \
@@ -67,6 +69,10 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 ```
 
 在命令末尾追加 `--datasets chess` 可只转换 `chess` 场景（多个场景可用逗号分隔，例如 `--datasets chess,heads`），便于先运行小规模验证。
+此外：
+
+- `--device` 用于显式指定 GPU/CPU 设备（默认为 `cuda`）。该设置会贯穿转换、共视图计算与 MoGe 推理，便于充分利用 GPU。
+- `--moge-batch-size` 可以放大 MoGe 推理的 batch size，提高 GPU 利用率；若显存不足可调小或直接省略，回落到默认配置。
 
 脚本内部依次调用：
 
