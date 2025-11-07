@@ -146,17 +146,15 @@ python scripts/train.py \
 1. 首先在服务器端运行脚本，将重建结果写入磁盘：
 
     ```bash
+    DEVICE=cuda NUM_SAMPLES=3 DATA_ROOT="$WAI_ROOT" \
     bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh \
-        --device cuda \
-        --num-samples 3 \
-        --data-root "$WAI_ROOT" \
         /path/to/info_sharing_outputs.pt \
         "$WAI_ROOT/demo_runs" \
         model.pretrained=/path/to/mapanything.ckpt \
         machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata
     ```
 
-    - `--indices 10,42,...` 可直接指定想处理的样本索引，脚本会自动忽略 `--num-samples`。
+    - 如果想固定样本，可在命令前添加 `SAMPLE_INDICES=10,42,...`，脚本会自动忽略 `NUM_SAMPLES`。
     - `fusion.stored_feature_file` 通过位置参数提供；其余 Hydra 覆盖（如 `model.pretrained`、`root_data_dir`）可按需追加。
     - 每个样本会生成一个 `<scene>_<split>_<frame>.pt`，内部包含 RGB、相机参数以及融合后的点云/深度信息，并在目录下汇总 `summary.json`。
 

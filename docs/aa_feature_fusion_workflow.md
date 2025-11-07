@@ -19,12 +19,15 @@
 
 1. **运行脚本**：
    ```bash
+   DEVICE=cuda NUM_SAMPLES=4 DATA_ROOT="$WAI_ROOT" \
    bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh \
-       [--device cuda] [--num-samples 4] [--indices 0,5,7] [--data-root /path/to/wai_data/7scenes] \
-       /path/to/info_sharing_outputs.pt /tmp/aa_fusion_demo \
+       /path/to/info_sharing_outputs.pt \
+       "$WAI_ROOT/demo_runs" \
        model.pretrained=/path/to/mapanything.ckpt
    ```
-   脚本会自动把存储文件传给 Hydra 配置，输出目录中会生成每个样本对应的 `.pt` 记录与 `summary.json`。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L98】【F:configs/tasks/aa_feature_fusion/demo.yaml†L1-L18】
+   - 如需指定数据索引，可通过 `SAMPLE_INDICES=0,5,7` 覆盖，脚本会自动忽略 `NUM_SAMPLES`。
+   - 额外的 Hydra 覆盖（如 `model.pretrained`、`root_data_dir`）继续以命令行参数形式追加。
+   脚本会自动把存储文件传给 Hydra 配置，输出目录中会生成每个样本对应的 `.pt` 记录与 `summary.json`。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L55】【F:configs/tasks/aa_feature_fusion/demo.yaml†L1-L18】
 2. **内部流程**：Demo 入口会加载 7Scenes 测试集的单视图样本，按配置取用内参/深度/位姿信息，然后通过融合模块与 MapAnything 的下游头部恢复点云或深度图，并序列化到磁盘。【F:mapanything/tasks/aa_feature_fusion/demo.py†L17-L137】【F:mapanything/tasks/aa_feature_fusion/demo.py†L139-L207】
 3. **可视化**：在 WSL 或本地机器执行 `python scripts/visualization/view_aa_fusion_demo.py sample.pt --save sample.png --export-pts sample.ply` 即可预览 RGB 与重建深度，并可选导出 PLY 点云。【F:scripts/visualization/view_aa_fusion_demo.py†L1-L96】
 
