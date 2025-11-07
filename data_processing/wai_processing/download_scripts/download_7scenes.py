@@ -6,10 +6,18 @@
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable
 
-from wai_processing.utils.download import extract_zip_archives, parallel_download
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from data_processing.wai_processing.utils.download import (
+    extract_zip_archives,
+    parallel_download,
+)
 
 SCENE_NAMES: tuple[str, ...] = (
     "chess",
