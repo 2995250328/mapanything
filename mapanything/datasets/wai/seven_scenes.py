@@ -50,7 +50,7 @@ class SevenScenesWAI(BaseDataset):
 
     def _infer_scene_split(self, scene_name: str) -> str | None:
         parts = scene_name.split("_")
-        if len(parts) >= 3:
+        if len(parts) >= 2:
             return parts[1].lower()
         return None
 

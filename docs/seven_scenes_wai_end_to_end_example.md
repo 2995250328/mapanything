@@ -74,7 +74,7 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 2. `python -m wai_processing.scripts.covisibility` —— 基于真值深度计算共视图指标。
 3. `python -m wai_processing.scripts.run_moge` —— 生成 MapAnything 下游任务所需的统计量。
 
-转换完成后，`$WAI_ROOT` 下会按场景与序列创建目录，例如 `chess_train_seq-01/`，内部包含 `images/`、`depth/`、`scene_meta.json` 等文件。
+转换完成后，`$WAI_ROOT` 会按场景与 split（`train`/`test`）聚合生成目录，例如 `chess_train/`、`chess_test/`。每个目录都包含该 split 下所有序列的 `images/`、`depth/` 与统一的 `scene_meta.json` 文件。
 
 ## 4. 验证转换结果
 
@@ -144,12 +144,14 @@ $DATA_ROOT/
 └── ...
 
 $WAI_ROOT/
-├── chess_train_seq-01/
+├── chess_train/
 │   ├── images/seq-01-frame-000000.color.png -> ../../../../7scenes_source/... (符号链接)
+│   ├── images/seq-02-frame-000000.color.png -> ../../../../7scenes_source/... (符号链接)
 │   ├── depth/seq-01-frame-000000.exr
+│   ├── depth/seq-02-frame-000000.exr
 │   └── scene_meta.json
-├── chess_test_seq-03/
-├── heads_train_seq-01/
+├── chess_test/
+├── heads_train/
 └── ...
 ```
 

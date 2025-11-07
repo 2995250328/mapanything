@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from argconf import argconf_parse
-from mapanything.utils.wai.core import store_data
+from mapanything.utils.wai.core import load_data, store_data
 from natsort import natsorted
 from PIL import Image
 from wai_processing.utils.globals import WAI_PROC_CONFIG_PATH
@@ -65,17 +65,21 @@ def _discover_scene_keys(cfg) -> list[str]:
             if not rgb_dir.exists():
                 logger.warning("Skipping %s; missing rgb/ directory", split_dir)
                 continue
+            has_valid_sequence = False
             for image_file in natsorted(rgb_dir.glob(f"*{RGB_SUFFIX}")):
                 prefix = image_file.name.replace(RGB_SUFFIX, "")
                 seq_name = prefix.split("-frame")[0]
-                scene_key = f"{dataset_name}/{split_name}/{seq_name}"
                 if sequence_whitelist_full and (
-                    scene_key not in sequence_whitelist_full
+                    f"{dataset_name}/{split_name}/{seq_name}" not in sequence_whitelist_full
                     and seq_name not in sequence_whitelist_short
                 ):
                     continue
-                if scene_key not in scene_keys:
-                    scene_keys.append(scene_key)
+                has_valid_sequence = True
+                break
+            if has_valid_sequence:
+                split_key = f"{dataset_name}_{split_name}"
+                if split_key not in scene_keys:
+                    scene_keys.append(split_key)
     return scene_keys
 
 
@@ -122,8 +126,22 @@ def _load_depth(depth_path: Path, invalid_values: set[int]) -> np.ndarray:
     return depth
 
 
+def _sequence_filters(cfg):
+    sequence_whitelist_cfg = cfg.get("sequence_whitelist")
+    if not sequence_whitelist_cfg:
+        return None, None
+    full_keys = {entry for entry in sequence_whitelist_cfg}
+    short_keys = {entry.split("/")[-1] for entry in sequence_whitelist_cfg}
+    return full_keys, short_keys
+
+
 def process_seven_scenes_scene(cfg, scene_key: str):
-    dataset_name, split, sequence = scene_key.split("/")
+    if "_" not in scene_key:
+        raise ValueError(
+            "Expected scene keys to be formatted as '<dataset>_<split>' but received "
+            f"{scene_key!r}."
+        )
+    dataset_name, split = scene_key.split("_", 1)
     source_root = Path(cfg.original_root) / f"pgt_7scenes_{dataset_name}" / split
 
     rgb_dir = source_root / "rgb"
@@ -134,23 +152,47 @@ def process_seven_scenes_scene(cfg, scene_key: str):
     if not rgb_dir.exists():
         raise FileNotFoundError(f"Missing rgb directory at {rgb_dir}")
 
-    wai_scene_name = f"{dataset_name}_{split}_{sequence}"
-    target_scene_root = Path(cfg.root) / wai_scene_name
+    target_scene_root = Path(cfg.root) / scene_key
     image_dir = target_scene_root / "images"
     depth_out_dir = target_scene_root / "depth"
     image_dir.mkdir(parents=True, exist_ok=True)
     depth_out_dir.mkdir(parents=True, exist_ok=True)
 
     invalid_values = set(cfg.get("invalid_depth_values", [0, 65535]))
+    sequence_whitelist_full, sequence_whitelist_short = _sequence_filters(cfg)
 
-    image_files = natsorted(rgb_dir.glob(f"{sequence}-frame-*{RGB_SUFFIX}"))
+    image_files = natsorted(rgb_dir.glob(f"*{RGB_SUFFIX}"))
+    if sequence_whitelist_full or sequence_whitelist_short:
+        filtered_files = []
+        for image_path in image_files:
+            base_name = image_path.name.replace(RGB_SUFFIX, "")
+            seq_name = base_name.split("-frame")[0]
+            if sequence_whitelist_full and (
+                f"{dataset_name}/{split}/{seq_name}" not in sequence_whitelist_full
+                and seq_name not in sequence_whitelist_short
+            ):
+                continue
+            filtered_files.append(image_path)
+        image_files = filtered_files
+
     if not image_files:
         logger.warning("No frames found for %s", scene_key)
-        return "finished", "empty_sequence"
+        return "finished", "empty_split"
 
-    frames = []
+    existing_meta_path = target_scene_root / "scene_meta.json"
+    if existing_meta_path.exists():
+        scene_meta = load_data(existing_meta_path, "scene_meta")
+        frames = list(scene_meta.get("frames", []))
+    else:
+        frames = []
+
+    existing_frame_names = {frame["frame_name"] for frame in frames}
+
     for image_path in image_files:
         base_name = image_path.name.replace(RGB_SUFFIX, "")
+        if base_name in existing_frame_names:
+            continue
+
         depth_path = depth_dir / f"{base_name}{DEPTH_SUFFIX}"
         pose_path = pose_dir / f"{base_name}{POSE_SUFFIX}"
         calib_path = calib_dir / f"{base_name}{CALIB_SUFFIX}"
@@ -163,9 +205,8 @@ def process_seven_scenes_scene(cfg, scene_key: str):
             continue
 
         target_image_path = image_dir / image_path.name
-        if target_image_path.exists():
-            target_image_path.unlink()
-        target_image_path.symlink_to(image_path.resolve())
+        if not target_image_path.exists():
+            target_image_path.symlink_to(image_path.resolve())
 
         depth = _load_depth(depth_path, invalid_values)
         rel_depth_path = Path("depth") / f"{base_name}.exr"
@@ -188,13 +229,16 @@ def process_seven_scenes_scene(cfg, scene_key: str):
             "cy": float(cy),
         }
         frames.append(frame_entry)
+        existing_frame_names.add(base_name)
 
     if not frames:
         logger.warning("All frames skipped for %s", scene_key)
         return "finished", "no_valid_frames"
 
+    frames = sorted(frames, key=lambda frame: frame["frame_name"])
+
     scene_meta = {
-        "scene_name": wai_scene_name,
+        "scene_name": scene_key,
         "dataset_name": cfg.dataset_name,
         "version": cfg.version,
         "shared_intrinsics": False,

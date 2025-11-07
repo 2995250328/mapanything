@@ -88,14 +88,19 @@ pgt_7scenes_chess/
 4. **相机内参**：从 `*.calibration.txt` 解析 `fx, fy, cx, cy`，若文件为空则回退到配置中定义的默认焦距和图像中心。
 5. **WAI 元数据**：为每个帧生成包含 `image`、`depth`、`transform_matrix` 以及分辨率、焦距、主点等信息的条目。
 
-最终，每个序列（例：`pgt_7scenes_chess/train/seq-01`）会在目标目录下生成一个独立的 WAI 场景目录 `chess_train_seq-01`，内部包含：
+最终，每个场景只会按照 split 聚合为两个子数据集（如 `train` 与 `test`）。
+例如 `pgt_7scenes_chess/train/` 下所有序列会被合并到同一个目标目录 `chess_train/` 中：
 
 ```
-chess_train_seq-01/
+chess_train/
 ├── images/seq-01-frame-000000.color.png -> 原始图像符号链接
+├── images/seq-02-frame-000000.color.png -> 原始图像符号链接
 ├── depth/seq-01-frame-000000.exr
+├── depth/seq-02-frame-000000.exr
 └── scene_meta.json
 ```
+
+`scene_meta.json` 会列出所有来自 `train` split 的帧信息，便于后续统一抽样。
 
 ## 5. 配置文件与批处理
 
