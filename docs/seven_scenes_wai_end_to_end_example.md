@@ -141,7 +141,7 @@ python scripts/train.py \
 
 ### 5.3 运行 AA 特征融合重建 Demo
 
-如果已经通过 MapAnything 捕获了交替注意力（AA）中间特征（例如利用 `info_sharing_outputs.pt`），可以借助仓库提供的 demo 在 7Scenes 上测试“储存多视角记忆 + 单视角查询”的重建效果。
+如果已经通过 MapAnything 捕获了交替注意力（AA）中间特征（例如利用 `info_sharing_outputs.pt`），可以借助记忆版 demo 在 7Scenes 上测试“储存多视角记忆 + 单视角查询”的重建效果。
 
 1. 首先在服务器端运行脚本，将重建结果写入磁盘：
 
@@ -151,7 +151,7 @@ python scripts/train.py \
     DEVICE=cuda NUM_SAMPLES=3 DATA_ROOT="$WAI_ROOT" \
     SAMPLE_INDICES=10,42 \
     HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata" \
-    bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh
+    bash bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh
     ```
 
     - `SAMPLE_INDICES` 会覆盖 `NUM_SAMPLES`，可留空以顺序取样。

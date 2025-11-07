@@ -8,37 +8,29 @@
 set -euo pipefail
 export HYDRA_FULL_ERROR=1
 
+: "${STORED_FEATURE_FILE:?Set STORED_FEATURE_FILE to the info_sharing_outputs.pt path}"
 : "${OUTPUT_ROOT:?Set OUTPUT_ROOT to the reconstruction artifact directory}"
+
+STORED_FEATURE_FILE=$(realpath "${STORED_FEATURE_FILE}")
 
 mkdir -p "${OUTPUT_ROOT}"
 OUTPUT_ROOT=$(realpath "${OUTPUT_ROOT}")
 
 DEVICE=${DEVICE:-cuda}
-NUM_SAMPLES=${NUM_SAMPLES:-4}
-VIEWS_PER_SAMPLE=${VIEWS_PER_SAMPLE:-}
+NUM_SAMPLES=${NUM_SAMPLES:-1}
 SAMPLE_INDICES=${SAMPLE_INDICES:-}
-START_INDEX=${START_INDEX:-0}
-MAX_INDEX=${MAX_INDEX:-}
 DATA_ROOT=${DATA_ROOT:-}
 HYDRA_OVERRIDES=${HYDRA_OVERRIDES:-}
 
 CLI_ARGS=(
-  "reconstruction.output_dir=${OUTPUT_ROOT}"
-  "reconstruction.device=${DEVICE}"
-  "reconstruction.num_samples=${NUM_SAMPLES}"
-  "reconstruction.start_index=${START_INDEX}"
+  "fusion.stored_feature_file=${STORED_FEATURE_FILE}"
+  "demo.output_dir=${OUTPUT_ROOT}"
+  "demo.device=${DEVICE}"
+  "demo.num_samples=${NUM_SAMPLES}"
 )
 
-if [[ -n "${MAX_INDEX}" ]]; then
-  CLI_ARGS+=("reconstruction.max_index=${MAX_INDEX}")
-fi
-
-if [[ -n "${VIEWS_PER_SAMPLE}" ]]; then
-  CLI_ARGS+=("reconstruction.views_per_sample=${VIEWS_PER_SAMPLE}")
-fi
-
 if [[ -n "${SAMPLE_INDICES}" ]]; then
-  CLI_ARGS+=("reconstruction.sample_indices=[${SAMPLE_INDICES}]")
+  CLI_ARGS+=("demo.sample_indices=[${SAMPLE_INDICES}]")
 fi
 
 if [[ -n "${DATA_ROOT}" ]]; then
@@ -51,7 +43,7 @@ if [[ -n "${HYDRA_OVERRIDES}" ]]; then
 fi
 
 python3 \
-  -m mapanything.tasks.aa_feature_fusion.dataset_reconstruction \
+  -m mapanything.tasks.aa_feature_fusion.demo \
   "${CLI_ARGS[@]}"
 
-echo "Dataset reconstructions saved to ${OUTPUT_ROOT}"
+echo "Single-view memory reconstructions saved to ${OUTPUT_ROOT}"

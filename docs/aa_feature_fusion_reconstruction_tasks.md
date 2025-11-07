@@ -1,0 +1,70 @@
+# AA 特征融合重建与 SCR 训练任务指南
+
+本文聚焦于仓库中新引入的三个脚本：
+
+1. **数据集重建 Demo**（`run_demo_reconstruction.sh`）：直接从数据集中抽取多视图样本执行 MapAnything 推理。
+2. **记忆驱动重建**（`run_memory_reconstruction.sh`）：复用 `info_sharing_outputs.pt` 中缓存的 AA 块，对单帧输入进行增强重建。
+3. **ACE 缓冲区 SCR 训练**（`train_scr_with_buffer.sh`）：将 AA 融合后的密集特征写入训练缓冲区，再拟合一个轻量级的场景坐标回归头。
+
+## 1. 数据集多视图重建
+
+脚本位置：`bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh`
+
+示例命令：
+
+```bash
+OUTPUT_ROOT="$WAI_ROOT/dataset_runs" \
+DEVICE=cuda NUM_SAMPLES=6 VIEWS_PER_SAMPLE=4 DATA_ROOT="$WAI_ROOT" \
+HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt" \
+bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh
+```
+
+- `VIEWS_PER_SAMPLE` 控制从数据集中抽取的视角数量；默认为配置文件中的 `dataset.num_views`。
+- `START_INDEX`/`MAX_INDEX` 或 `SAMPLE_INDICES` 用于选择场景。
+- 输出目录下会生成按场景划分的子文件夹，每个子文件夹包含 `reconstruction.pt` 与跨样本汇总的 `summary.json`。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L63】【F:mapanything/tasks/aa_feature_fusion/dataset_reconstruction.py†L1-L176】
+
+内部流程：脚本会构建原生 `MapAnything` 模型，逐条加载数据集条目，将必要的几何信息（光线、深度、位姿、尺度标记等）转换为张量后调用 `model.forward` 获取每个视角的密集输出，并可选附带基于真值深度计算的点云目标。【F:mapanything/tasks/aa_feature_fusion/dataset_reconstruction.py†L20-L176】【F:configs/tasks/aa_feature_fusion/dataset_demo.yaml†L1-L17】
+
+## 2. 记忆增强的单视图重建
+
+脚本位置：`bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh`
+
+示例命令：
+
+```bash
+STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
+OUTPUT_ROOT="$WAI_ROOT/memory_runs" \
+DEVICE=cuda NUM_SAMPLES=8 DATA_ROOT="$WAI_ROOT" \
+HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt" \
+bash bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh
+```
+
+- 需要先通过 `ace_store_intermediates.sh` 等流程生成 `info_sharing_outputs.pt`。
+- 其余参数与旧版 Demo 保持一致，仍支持 `SAMPLE_INDICES` 定位单个样本。
+- Python 端逻辑沿用 `mapanything.tasks.aa_feature_fusion.demo`，会加载 AA 记忆块、执行 token 融合与下游头推理，并序列化重建结果。【F:bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh†L1-L61】【F:mapanything/tasks/aa_feature_fusion/demo.py†L17-L207】
+
+## 3. ACE 缓冲区驱动的 SCR 训练
+
+脚本位置：`bash_scripts/ace/train_scr_with_buffer.sh`
+
+示例命令：
+
+```bash
+STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
+OUTPUT_ROOT="$WAI_ROOT/scr_training" \
+DEVICE=cuda NUM_SAMPLES=48 BATCH_SIZE=6 BUFFER_CAPACITY=384 \
+HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt" \
+bash bash_scripts/ace/train_scr_with_buffer.sh
+```
+
+- 训练脚本首先调用 `mapanything.tasks.aa_feature_fusion.scr_training` 构建融合流水线，并将若干样本的 DPT 密集特征与相应的 3D 点云目标写入 FIFO 缓冲区。【F:bash_scripts/ace/train_scr_with_buffer.sh†L1-L61】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L1-L204】
+- `scr_head.hidden_dim`、`buffer.capacity` 等参数可通过环境变量或 `HYDRA_OVERRIDES` 自定义。
+- 缓冲区填满后会构建 `TensorDataset`，以 SmoothL1 损失拟合 `SCRRegressionHead`，最终在 `OUTPUT_ROOT` 下产出 `scr_head.pt` 检查点。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L41-L149】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L151-L204】
+
+### 训练缓冲区设计要点
+
+- `ACETrainingBuffer` 使用固定长度的 deque 保存特征与目标，超出容量时自动覆盖最旧样本，模拟 ACE 论文中的滑动窗口式训练缓存。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L45-L69】
+- 由于重用 AA 记忆块，`fusion.stored_feature_file` 为必填项；脚本会在 GPU 不可用时自动降级到 CPU 以确保可运行性。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L152-L166】
+- `SCRRegressionHead` 默认输出三通道 XYZ，可根据任务需求在配置中改写输出维度或隐藏层大小。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L72-L86】【F:configs/tasks/aa_feature_fusion/scr_train.yaml†L1-L26】
+
+通过上述三个脚本，可以快速完成“多视图数据载入 → 单视图记忆重建 → SCR 回归训练”的闭环流程，并在 `docs/aa_feature_fusion_workflow.md` 的基础上拓展更多 ACE 相关实验。 
