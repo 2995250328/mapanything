@@ -150,7 +150,6 @@ python scripts/train.py \
         --device cuda \
         --num-samples 3 \
         --data-root "$WAI_ROOT" \
-        mapanything \
         /path/to/info_sharing_outputs.pt \
         "$WAI_ROOT/demo_runs" \
         model.pretrained=/path/to/mapanything.ckpt \
