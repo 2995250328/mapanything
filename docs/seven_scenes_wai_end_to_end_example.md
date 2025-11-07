@@ -146,16 +146,16 @@ python scripts/train.py \
 1. 首先在服务器端运行脚本，将重建结果写入磁盘：
 
     ```bash
+    STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
+    OUTPUT_ROOT="$WAI_ROOT/demo_runs" \
     DEVICE=cuda NUM_SAMPLES=3 DATA_ROOT="$WAI_ROOT" \
-    bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh \
-        /path/to/info_sharing_outputs.pt \
-        "$WAI_ROOT/demo_runs" \
-        model.pretrained=/path/to/mapanything.ckpt \
-        machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata
+    SAMPLE_INDICES=10,42 \
+    HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata" \
+    bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh
     ```
 
-    - 如果想固定样本，可在命令前添加 `SAMPLE_INDICES=10,42,...`，脚本会自动忽略 `NUM_SAMPLES`。
-    - `fusion.stored_feature_file` 通过位置参数提供；其余 Hydra 覆盖（如 `model.pretrained`、`root_data_dir`）可按需追加。
+    - `SAMPLE_INDICES` 会覆盖 `NUM_SAMPLES`，可留空以顺序取样。
+    - `HYDRA_OVERRIDES` 支持一次性传入多个覆盖项，使用空格分隔即可。
     - 每个样本会生成一个 `<scene>_<split>_<frame>.pt`，内部包含 RGB、相机参数以及融合后的点云/深度信息，并在目录下汇总 `summary.json`。
 
 2. 在本地（例如 WSL）可使用可视化脚本查看或导出 demo 结果：

@@ -8,31 +8,26 @@
 set -euo pipefail
 export HYDRA_FULL_ERROR=1
 
-if [[ $# -lt 2 ]]; then
-  cat <<'USAGE' >&2
-Usage: run_demo_reconstruction.sh <stored_feature_file> <output_root> [overrides...]
+: "${STORED_FEATURE_FILE:?Set STORED_FEATURE_FILE to the info_sharing_outputs.pt path}"
+: "${OUTPUT_ROOT:?Set OUTPUT_ROOT to the reconstruction artifact directory}"
 
-Environment overrides:
-  DEVICE=cuda              # Torch device for the demo run
-  NUM_SAMPLES=1            # Number of dataset items to process
-  SAMPLE_INDICES=0,5,7     # Optional comma-separated indices (overrides NUM_SAMPLES)
-  DATA_ROOT=/path/to/wai   # Optional WAI dataset root passed as root_data_dir
-USAGE
-  exit 1
-fi
-
-STORED_FEATURE_FILE=$(realpath "$1")
-OUTPUT_ROOT=$(realpath "$2")
-shift 2
+STORED_FEATURE_FILE=$(realpath "${STORED_FEATURE_FILE}")
 
 mkdir -p "${OUTPUT_ROOT}"
+OUTPUT_ROOT=$(realpath "${OUTPUT_ROOT}")
 
 DEVICE=${DEVICE:-cuda}
 NUM_SAMPLES=${NUM_SAMPLES:-1}
 SAMPLE_INDICES=${SAMPLE_INDICES:-}
 DATA_ROOT=${DATA_ROOT:-}
+HYDRA_OVERRIDES=${HYDRA_OVERRIDES:-}
 
-HYDRA_ARGS=(
+EXTRA_OVERRIDES=()
+if [[ -n "${HYDRA_OVERRIDES}" ]]; then
+  read -r -a EXTRA_OVERRIDES <<< "${HYDRA_OVERRIDES}"
+fi
+
+PY_ARGS=(
   "fusion.stored_feature_file=${STORED_FEATURE_FILE}"
   "demo.output_dir=${OUTPUT_ROOT}"
   "demo.device=${DEVICE}"
@@ -40,16 +35,19 @@ HYDRA_ARGS=(
 )
 
 if [[ -n "${SAMPLE_INDICES}" ]]; then
-  HYDRA_ARGS+=("demo.sample_indices=[${SAMPLE_INDICES}]")
+  PY_ARGS+=("demo.sample_indices=[${SAMPLE_INDICES}]")
 fi
 
 if [[ -n "${DATA_ROOT}" ]]; then
-  HYDRA_ARGS+=("root_data_dir=${DATA_ROOT}")
+  PY_ARGS+=("root_data_dir=${DATA_ROOT}")
 fi
 
-HYDRA_ARGS+=("$@")
+if [[ ${#EXTRA_OVERRIDES[@]} -gt 0 ]]; then
+  PY_ARGS+=("${EXTRA_OVERRIDES[@]}")
+fi
 
-python3 -m mapanything.tasks.aa_feature_fusion.demo \
-  "${HYDRA_ARGS[@]}"
+python3 \
+  -m mapanything.tasks.aa_feature_fusion.demo \
+  "${PY_ARGS[@]}"
 
 echo "Reconstruction artifacts written to ${OUTPUT_ROOT}"
