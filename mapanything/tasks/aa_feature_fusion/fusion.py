@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -48,6 +48,8 @@ class StoredAAFeatureSequence:
 
     memory_tokens: Sequence[torch.Tensor]
     embed_dim: int
+    spatial_shape: Tuple[int, int]
+    additional_token: Optional[torch.Tensor]
 
     @classmethod
     def from_outputs(
@@ -55,14 +57,35 @@ class StoredAAFeatureSequence:
         blocks: Iterable[MultiViewTransformerOutput],
     ) -> "StoredAAFeatureSequence":
         token_groups: List[torch.Tensor] = []
+        spatial_shape: Optional[Tuple[int, int]] = None
+        additional_token: Optional[torch.Tensor] = None
         for block in blocks:
-            per_view_tokens = [_flatten_view_features(feature) for feature in block.features]
+            per_view_tokens = []
+            for feature in block.features:
+                height, width = feature.shape[-2:]
+                if spatial_shape is None:
+                    spatial_shape = (height, width)
+                elif spatial_shape != (height, width):
+                    raise ValueError(
+                        "All alternating-attention blocks must share the same spatial shape; "
+                        f"expected {spatial_shape} but received {(height, width)}"
+                    )
+                per_view_tokens.append(_flatten_view_features(feature))
             memory = torch.cat(per_view_tokens, dim=1)
             token_groups.append(memory.detach())
+            if block.additional_token_features is not None:
+                additional_token = block.additional_token_features.detach()
         if not token_groups:
             raise ValueError("No alternating-attention blocks were provided for memory construction.")
         embed_dim = token_groups[0].shape[-1]
-        return cls(memory_tokens=token_groups, embed_dim=embed_dim)
+        if spatial_shape is None:
+            raise ValueError("Unable to infer spatial shape from alternating-attention blocks.")
+        return cls(
+            memory_tokens=token_groups,
+            embed_dim=embed_dim,
+            spatial_shape=spatial_shape,
+            additional_token=additional_token,
+        )
 
     @classmethod
     def from_file(
@@ -89,6 +112,14 @@ class StoredAAFeatureSequence:
     def num_blocks(self) -> int:
         return len(self.memory_tokens)
 
+    @property
+    def height(self) -> int:
+        return self.spatial_shape[0]
+
+    @property
+    def width(self) -> int:
+        return self.spatial_shape[1]
+
     def iter_tokens(
         self,
         *,
@@ -100,6 +131,21 @@ class StoredAAFeatureSequence:
                 yield tokens.to(device=device, dtype=dtype)
             else:
                 yield tokens
+
+    def reshape_tokens_to_feature_map(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Reshape flattened tokens ``(B, S, C)`` back into ``(B, C, H, W)`` feature maps."""
+
+        batch, sequence, embed_dim = tokens.shape
+        expected_sequence = self.height * self.width
+        if sequence != expected_sequence:
+            raise ValueError(
+                "Token sequence length does not match stored spatial shape: "
+                f"expected {expected_sequence} but received {sequence}"
+            )
+        feature_map = tokens.transpose(1, 2).contiguous().reshape(
+            batch, embed_dim, self.height, self.width
+        )
+        return feature_map
 
 
 class AlternatingAttentionMemoryBlock(nn.Module):
@@ -192,6 +238,7 @@ class AAFeatureFusionModule(nn.Module):
         )
         if self._memory is None:
             self.blocks = nn.ModuleList()
+            self._embed_dim: Optional[int] = None
         else:
             embed_dim = self._memory.embed_dim
             self.blocks = nn.ModuleList(
@@ -205,10 +252,23 @@ class AAFeatureFusionModule(nn.Module):
                     for _ in range(self._memory.num_blocks)
                 ]
             )
+            self._embed_dim = embed_dim
 
     @property
     def has_memory(self) -> bool:
         return self._memory is not None and self._memory.num_blocks > 0
+
+    @property
+    def spatial_shape(self) -> Optional[Tuple[int, int]]:
+        if self._memory is None:
+            return None
+        return self._memory.spatial_shape
+
+    @property
+    def embed_dim(self) -> Optional[int]:
+        if self._memory is None:
+            return None
+        return self._memory.embed_dim
 
     def forward(self, query_tokens: torch.Tensor) -> torch.Tensor:
         if not self.has_memory:
@@ -223,6 +283,25 @@ class AAFeatureFusionModule(nn.Module):
         ):
             fused = block(fused, memory_tokens)
         return fused
+
+    def tokens_to_feature_map(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Convert fused token sequences back into 2D feature maps."""
+
+        if self._memory is None:
+            raise RuntimeError("Cannot reshape tokens without stored alternating-attention memory.")
+        return self._memory.reshape_tokens_to_feature_map(tokens)
+
+    def get_additional_token(
+        self, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None
+    ) -> Optional[torch.Tensor]:
+        """Return the stored additional token (e.g., scale token) if available."""
+
+        if self._memory is None or self._memory.additional_token is None:
+            return None
+        token = self._memory.additional_token
+        if device is not None or dtype is not None:
+            token = token.to(device=device, dtype=dtype)
+        return token
 
     def reload(self, path: str | Path, *, map_location: Optional[torch.device | str] = None) -> None:
         """Replace the stored memory with a new alternating-attention capture."""
@@ -256,3 +335,4 @@ class AAFeatureFusionModule(nn.Module):
             )
         self._memory = memory
         self.stored_feature_file = Path(path).expanduser()
+        self._embed_dim = memory.embed_dim

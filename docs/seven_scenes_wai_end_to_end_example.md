@@ -139,6 +139,39 @@ python scripts/train.py \
 
 也可以把 7Scenes 与其他数据集组合，只需把 `dataset.train_dataset` 中的列表换成多个条目即可。
 
+### 5.3 运行 AA 特征融合重建 Demo
+
+如果已经通过 MapAnything 捕获了交替注意力（AA）中间特征（例如利用 `info_sharing_outputs.pt`），可以借助仓库提供的 demo 在 7Scenes 上测试“储存多视角记忆 + 单视角查询”的重建效果。
+
+1. 首先在服务器端运行脚本，将重建结果写入磁盘：
+
+    ```bash
+    bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh \
+        --device cuda \
+        --num-samples 3 \
+        --data-root "$WAI_ROOT" \
+        mapanything \
+        /path/to/info_sharing_outputs.pt \
+        "$WAI_ROOT/demo_runs" \
+        model.pretrained=/path/to/mapanything.ckpt \
+        machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata
+    ```
+
+    - `--indices 10,42,...` 可直接指定想处理的样本索引，脚本会自动忽略 `--num-samples`。
+    - `fusion.stored_feature_file` 通过位置参数提供；其余 Hydra 覆盖（如 `model.pretrained`、`root_data_dir`）可按需追加。
+    - 每个样本会生成一个 `<scene>_<split>_<frame>.pt`，内部包含 RGB、相机参数以及融合后的点云/深度信息，并在目录下汇总 `summary.json`。
+
+2. 在本地（例如 WSL）可使用可视化脚本查看或导出 demo 结果：
+
+    ```bash
+    python scripts/visualization/view_aa_fusion_demo.py \
+        "$WAI_ROOT/demo_runs/chess_test_seq-03-frame-000123.pt" \
+        --save /tmp/chess_demo.png \
+        --export-pts /tmp/chess_demo.ply
+    ```
+
+    脚本默认输出一张包含 RGB 与深度预览的 PNG；如指定 `--show`，则直接弹出窗口。`--export-pts` 会额外写出带颜色的 ASCII PLY 点云，便于在其它工具中进一步分析。
+
 ## 6. 目录检查速查表
 
 运行完整流程后，关键目录应类似：

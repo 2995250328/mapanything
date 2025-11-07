@@ -1,5 +1,6 @@
 """AA feature fusion task utilities."""
 
+from .builder import build_pipeline_from_cfg
 from .fusion import (
     AAFeatureFusionModule,
     StoredAAFeatureSequence,
@@ -8,6 +9,7 @@ from .fusion import (
 from .pipeline import AAFeatureFusionPipeline
 
 __all__ = [
+    "build_pipeline_from_cfg",
     "AAFeatureFusionModule",
     "AAFeatureFusionPipeline",
     "StoredAAFeatureSequence",

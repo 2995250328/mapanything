@@ -1,0 +1,18 @@
+# Demo configuration for running AA feature fusion reconstruction on 7Scenes.
+defaults:
+  - default
+  - dataset: seven_scenes_wai/test/default
+  - _self_
+
+dataset:
+  num_views: 1
+  test:
+    num_views: 1
+    variable_num_views: false
+
+demo:
+  device: cuda
+  num_samples: 1
+  sample_indices: null
+  output_dir: ${hydra:run.dir}/reconstruction
+  memory_efficient_inference: false

@@ -8,12 +8,12 @@ from typing import Any
 import hydra
 from omegaconf import DictConfig
 
-from .train import _build_pipeline
+from .builder import build_pipeline_from_cfg
 
 
 def run_evaluation(cfg: DictConfig) -> Any:
     log = logging.getLogger(__name__)
-    pipeline = _build_pipeline(cfg)
+    pipeline = build_pipeline_from_cfg(cfg)
     log.info("Initialized AA feature fusion pipeline for evaluation.")
     log.info("Dataset config: %s", cfg.dataset)
     log.info("Evaluation parameters: %s", cfg.evaluation)
