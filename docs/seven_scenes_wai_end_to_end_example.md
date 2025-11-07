@@ -61,6 +61,7 @@ cd -
 bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
     --device cuda \
     --moge-batch-size 8 \
+    --moge-model Ruicheng/moge-2-vitl-normal \
     "$DATA_ROOT" \
     "$WAI_ROOT" \
     "$CONDA_ENV" \
@@ -73,12 +74,15 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 
 - `--device` 用于显式指定 GPU/CPU 设备（默认为 `cuda`）。该设置会贯穿转换、共视图计算与 MoGe 推理，便于充分利用 GPU。
 - `--moge-batch-size` 可以放大 MoGe 推理的 batch size，提高 GPU 利用率；若显存不足可调小或直接省略，回落到默认配置。
+- `--moge-model` 允许指定 MoGe 权重来源：默认值 `Ruicheng/moge-2-vitl-normal` 会通过 Hugging Face 自动下载；若提前准备好了本地 `model.pt`，可以传入绝对路径免去重复下载。
 
 脚本内部依次调用：
 
 1. `python -m wai_processing.scripts.conversion.seven_scenes` —— 生成符号链接的 RGB、EXR 深度、`scene_meta.json`。
 2. `python -m wai_processing.scripts.covisibility` —— 基于真值深度计算共视图指标。
 3. `python -m wai_processing.scripts.run_moge` —— 生成 MapAnything 下游任务所需的统计量。
+
+如果重复执行该脚本，`scene_meta.json` 中已经标记为 `moge.finished` 的场景会被自动跳过；转换脚本也会检测并复用现有输出，因此不会从零开始重建全部文件。
 
 转换完成后，`$WAI_ROOT` 会按场景与 split（`train`/`test`）聚合生成目录，例如 `chess_train/`、`chess_test/`。每个目录都包含该 split 下所有序列的 `images/`、`depth/` 与统一的 `scene_meta.json` 文件。
 

@@ -55,6 +55,7 @@ MapAnything 的转换脚本期望看到如下的预处理结果：
 bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
     --device cuda \
     --moge-batch-size 8 \
+    --moge-model Ruicheng/moge-2-vitl-normal \
     /mnt/storage/xwh/7Scenes \
     /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
     wai_processing
@@ -64,6 +65,7 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 
 - `--device`：显式指定 PyTorch 设备（默认为 `cuda`，可改为 `cpu` 或 `cuda:1` 等）。转换阶段会在该设备上执行深度数据的清理、`covisibility` 计算以及 `MoGe` 推理。
 - `--moge-batch-size`：覆盖 `MoGe` 的推理批大小，值越大越能填满 GPU，但也需要更多显存。
+- `--moge-model`：覆盖 MoGe 权重路径。默认值为 Hugging Face 仓库 `Ruicheng/moge-2-vitl-normal`；若已手动下载权重文件，可直接传入本地 `.pt` 路径避免重复下载。
 
 脚本会自动把场景过滤条件和设备配置传递给转换与后处理脚本，仅为指定场景生成 WAI 数据。
 
@@ -73,6 +75,8 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 2. 运行 `covisibility` 与 `run_moge`，生成与其他数据集一致的附加元数据。
 
 `<conda_env>` 参数用于指定安装了 `wai_processing` 依赖的 Conda 环境，脚本会通过 `conda run` 自动切换环境。
+
+若再次运行该脚本，它会跳过已在 `scene_meta.json` 中标记为 `moge.finished` 的场景，只对未完成的部分重新计算；转换阶段也会复用已存在的 EXR、元数据和符号链接，因此无需担心“从头”覆盖整个数据集。
 
 ## 4. 转换脚本细节
 

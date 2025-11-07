@@ -4,17 +4,20 @@ set -euo pipefail
 usage() {
   cat <<'EOF' >&2
 Usage: seven_scenes_to_wai.sh [--datasets scene1[,scene2...]] [--device DEVICE] [--moge-batch-size N] \
-                              <processed_root> <wai_output_dir> <conda_env> [conversion overrides...]
+                              [--moge-model PATH_OR_REPO] <processed_root> <wai_output_dir> <conda_env> \
+                              [conversion overrides...]
   processed_root 目录需要包含 pgt_7scenes_* 子目录 (train/test/calibration/depth/poses/rgb)。
   --datasets 支持用逗号分隔的场景列表，例如 --datasets chess 或 --datasets chess,heads。
   --device 控制转换与后处理脚本使用的 PyTorch 设备（默认 cuda，可设置为 cpu、cuda:1 等）。
   --moge-batch-size 指定 MoGe 推理批大小；默认保持配置文件中的设定。
+  --moge-model     覆盖 MoGe 权重位置，可填写本地 .pt 文件路径或 Hugging Face 仓库名。
 EOF
 }
 
 DATASET_FILTER=""
 DEVICE="cuda"
 MOGE_BATCH_SIZE=""
+MOGE_MODEL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +43,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       MOGE_BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --moge-model)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 1
+      fi
+      MOGE_MODEL="$2"
       shift 2
       ;;
     -h|--help)
@@ -111,6 +122,10 @@ MOGE_ARGS=(
 
 if [[ -n "${MOGE_BATCH_SIZE}" ]]; then
   MOGE_ARGS+=("batch_size=${MOGE_BATCH_SIZE}")
+fi
+
+if [[ -n "${MOGE_MODEL}" ]]; then
+  MOGE_ARGS+=("model_path=${MOGE_MODEL}")
 fi
 
 conda run -n "${CONDA_ENV}" \
