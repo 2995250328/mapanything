@@ -7,6 +7,7 @@
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -21,8 +22,8 @@ class SevenScenesWAI(BaseDataset):
         self,
         *args,
         ROOT,
-        dataset_metadata_dir,
-        split,
+        dataset_metadata_dir=None,
+        split=None,
         overfit_num_sets=None,
         sample_specific_scene: bool = False,
         specific_scene_name: str | None = None,
@@ -32,7 +33,7 @@ class SevenScenesWAI(BaseDataset):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.dataset_metadata_dir = dataset_metadata_dir
-        self.split = split
+        self.split = split or "train"
         self.overfit_num_sets = overfit_num_sets
         self.sample_specific_scene = sample_specific_scene
         self.specific_scene_name = specific_scene_name
@@ -45,7 +46,9 @@ class SevenScenesWAI(BaseDataset):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _metadata_path(self) -> Path:
+    def _metadata_path(self) -> Optional[Path]:
+        if not self.dataset_metadata_dir or str(self.dataset_metadata_dir).lower() == "none":
+            return None
         return Path(self.dataset_metadata_dir) / self.split / f"seven_scenes_scene_list_{self.split}.npy"
 
     def _infer_scene_split(self, scene_name: str) -> str | None:
@@ -110,7 +113,7 @@ class SevenScenesWAI(BaseDataset):
     # ------------------------------------------------------------------
     def _load_data(self):
         metadata_path = self._metadata_path()
-        if metadata_path.exists():
+        if metadata_path is not None and metadata_path.exists():
             split_scene_list = list(np.load(metadata_path, allow_pickle=True))
         else:
             split_scene_list = self._scan_split_directory(self.split)
@@ -185,8 +188,9 @@ def get_parser():
     parser.add_argument(
         "-dmd",
         "--dataset_metadata_dir",
-        default="/fsx/nkeetha/mapanything_dataset_metadata",
+        default="",
         type=str,
+        help="Optional metadata directory; omit when scenes are already split by folder name.",
     )
     parser.add_argument("-s", "--split", default="test", type=str)
     parser.add_argument(

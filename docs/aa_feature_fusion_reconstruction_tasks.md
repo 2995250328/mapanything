@@ -51,18 +51,20 @@ bash bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh
 STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
 OUTPUT_ROOT="$WAI_ROOT/scr_training" \
 DEVICE=cuda NUM_SAMPLES=48 BATCH_SIZE=6 BUFFER_CAPACITY=384 \
+REPROJECTION_WEIGHT=1.0 XYZ_WEIGHT=0.1 RELATIVE_WEIGHT=0.1 \
 HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt" \
 bash bash_scripts/ace/train_scr_with_buffer.sh
 ```
 
-- 训练脚本首先调用 `mapanything.tasks.aa_feature_fusion.scr_training` 构建融合流水线，并将若干样本的 DPT 密集特征与相应的 3D 点云目标写入 FIFO 缓冲区。【F:bash_scripts/ace/train_scr_with_buffer.sh†L1-L61】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L1-L204】
+- 训练脚本首先调用 `mapanything.tasks.aa_feature_fusion.scr_training` 构建融合流水线，逐个样本收集 DPT 密集特征、世界坐标、相机内外参以及场景均值位姿，并写入 ACE 风格的 FIFO 缓冲区。【F:bash_scripts/ace/train_scr_with_buffer.sh†L1-L79】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L29-L213】
 - `scr_head.hidden_dim`、`buffer.capacity` 等参数可通过环境变量或 `HYDRA_OVERRIDES` 自定义。
-- 缓冲区填满后会构建 `TensorDataset`，以 SmoothL1 损失拟合 `SCRRegressionHead`，最终在 `OUTPUT_ROOT` 下产出 `scr_head.pt` 检查点。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L41-L149】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L151-L204】
+- 缓冲区会按样本构建 `DataLoader`，采用 ACE 论文中的重投影主损失，辅以可调的 XYZ 与相对坐标正则项，最终在 `OUTPUT_ROOT` 下产出 `scr_head.pt` 检查点。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L88-L213】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L215-L311】
 
 ### 训练缓冲区设计要点
 
-- `ACETrainingBuffer` 使用固定长度的 deque 保存特征与目标，超出容量时自动覆盖最旧样本，模拟 ACE 论文中的滑动窗口式训练缓存。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L45-L69】
-- 由于重用 AA 记忆块，`fusion.stored_feature_file` 为必填项；脚本会在 GPU 不可用时自动降级到 CPU 以确保可运行性。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L152-L166】
-- `SCRRegressionHead` 默认输出三通道 XYZ，可根据任务需求在配置中改写输出维度或隐藏层大小。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L72-L86】【F:configs/tasks/aa_feature_fusion/scr_train.yaml†L1-L26】
+- `ACETrainingBuffer` 以固定长度 deque 保存包含特征图、世界/相对坐标、相机参数与均值位姿的字典条目，容量溢出时自动覆盖最旧样本。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L35-L120】
+- 缓冲构建阶段会为每个场景自动缓存/复用 `statistics/mean_pose.json`，确保均值位姿仅在首次访问时计算，后续直接读取。【F:mapanything/tasks/aa_feature_fusion/pose_stats.py†L12-L109】【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L237-L283】
+- 由于重用 AA 记忆块，`fusion.stored_feature_file` 为必填项；脚本会在 GPU 不可用时自动降级到 CPU 以确保可运行性。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L315-L347】
+- `SCRRegressionHead` 默认输出三通道 XYZ，可根据任务需求在配置中改写输出维度或隐藏层大小。【F:mapanything/tasks/aa_feature_fusion/scr_training.py†L88-L108】【F:configs/tasks/aa_feature_fusion/scr_train.yaml†L1-L30】
 
 通过上述三个脚本，可以快速完成“多视图数据载入 → 单视图记忆重建 → SCR 回归训练”的闭环流程，并在 `docs/aa_feature_fusion_workflow.md` 的基础上拓展更多 ACE 相关实验。 

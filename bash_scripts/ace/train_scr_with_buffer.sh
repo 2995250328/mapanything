@@ -24,6 +24,9 @@ HIDDEN_DIM=${HIDDEN_DIM:-128}
 SAMPLE_INDICES=${SAMPLE_INDICES:-}
 DATA_ROOT=${DATA_ROOT:-}
 HYDRA_OVERRIDES=${HYDRA_OVERRIDES:-}
+REPROJECTION_WEIGHT=${REPROJECTION_WEIGHT:-}
+XYZ_WEIGHT=${XYZ_WEIGHT:-}
+RELATIVE_WEIGHT=${RELATIVE_WEIGHT:-}
 
 CLI_ARGS=(
   "fusion.stored_feature_file=${STORED_FEATURE_FILE}"
@@ -41,6 +44,18 @@ fi
 
 if [[ -n "${DATA_ROOT}" ]]; then
   CLI_ARGS+=("root_data_dir=${DATA_ROOT}")
+fi
+
+if [[ -n "${REPROJECTION_WEIGHT}" ]]; then
+  CLI_ARGS+=("loss.reprojection_weight=${REPROJECTION_WEIGHT}")
+fi
+
+if [[ -n "${XYZ_WEIGHT}" ]]; then
+  CLI_ARGS+=("loss.xyz_weight=${XYZ_WEIGHT}")
+fi
+
+if [[ -n "${RELATIVE_WEIGHT}" ]]; then
+  CLI_ARGS+=("loss.relative_weight=${RELATIVE_WEIGHT}")
 fi
 
 if [[ -n "${HYDRA_OVERRIDES}" ]]; then

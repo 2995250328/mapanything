@@ -26,6 +26,11 @@ buffer:
   capacity: 256
   shuffle: true
 
+loss:
+  reprojection_weight: 1.0
+  xyz_weight: 0.1
+  relative_weight: 0.1
+
 scr_head:
   hidden_dim: 128
   output_channels: 3

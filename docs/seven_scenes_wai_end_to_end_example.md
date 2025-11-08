@@ -93,10 +93,11 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 ```bash
 python -m mapanything.datasets.wai.seven_scenes \
     --root_dir "$WAI_ROOT" \
-    --dataset_metadata_dir /path/to/mapanything_dataset_metadata \
     --split test \
     --num_of_views 2
 ```
+
+> ℹ️ 如果本地目录已经按照 `scene_split`（如 `chess_train/`、`chess_test/`）区分好样本，可直接省略 `--dataset_metadata_dir`。如仍需沿用官方的元数据 `.npy`，只需额外添加该参数即可。
 
 输出会展示样本数量、视角组合情况等。如果加上 `--viz --save /tmp/rr`（需安装 `rerun`），还能快速可视化。
 
@@ -112,12 +113,12 @@ python benchmarking/dense_n_view/benchmark.py \
     model=mapanything \
     model.mapanything.checkpoint_path=/path/to/mapanything.ckpt \
     root_data_dir="$WAI_ROOT" \
-    machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata \
+    machine.mapanything_dataset_metadata_dir=null \
     dataset.num_views=2
 ```
 
 - `root_data_dir` 会通过 Hydra 传给 `SevenScenesWAI` 加载器。
-- `machine.mapanything_dataset_metadata_dir` 指向预先下载好的公共元数据包。
+- `machine.mapanything_dataset_metadata_dir` 在自建目录划分场景时可设为 `null`，需要官方 `.npy` 元数据时再指定真实路径。
 - `dataset.num_views` 可以按需改成 1～5，覆盖不同的视角组合数量。
 
 ### 5.2 启动训练/微调
@@ -131,7 +132,7 @@ python scripts/train.py \
     dataset.resolution_train="${dataset.resolution_options.512_4_3_ar}" \
     dataset.resolution_val="${dataset.resolution_options.512_4_3_ar}" \
     root_data_dir="$WAI_ROOT" \
-    machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata \
+    machine.mapanything_dataset_metadata_dir=null \
     model=mapanything \
     optimizer=adamw \
     training.max_steps=20000
@@ -145,17 +146,17 @@ python scripts/train.py \
 
 1. 首先在服务器端运行脚本，将重建结果写入磁盘：
 
-    ```bash
-    STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
-    OUTPUT_ROOT="$WAI_ROOT/demo_runs" \
-    DEVICE=cuda NUM_SAMPLES=3 DATA_ROOT="$WAI_ROOT" \
-    SAMPLE_INDICES=10,42 \
-    HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt machine.mapanything_dataset_metadata_dir=/path/to/mapanything_dataset_metadata" \
-    bash bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh
-    ```
+      ```bash
+      STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
+      OUTPUT_ROOT="$WAI_ROOT/demo_runs" \
+      DEVICE=cuda NUM_SAMPLES=3 DATA_ROOT="$WAI_ROOT" \
+      SAMPLE_INDICES=10,42 \
+      HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt machine.mapanything_dataset_metadata_dir=null" \
+      bash bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh
+      ```
 
-    - `SAMPLE_INDICES` 会覆盖 `NUM_SAMPLES`，可留空以顺序取样。
-    - `HYDRA_OVERRIDES` 支持一次性传入多个覆盖项，使用空格分隔即可。
+      - `SAMPLE_INDICES` 会覆盖 `NUM_SAMPLES`，可留空以顺序取样。
+      - `HYDRA_OVERRIDES` 支持一次性传入多个覆盖项，使用空格分隔即可；如需恢复官方元数据清单，只需将 `machine.mapanything_dataset_metadata_dir` 改为实际路径。
     - 每个样本会生成一个 `<scene>_<split>_<frame>.pt`，内部包含 RGB、相机参数以及融合后的点云/深度信息，并在目录下汇总 `summary.json`。
 
 2. 在本地（例如 WSL）可使用可视化脚本查看或导出 demo 结果：
