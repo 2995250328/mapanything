@@ -13,15 +13,13 @@
 示例命令：
 
 ```bash
-OUTPUT_ROOT="$WAI_ROOT/dataset_runs" \
-DEVICE=cuda NUM_SAMPLES=6 VIEWS_PER_SAMPLE=4 DATA_ROOT="$WAI_ROOT" \
-HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt" \
 bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh
 ```
 
-- `VIEWS_PER_SAMPLE` 控制从数据集中抽取的视角数量；默认为配置文件中的 `dataset.num_views`。
+- 脚本顶部提供了一组“用户可编辑默认值”，可直接在文件中设置 `OUTPUT_ROOT`、`DATA_ROOT`、`NUM_SAMPLES`、`VIEWS_PER_SAMPLE` 等关键参数；如需临时覆盖，可继续通过同名环境变量传参。
+- `VIEWS_PER_SAMPLE` 控制从数据集中抽取的视角数量；默认为脚本中的 `DEFAULT_VIEWS_PER_SAMPLE`，留空则回落到配置文件的 `dataset.num_views`。
 - `START_INDEX`/`MAX_INDEX` 或 `SAMPLE_INDICES` 用于选择场景。
-- 输出目录下会生成按场景划分的子文件夹，每个子文件夹包含 `reconstruction.pt` 与跨样本汇总的 `summary.json`。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L63】【F:mapanything/tasks/aa_feature_fusion/dataset_reconstruction.py†L1-L176】
+- 输出目录下会生成按场景划分的子文件夹，每个子文件夹包含 `reconstruction.pt` 与跨样本汇总的 `summary.json`。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L78】【F:mapanything/tasks/aa_feature_fusion/dataset_reconstruction.py†L1-L176】
 
 内部流程：脚本会构建原生 `MapAnything` 模型，逐条加载数据集条目，将必要的几何信息（光线、深度、位姿、尺度标记等）转换为张量后调用 `model.forward` 获取每个视角的密集输出，并可选附带基于真值深度计算的点云目标。【F:mapanything/tasks/aa_feature_fusion/dataset_reconstruction.py†L20-L176】【F:configs/tasks/aa_feature_fusion/dataset_demo.yaml†L1-L17】
 
