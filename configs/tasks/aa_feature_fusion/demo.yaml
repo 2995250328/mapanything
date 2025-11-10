@@ -1,6 +1,5 @@
 # Demo configuration for running AA feature fusion reconstruction on 7Scenes.
 defaults:
-  - default
   - dataset: seven_scenes_wai/test/default
   - _self_
 
@@ -16,3 +15,10 @@ demo:
   sample_indices: null
   output_dir: ${hydra:run.dir}/reconstruction
   memory_efficient_inference: false
+
+reconstruction:
+  device: cuda
+  output_dir: dataset_runs
+  num_samples: 24
+  views_per_sample: 1
+  start_index: 0

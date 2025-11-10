@@ -10,4 +10,4 @@ resolution_test_seven_scenes: ${dataset.resolution_options.518_1_33_ar}
 # Test Set
 # Each sequence yields hundreds of frames; request 140 multi-view samples (~20 per scene)
 test_dataset:
-  "+ 140 @ ${dataset.seven_scenes_wai.test.dataset_str}"
+  "+ 3 @ ${dataset.seven_scenes_wai.test.dataset_str}"

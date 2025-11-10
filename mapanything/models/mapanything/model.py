@@ -138,7 +138,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self.info_sharing_config = info_sharing_config
         self.pred_head_config = pred_head_config
         self.geometric_input_config = geometric_input_config
-        self.pretrained_checkpoint_path = pretrained_checkpoint_path
+        self.pretrained_checkpoint_path = '/home/xwh/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth'
         self.load_specific_pretrained_submodules = load_specific_pretrained_submodules
         self.specific_pretrained_submodules = specific_pretrained_submodules
         self.torch_hub_force_reload = torch_hub_force_reload
@@ -151,6 +151,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             if info_sharing_storage_path is not None
             else None
         )
+        print(f"DEBUG: Model init - store_features={self.store_info_sharing_intermediate_features}")
+        print(f"DEBUG: Model init - storage_path={self.info_sharing_storage_path}")
         self._info_sharing_storage_run_dir: Optional[Path] = None
         self._stored_info_sharing_features: Optional[Dict[str, Any]] = None
         self.class_init_args = {
@@ -180,6 +182,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             self.encoder_config["torch_hub_force_reload"] = torch_hub_force_reload
         # Create a copy of the config before deleting the key to preserve it for serialization
         encoder_config_copy = self.encoder_config.copy()
+        encoder_config_copy["pretrained_checkpoint_path"] = self.pretrained_checkpoint_path
         del encoder_config_copy["uses_torch_hub"]
         self.encoder = encoder_factory(**encoder_config_copy)
 
@@ -238,6 +241,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self._initialize_adaptors(pred_head_config)
 
         # Load pretrained weights
+        self.pretrained_checkpoint_path = None
         self._load_pretrained_weights()
 
     @property
@@ -1511,7 +1515,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def forward(self, views, memory_efficient_inference=False):
+    def forward(self, views, memory_efficient_inference=False,save_filename="info_sharing_outputs.pt"):
         """
         Forward pass performing the following operations:
         1. Encodes the N input views (images).
@@ -1590,6 +1594,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             self._stored_info_sharing_features = self._capture_info_sharing_features(
                 final_info_sharing_multi_view_feat,
                 intermediate_info_sharing_multi_view_feat,
+                filename=save_filename
             )
         else:
             self._stored_info_sharing_features = None
@@ -2033,14 +2038,18 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self,
         run_dir: Path,
         payload: Dict[str, Any],
+        filename: str,
     ) -> Path:
         """Persist the serialized alternating-attention payload to a single file."""
 
-        file_path = run_dir / "info_sharing_outputs.pt"
+        file_path = run_dir / filename
         torch.save(payload, file_path)
         return file_path
 
-    def _create_info_sharing_run_directory(self) -> Optional[Path]:
+    def _create_info_sharing_run_directory(
+            self,
+            filename: str = "info_sharing_outputs.pt"
+    ) -> Optional[Path]:
         if self.info_sharing_storage_path is None:
             self._info_sharing_storage_run_dir = None
             return None
@@ -2048,9 +2057,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         base_dir = self.info_sharing_storage_path
         base_dir.mkdir(parents=True, exist_ok=True)
         run_dir = base_dir / (
-            datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-            + f"_{uuid.uuid4().hex[:8]}"
-        )
+            datetime.utcnow().strftime("%m%dT%H%M%s")
+        ) / Path(filename)
         run_dir.mkdir(parents=True, exist_ok=False)
         self._info_sharing_storage_run_dir = run_dir
         return run_dir
@@ -2059,10 +2067,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self,
         final_output: MultiViewTransformerOutput,
         intermediate_outputs: Optional[List[MultiViewTransformerOutput]],
+        filename: str = "info_sharing_outputs.pt"
     ) -> Dict[str, Any]:
         """Clone or serialize information sharing outputs for later inspection."""
 
-        run_dir = self._create_info_sharing_run_directory()
+        run_dir = self._create_info_sharing_run_directory(filename)
 
         if run_dir is None:
             stored: Dict[str, Any] = {
@@ -2097,7 +2106,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             "final": final_block,
             "intermediate": intermediate_blocks,
         }
-        storage_file = self._write_info_sharing_payload(run_dir, payload)
+        storage_file = self._write_info_sharing_payload(run_dir, payload,filename)
 
         stored = {
             "return_type": self.info_sharing_return_type,

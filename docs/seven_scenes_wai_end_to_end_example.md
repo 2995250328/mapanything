@@ -60,8 +60,7 @@ cd -
 ```bash
 bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
     --device cuda \
-    --moge-batch-size 8 \
-    --moge-model Ruicheng/moge-2-vitl-normal \
+    --moge-model /mnt/storage/xwh/checkpoints/moge-2-vitl-normal \
     "$DATA_ROOT" \
     "$WAI_ROOT" \
     "$CONDA_ENV" \

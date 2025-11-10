@@ -161,11 +161,8 @@ def run_dataset_reconstruction(cfg: DictConfig) -> Dict[str, Any]:
     return {"saved": saved, "output_dir": str(output_dir)}
 
 
-@hydra.main(
-    version_base=None,
-    config_path="../../../configs/tasks/aa_feature_fusion",
-    config_name="dataset_demo",
-)
+@hydra.main(config_path="../../../configs/tasks/aa_feature_fusion/",
+            config_name="demo")
 def main(cfg: DictConfig) -> None:
     info = run_dataset_reconstruction(cfg)
     print(json.dumps(info, indent=2, ensure_ascii=False))

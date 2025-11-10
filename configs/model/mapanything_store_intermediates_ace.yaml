@@ -15,7 +15,7 @@ model_config:
   info_sharing_config: ${model.info_sharing}
   pred_head_config: ${model.pred_head}
   geometric_input_config: ${model.task}
-  store_info_sharing_intermediate_features: true
+  store_info_sharing_intermediate_features: True
   info_sharing_storage_device: null
   info_sharing_storage_path: "${hydra:run.dir}/ACE/aa_blocks"
 

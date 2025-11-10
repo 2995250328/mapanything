@@ -702,3 +702,41 @@ def view_name(view, batch_index=None):
     label = sel(view["label"])
     instance = sel(view["instance"])
     return f"{db}/{label}/{instance}"
+
+from torch.utils.data import default_collate
+class ForcedRandomDataLoader:
+    """
+    一个模拟 DataLoader 行为的迭代器。
+    专门用于当数据集长度可能为 1 (例如锁定了单一场景)，但其 __getitem__ 内部包含随机性，
+    需要反复调用同一个索引来获取不同随机样本的场景。
+    """
+
+    def __init__(self, dataset, batch_size: int, num_batches: int, repeat_index: int = 0, collate_fn=None):
+        """
+        Args:
+            dataset: PyTorch 数据集 (建议初始化时 seed=None 以确保随机性).
+            batch_size: 每个批次的大小.
+            num_batches: 这个 Loader 总共会产生多少个批次 (控制循环次数).
+            repeat_index: 每次从数据集中读取时使用的固定索引. 对于单场景数据集通常是 0.
+            collate_fn: 用于打包样本的函数. 默认为 torch.utils.data.default_collate.
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_batches = num_batches
+        self.repeat_index = repeat_index
+        self.collate_fn = collate_fn if collate_fn is not None else default_collate
+
+    def __len__(self):
+        """使得 tqdm(dataloader) 可以正确显示进度条总长度"""
+        return self.num_batches
+
+    def __iter__(self):
+        """生成器函数，每次 yield 一个完整的 batch"""
+        for _ in range(self.num_batches):
+            samples = []
+            for _ in range(self.batch_size):
+                # 反复读取同一个索引，依赖数据集内部的 __getitem__ 随机性
+                samples.append(self.dataset[self.repeat_index])
+
+            # 使用 collate_fn 将样本列表打包成 Batch
+            yield self.collate_fn(samples)
