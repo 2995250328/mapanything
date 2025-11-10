@@ -14,7 +14,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 4 benchmark_518_eth3d_snpp_tav2"
 #)
   batch_sizes_and_views=(
-    "1 48 benchmark_518_seven_scenes"
+    "1 2 benchmark_518_seven_scenes"
 )
 
 for combo in "${batch_sizes_and_views[@]}"; do
@@ -30,7 +30,6 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset=$dataset \
         dataset.num_workers=1 \
         dataset.num_views=$num_views \
-        +num_views=$num_views \
         batch_size=$batch_size \
         model=mapanything_store_intermediates_ace \
         model/task=images_and_full_geometry \

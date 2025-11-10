@@ -260,7 +260,6 @@ if __name__ == "__main__":
     # =========================================
     # 2. 手动循环构建 Batch
     # =========================================
-    print(dataloader.dataset.dataset.scenes)
     for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Loading Data")):
 
    # =========================================

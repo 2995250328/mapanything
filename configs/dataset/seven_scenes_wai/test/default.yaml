@@ -11,7 +11,7 @@ dataset_str:
     variable_num_views=${dataset.seven_scenes_wai.test.variable_num_views},
     num_views=${dataset.seven_scenes_wai.test.num_views},
     covisibility_thres=${dataset.seven_scenes_wai.test.covisibility_thres})"
-split: 'train'
+split: 'test'
 dataset_resolution: ${dataset.resolution_options.518_1_33_ar}
 principal_point_centered: ${dataset.principal_point_centered}
 seed: 777
