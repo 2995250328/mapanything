@@ -19,7 +19,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 100 benchmark_518_eth3d_snpp_tav2"
 #)
 batch_sizes_and_views=(
-    "1 100 benchmark_518_eth3d_snpp_tav2"
+    "2 4 benchmark_518_eth3d_snpp_tav2"
 )
 
 # Loop through each combination

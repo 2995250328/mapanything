@@ -1966,6 +1966,279 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return res
 
+    def forward_with_memory(
+            self,
+            query_view: dict,  # 单视图输入 {"img":(B,C,H,W), 以及可选几何输入}
+            memory_feats: List[List[torch.Tensor]],   # 记忆特征列表，每个 (B,C,H,W)
+            additional_tokens: torch.Tensor,
+            memory_keep_ratio: float = 1.0,
+            memory_efficient_inference: bool = False,
+            save_filename: str = "memory_info_sharing.pt",
+    ):
+        """
+        自定义的前向传播：
+        1. 提取 query image encoder features
+        2. 调用 info_sharing.forward_query_with_memory() 融合 query_feat & memory_feats
+        3. 使用与原 forward() 完全一致的 DPT / pose / scale prediction 逻辑
+        4. 返回与 forward() 相同格式的 dense predictions
+        memory_features: 来自外部存储的 IFR output.features（单视图）
+        """
+        # ======================================================
+        # Step 0. 如果 memory 过大 → 对所有 memory blocks 执行随机 downsample
+        # ======================================================
+        def downsample_tokens(feat_list):
+            """feat_list: List[(B,C,Hm,Wm)] → return List[(B,C,h,w)]"""
+            kept = []
+            for f in feat_list:
+                Bh, Ch, Hm, Wm = f.shape
+                total = Hm * Wm
+                keep_n = max(1, int(total * memory_keep_ratio))
+
+                # flatten → random index → gather → reshape
+                flat = f.reshape(Bh, Ch, total)
+                idx = torch.randperm(total, device=device)[:keep_n]
+                selected = flat[:, :, idx]  # (B,C,keep_n)
+                kept.append(selected)
+            return kept  # List[(B,C,Lk)]
+        ###########################################################################
+        # Step 1 — Extract query encoder features（与 forward() 相同）
+        ###########################################################################
+        # 需要将单视图 query 转成列表形式以复用 encode_n_views
+
+        memory_token_blocks = []
+        for block in memory_feats:
+            # block: List[num_views]，每个 (B,C,Hm,Wm)
+            # 将所有视图 flatten → merge
+            merged = []
+            for view_feat in block:
+                merged.append(view_feat)  # 不下采样形状，用 tokens 压缩
+            # ↓ 对这个 block 的所有视图做 token-level downsample
+            block_tokens = downsample_tokens(merged)  # List[(B,C,K)]
+            # concat 所有视图的 token
+            block_tokens = torch.cat(block_tokens, dim=2)  # (B,C,L_block)
+            memory_token_blocks.append(block_tokens)
+
+        views = [query_view]
+        all_encoder_features_across_views = self._encode_n_views(views)
+        # Optional geometric fusion（depth, rays, pose…）保持一致
+        with torch.autocast("cuda", enabled=False):
+            all_encoder_features_across_views = (
+                self._encode_and_fuse_optional_geometric_inputs(
+                    views, all_encoder_features_across_views
+                )
+            )
+
+        # B,C,H,W
+        query_feat = all_encoder_features_across_views[0]
+        ###########################################################################
+        # Step 2 — scale token 准备
+        ###########################################################################
+        B = query_feat.shape[0]
+        scale_token = additional_tokens.to(query_feat.dtype)
+        ###########################################################################
+        # Step 3 — 调用 MultiViewAlternatingAttentionTransformerIFR.forward_query_with_memory
+        ###########################################################################
+        final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
+            query_feat=query_feat,
+            memory_feats=memory_features,
+            additional_tokens=scale_token,
+            memory_keep_ratio=memory_keep_ratio,
+        )
+
+        # final_feat: MultiViewTransformerOutput
+        # final_feat.features: List[Tensor], 第一项就是 query 的最终表示
+        # intermediate_feats: List[MultiViewTransformerOutput]（IFR 中间层）
+        # 只取 query （第 0 个）
+        fused_query_feature = final_feat.features[0]  # (B, D, H, W)
+        # scale token
+        fused_scale_token = final_feat.additional_token_features  # (B, C, 1)
+
+        ###########################################################################
+        # Step 4 — 根据 pred_head_type 组建 Dense Head 输入（完全复刻 forward()）
+        ###########################################################################
+        if self.pred_head_type == "linear":
+            dense_head_inputs = fused_query_feature
+        elif self.pred_head_type in ["dpt", "dpt+pose"]:
+            dense_head_inputs_list = []
+            if self.use_encoder_features_for_dpt:
+                # (1) encoder features
+                dense_head_inputs_list.append(query_feat)
+                # (2)(3) IFR 中间两层（取前两层）
+                dense_head_inputs_list.append(intermediate_feats[0].features[0])
+                dense_head_inputs_list.append(intermediate_feats[1].features[0])
+                # (4) 最终特征
+                dense_head_inputs_list.append(fused_query_feature)
+            else:
+                dense_head_inputs_list.append(intermediate_feats[0].features[0])
+                dense_head_inputs_list.append(intermediate_feats[1].features[0])
+                dense_head_inputs_list.append(intermediate_feats[2].features[0])
+                dense_head_inputs_list.append(fused_query_feature)
+
+            dense_head_inputs = dense_head_inputs_list
+
+        else:
+            raise ValueError(f"Invalid pred_head_type: {self.pred_head_type}")
+        ###########################################################################
+        # Step 5 — 调用 downstream_head（完全和 forward() 保持一致）
+        ###########################################################################
+        H, W = query_feat.shape[2:]
+        img_shape = (H, W)
+        with torch.autocast("cuda", enabled=False):
+            dense_out, pose_out, scale_out = self.downstream_head(
+                dense_head_inputs=dense_head_inputs,
+                scale_head_inputs=scale_head_inputs,
+                img_shape=img_shape,
+                memory_efficient_inference=memory_efficient_inference,
+            )
+
+        # ---------------------------------------------------------
+        # Step 6. 根据 scene_rep_type 构建最终结果
+        # ---------------------------------------------------------
+        num_views = 1  # 查询视图只有 1 个
+
+        # ------------------------------
+        # 类型 1：pointmap (+ variants)
+        # ------------------------------
+        if self.scene_rep_type in [
+            "pointmap", "pointmap+confidence", "pointmap+mask", "pointmap+confidence+mask",
+        ]:
+            pts3d = dense_out.value.permute(0, 2, 3, 1).contiguous()
+            pts3d = pts3d * scale_out.unsqueeze(-1).unsqueeze(-1)
+
+            res = [{
+                "pts3d": pts3d,
+                "metric_scaling_factor": scale_out,
+            }]
+
+        # --------------------------------------
+        # 类型 2：raymap+depth (+ variants)
+        # --------------------------------------
+        elif self.scene_rep_type in [
+            "raymap+depth",
+            "raymap+depth+confidence",
+            "raymap+depth+mask",
+            "raymap+depth+confidence+mask",
+        ]:
+            rep = dense_out.value.permute(0, 2, 3, 1).contiguous()
+            o, d, z = rep.split([3, 3, 1], dim=-1)
+            pts3d = o + d * z
+
+            res = [{
+                "pts3d": pts3d * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "ray_origins": o * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "ray_directions": d,
+                "depth_along_ray": z * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "metric_scaling_factor": scale_out,
+            }]
+
+        # ---------------------------------------------------------------
+        # 类型 3：raydirs+depth+pose (+ confidence/mask)
+        # ---------------------------------------------------------------
+        elif self.scene_rep_type in [
+            "raydirs+depth+pose",
+            "raydirs+depth+pose+confidence",
+            "raydirs+depth+pose+mask",
+            "raydirs+depth+pose+confidence+mask",
+        ]:
+            rep = dense_out.value.permute(0, 2, 3, 1).contiguous()
+            d, z = rep.split([3, 1], dim=-1)
+            t, q = pose_out.value.split([3, 4], dim=-1)
+
+            from mapanything.tasks.aa_feature_fusion.common import (
+                convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap
+            )
+
+            pts3d = convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(d, z, t, q)
+            pts3d_cam = d * z
+
+            res = [{
+                "pts3d": pts3d * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "pts3d_cam": pts3d_cam * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "ray_directions": d,
+                "depth_along_ray": z * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "cam_trans": t * scale_out,
+                "cam_quats": q,
+                "metric_scaling_factor": scale_out,
+            }]
+
+        # ---------------------------------------------------------------
+        # 类型 4：campointmap+pose (+ confidence/mask)
+        # ---------------------------------------------------------------
+        elif self.scene_rep_type in [
+            "campointmap+pose",
+            "campointmap+pose+confidence",
+            "campointmap+pose+mask",
+            "campointmap+pose+confidence+mask",
+        ]:
+            pts3d_cam = dense_out.value.permute(0, 2, 3, 1).contiguous()
+            t, q = pose_out.value.split([3, 4], dim=-1)
+
+            z = torch.norm(pts3d_cam, dim=-1, keepdim=True)
+            d = pts3d_cam / z
+
+            from mapanything.tasks.aa_feature_fusion.common import (
+                convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap
+            )
+
+            pts3d = convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(d, z, t, q)
+
+            res = [{
+                "pts3d": pts3d * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "pts3d_cam": pts3d_cam * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "ray_directions": d,
+                "depth_along_ray": z * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "cam_trans": t * scale_out,
+                "cam_quats": q,
+                "metric_scaling_factor": scale_out,
+            }]
+
+        # ---------------------------------------------------------------
+        # 类型 5：pointmap+raydirs+depth+pose (+ variants)
+        # ---------------------------------------------------------------
+        elif self.scene_rep_type in [
+            "pointmap+raydirs+depth+pose",
+            "pointmap+raydirs+depth+pose+confidence",
+            "pointmap+raydirs+depth+pose+mask",
+            "pointmap+raydirs+depth+pose+confidence+mask",
+        ]:
+            rep = dense_out.value.permute(0, 2, 3, 1).contiguous()
+            pts3d, d, z = rep.split([3, 3, 1], dim=-1)
+            t, q = pose_out.value.split([3, 4], dim=-1)
+
+            from mapanything.tasks.aa_feature_fusion.common import (
+                convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap
+            )
+            pts3d_cam = d * z
+
+            if self.pred_head_config["adaptor_config"]["use_factored_predictions_for_global_pointmaps"]:
+                pts3d = convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(d, z, t, q)
+
+            res = [{
+                "pts3d": pts3d * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "pts3d_cam": pts3d_cam * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "ray_directions": d,
+                "depth_along_ray": z * scale_out.unsqueeze(-1).unsqueeze(-1),
+                "cam_trans": t * scale_out,
+                "cam_quats": q,
+                "metric_scaling_factor": scale_out,
+            }]
+
+        # ---------------------------------------------------------------
+        # Step 7. confidence / mask 输出
+        # ---------------------------------------------------------------
+        if "confidence" in self.scene_rep_type:
+            conf = dense_out.confidence.permute(0, 2, 3, 1).squeeze(-1)
+            res[0]["conf"] = conf
+
+        if "mask" in self.scene_rep_type:
+            mask = dense_out.mask.permute(0, 2, 3, 1).squeeze(-1) > 0.5
+            logits = dense_out.logits.permute(0, 2, 3, 1).squeeze(-1)
+
+            res[0]["non_ambiguous_mask"] = mask
+            res[0]["non_ambiguous_mask_logits"] = logits
+
+        return res
+
     def _clone_tensor_for_storage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Detach, clone, and optionally move a tensor for intermediate storage."""
 

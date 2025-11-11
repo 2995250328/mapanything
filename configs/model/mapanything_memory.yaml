@@ -1,0 +1,24 @@
+defaults:
+  - default
+  - encoder: dinov2_large
+  - info_sharing: aat_ifr_24_layers
+  - pred_head: dpt_pose_scale
+  - task: calibrated_sfm
+
+# String for model factory
+model_str: "mapanything"
+# Model config
+model_config:
+  name: "mapanything"
+  encoder_config: ${model.encoder}
+  info_sharing_config: ${model.info_sharing}
+  pred_head_config: ${model.pred_head}
+  geometric_input_config: ${model.task}
+  # Toggle caching of alternating-attention features from MapAnything's info-sharing transformer.
+  store_info_sharing_intermediate_features: false
+  # Optional device where cached info-sharing tensors should be moved (e.g., "cpu").
+  info_sharing_storage_device: null
+  # Optional directory where cached info-sharing tensors should be serialized to disk.
+  info_sharing_storage_path: null
+# Image Normalization Type
+data_norm_type: ${model.encoder.data_norm_type}

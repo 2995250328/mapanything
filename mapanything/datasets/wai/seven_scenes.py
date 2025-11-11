@@ -6,10 +6,6 @@
 """7Scenes Dataset using WAI format data."""
 
 import os
-from pathlib import Path
-from typing import Optional
-import open3d as o3d
-import numpy as np
 import torch
 
 from mapanything.datasets.base.base_dataset import BaseDataset,ForcedRandomDataLoader

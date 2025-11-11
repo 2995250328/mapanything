@@ -703,40 +703,52 @@ def view_name(view, batch_index=None):
     instance = sel(view["instance"])
     return f"{db}/{label}/{instance}"
 
-from torch.utils.data import default_collate
+from torch.utils.data._utils.collate import default_collate
+
 class ForcedRandomDataLoader:
     """
     一个模拟 DataLoader 行为的迭代器。
-    专门用于当数据集长度可能为 1 (例如锁定了单一场景)，但其 __getitem__ 内部包含随机性，
-    需要反复调用同一个索引来获取不同随机样本的场景。
+    - 若 num_batches 指定：产生固定批次数
+    - 若 num_batches=None：无限迭代（适合训练需要“无限数据”的情况）
     """
 
-    def __init__(self, dataset, batch_size: int, num_batches: int, repeat_index: int = 0, collate_fn=None):
+    def __init__(self, dataset, batch_size: int, num_batches: int = None,
+                 repeat_index: int = 0, collate_fn=None):
         """
         Args:
-            dataset: PyTorch 数据集 (建议初始化时 seed=None 以确保随机性).
-            batch_size: 每个批次的大小.
-            num_batches: 这个 Loader 总共会产生多少个批次 (控制循环次数).
-            repeat_index: 每次从数据集中读取时使用的固定索引. 对于单场景数据集通常是 0.
-            collate_fn: 用于打包样本的函数. 默认为 torch.utils.data.default_collate.
+            dataset: PyTorch 数据集（建议让其 __getitem__() 内部具有随机性）
+            batch_size: 每批的数据量
+            num_batches: 迭代次数；若为 None，则无限迭代
+            repeat_index: 每次从 dataset 的固定索引读取数据（常用于单场景随机增强）
+            collate_fn: 自定义 batch 拼接函数
         """
         self.dataset = dataset
         self.batch_size = batch_size
-        self.num_batches = num_batches
+        self.num_batches = num_batches  # None → infinite
         self.repeat_index = repeat_index
         self.collate_fn = collate_fn if collate_fn is not None else default_collate
 
     def __len__(self):
-        """使得 tqdm(dataloader) 可以正确显示进度条总长度"""
+        """
+        如果 num_batches 为 None，无法定义长度。
+        推荐返回一个很大的数字，以保持 tqdm 正常工作。
+        """
+        if self.num_batches is None:
+            return 10**12  # 等效“无限”，但 tqdm 可以跑
         return self.num_batches
 
     def __iter__(self):
-        """生成器函数，每次 yield 一个完整的 batch"""
-        for _ in range(self.num_batches):
-            samples = []
-            for _ in range(self.batch_size):
-                # 反复读取同一个索引，依赖数据集内部的 __getitem__ 随机性
-                samples.append(self.dataset[self.repeat_index])
-
-            # 使用 collate_fn 将样本列表打包成 Batch
-            yield self.collate_fn(samples)
+        """
+        num_batches 指定 → 限定次数
+        num_batches=None → 无限循环
+        """
+        if self.num_batches is None:
+            # ===== 无限迭代 =====
+            while True:
+                samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
+                yield self.collate_fn(samples)
+        else:
+            # ===== 有限制的迭代 =====
+            for _ in range(self.num_batches):
+                samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
+                yield self.collate_fn(samples)
