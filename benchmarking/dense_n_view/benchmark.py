@@ -348,7 +348,7 @@ def benchmark(args):
         )
         for dataset in args.dataset.test_dataset.split("+")
         if "(" in dataset
-    }
+    }# 这里得到的是一个字典，键是场景的名称，值是对应的dataset
 
     # Load Model
     model = init_model(

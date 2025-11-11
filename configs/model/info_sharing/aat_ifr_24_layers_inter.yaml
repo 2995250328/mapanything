@@ -1,0 +1,24 @@
+# Model type (Options: ["cross_attention", "global_attention", "alternating_attention"])
+model_type: "alternating_attention"
+# Model class type (Options: ["no_intermediate_features", "intermediate_features"])
+model_return_type: "intermediate_features"
+# Custom positional encoding (Options: ["RoPEfreq"], Callable Function, null)
+custom_positional_encoding: null
+# DPT头实际使用的特征层数
+dpt_indices: [11,17]
+# Module arguments
+module_args:
+  # Name of the info sharing module
+  name: "aat_24_layers_ifr"
+  # Indices of the intermediate features to be shared (indices start from 0)
+  indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+  # Normalize intermediate features
+  norm_intermediate: True
+  # Size string
+  size: "24_layers"
+  # Depth
+  depth: 24
+  # Distinguish Reference and Non-Reference Views
+  distinguish_ref_and_non_ref_views: True
+  # Flag to indicate whether to use gradient checkpointing
+  gradient_checkpointing: False

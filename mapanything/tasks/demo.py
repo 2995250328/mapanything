@@ -19,16 +19,6 @@ from mapanything.tasks.aa_feature_fusion.common import (
     prepare_view,
 )
 
-# 兼容 inf / nan 解析
-def _resolve_special_float(x: str):
-    sx = str(x).strip()
-    if sx.lower() in ("inf", "+inf"): return float("inf")
-    if sx.lower() in ("-inf",): return float("-inf")
-    if sx.lower() in ("nan",): return float("nan")
-    return float(sx)
-if OmegaConf._get_resolver("special_float") is None:
-    OmegaConf.register_new_resolver("special_float", _resolve_special_float, replace=True)
-
 def load_memory_features(path: str, device: torch.device):
     """
     加载 Memory 文件，返回：
@@ -84,7 +74,6 @@ def run_demo(cfg: DictConfig):
     print(f"[Demo] Loading AA memory from: {cfg.fusion.stored_feature_file}")
     memory_feats, memory_scale_token = load_memory_features(cfg.fusion.stored_feature_file, device)
     print(f"[Demo] Loaded memory blocks: {len(memory_feats)}")
-    print(memory_scale_token.size())
     import sys
     sys.exit()
     # 4) 数据集

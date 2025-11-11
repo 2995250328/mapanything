@@ -4,7 +4,7 @@
 defaults:
   - default
   - encoder: dinov2_large
-  - info_sharing: aat_ifr_24_layers
+  - info_sharing: aat_ifr_24_layers_inter
   - pred_head: dpt_pose_scale
   - task: images_and_full_geometry
 
@@ -18,7 +18,7 @@ model_config:
   store_info_sharing_intermediate_features: True
   info_sharing_storage_device: null
   info_sharing_storage_path: "${hydra:run.dir}/ACE/aa_blocks"
-
+#[11, 17]
 model:
   info_sharing:
     module_args:

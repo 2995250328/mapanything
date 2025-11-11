@@ -135,6 +135,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         # Initalize the attributes
         self.name = name
         self.encoder_config = encoder_config
+        self.dpt_indices = info_sharing_config.get("dpt_indices", None)
         self.info_sharing_config = info_sharing_config
         self.pred_head_config = pred_head_config
         self.geometric_input_config = geometric_input_config
@@ -339,6 +340,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 self.use_encoder_features_for_dpt = True
             elif len(self.info_sharing.indices) == 3:
                 self.use_encoder_features_for_dpt = False
+            elif len(self.info_sharing.indices) == 24:
+                self.use_encoder_features_for_dpt = True
             else:
                 raise ValueError(
                     "Invalid number of indices provided for info sharing feature returner. Please provide 2 or 3 indices."
@@ -1599,6 +1602,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         else:
             self._stored_info_sharing_features = None
 
+        if self.store_info_sharing_intermediate_features and self.dpt_indices is not None:
+            # 先保存当前 24 层完整特征（它们已经保存在 _stored_info_sharing_features 内）
+            # 然后只保留 dpt_indices 对应的层
+            intermediate_info_sharing_multi_view_feat = [
+                intermediate_info_sharing_multi_view_feat[i]
+                for i in self.dpt_indices
+            ]
+
         if self.pred_head_type == "linear":
             # Stack the features for all views
             dense_head_inputs = torch.cat(
@@ -1973,7 +1984,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             additional_tokens: torch.Tensor,
             memory_keep_ratio: float = 1.0,
             memory_efficient_inference: bool = False,
-            save_filename: str = "memory_info_sharing.pt",
     ):
         """
         自定义的前向传播：

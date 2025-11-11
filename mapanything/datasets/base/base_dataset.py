@@ -8,7 +8,6 @@ Base class for MapAnything datasets.
 """
 
 from typing import List, Tuple, Union
-
 import PIL
 import numpy as np
 import torch

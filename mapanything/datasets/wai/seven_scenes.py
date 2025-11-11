@@ -7,6 +7,7 @@
 
 import os
 import torch
+import numpy as np
 
 from mapanything.datasets.base.base_dataset import BaseDataset,ForcedRandomDataLoader
 from mapanything.utils.wai.core import load_data, load_frame
