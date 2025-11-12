@@ -42,7 +42,7 @@ def prepare_view(
 
     prepared: Dict[str, Any] = {
         "img": to_tensor(view["img"], device=device).unsqueeze(0),
-        "data_norm_type": [view["data_norm_type"]],
+        "data_norm_type": view["data_norm_type"],
     }
 
     if include_intrinsics:

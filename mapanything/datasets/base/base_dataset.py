@@ -745,9 +745,21 @@ class ForcedRandomDataLoader:
             # ===== 无限迭代 =====
             while True:
                 samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
-                yield self.collate_fn(samples)
+
+                # ✅ 防止 default_collate 再多包一层
+                batch = self.collate_fn(samples)
+                # 如果 batch 是单个样本的 list（例如 [[dict]]），就 flatten 一层
+                if isinstance(batch, (list, tuple)) and len(batch) == 1 and isinstance(batch[0], (list, tuple)):
+                    batch = batch[0]
+
+                yield batch
         else:
             # ===== 有限制的迭代 =====
             for _ in range(self.num_batches):
                 samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
-                yield self.collate_fn(samples)
+
+                batch = self.collate_fn(samples)
+                if isinstance(batch, (list, tuple)) and len(batch) == 1 and isinstance(batch[0], (list, tuple)):
+                    batch = batch[0]
+
+                yield batch

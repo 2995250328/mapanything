@@ -13,10 +13,8 @@ root_uniception_pretrained_checkpoints_dir: ${machine.root_uniception_pretrained
 
 fusion:
   stored_feature_file: ???  # 必须在命令行指定
-  num_heads: 8               # ← 建议值
-  mlp_ratio: 4.0             # ← 建议值
-  dropout: 0.0               # ← 建议值（推理阶段常用）
-  map_location: cuda         # ← 有 3090，直接上 GPU
+  memory_keep_ratio: 1.0
+  dropout: 0.0
 
 # [Pipeline 参数 (默认值)]
 single_view:

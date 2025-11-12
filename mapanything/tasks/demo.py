@@ -11,14 +11,6 @@ from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 # 模型初始化
 from mapanything.models import init_model
 
-# 复用你现有的通用工具
-from mapanything.tasks.aa_feature_fusion.common import (
-    detach_to_cpu,
-    extract_pointmap_like_outputs,   # 仍可用于把 dense/pose/scale 打包成点图等结构；若 forward_with_memory 已返回最终结构，可不调用
-    instantiate_dataset,
-    prepare_view,
-)
-
 def load_memory_features(path: str, device: torch.device):
     """
     加载 Memory 文件，返回：
@@ -36,11 +28,7 @@ def load_memory_features(path: str, device: torch.device):
         for block in interm_blocks:
             feats = [t.to(device) for t in block["features"]]     # List[(B,C,H,W)]
             memory_feats.append(feats)
-    # ---- (2) 加上 final block 的 features ----
     final_block = payload.get("final", None)
-    if final_block is not None:
-        final_feats = [t.to(device) for t in final_block["features"]]
-        memory_feats.append(final_feats)   # ✅ 放在最后
     # ---- (3) scale token 只使用 final block 的 additional_token_features ----
     if final_block is not None and final_block["additional_token_features"] is not None:
         memory_scale_token = final_block["additional_token_features"].to(device)
@@ -74,9 +62,7 @@ def run_demo(cfg: DictConfig):
     print(f"[Demo] Loading AA memory from: {cfg.fusion.stored_feature_file}")
     memory_feats, memory_scale_token = load_memory_features(cfg.fusion.stored_feature_file, device)
     print(f"[Demo] Loaded memory blocks: {len(memory_feats)}")
-    import sys
-    sys.exit()
-    # 4) 数据集
+
     # dataset = instantiate_dataset(cfg)
     dataset = SevenScenesWAI(
         num_views=cfg.dataset.num_views,
@@ -96,45 +82,39 @@ def run_demo(cfg: DictConfig):
         batch_size=1  # 你想要的 batch size
     )
 
-    # 5) 输出目录
-    output_dir = Path(cfg.demo.output_dir).expanduser()
+    output_dir = Path(cfg.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     saved_items: List[Dict[str, Any]] = []
 
-    # 6) 推理循环（单视图查询）
     for batch_id, views in tqdm(enumerate(dataloader), desc="Running Memory-Augmented Reconstruction"):
+        batch = views
+        # 移除不必要的键
+        for view in batch:
+            if "idx" in view:
+                view["idx"] = view["idx"][2:]
+        # 转到 GPU
+        ignore_keys = {
+            "dataset", "label", "instance", "idx",
+            "true_shape", "rng", "data_norm_type",
+        }
+        for view in batch:
+            for name in view.keys():
+                if name in ignore_keys:
+                    continue
+                view[name] = view[name].to(device, non_blocking=True)
 
-        # views 是 batch 列表（因为 batch_size=1，所以取 views[0]）
-        single_view = views[0]
-        # 准备模型输入 (和你之前一样)
-        prepared = prepare_view(
-            single_view,
-            device=device,
-            include_intrinsics=cfg.single_view.include_intrinsics,
-            include_depth=cfg.single_view.include_depth,
-            include_pose=cfg.single_view.include_pose,
-            include_scale=cfg.single_view.include_scale,
-        )
-        # --------------------------
-        # 6. Memory-Augmented 推理部分
-        # --------------------------
         with torch.no_grad():
-            # (1) 提取查询视图特征
-            query_features = model.extract_features(prepared)
-
-            # (2) 载入 memory features（你之前保存的中间特征文件）
-            memory_features = torch.load(cfg.fusion.stored_feature_file, map_location=device)
-
-            with torch.no_grad():
-                result = model.forward_with_memory(
-                    views=prepared,
-                    memory_feats=memory_feats,
-                    memory_keep_ratio=cfg.fusion.memory_keep_ratio,
-                    memory_efficient_inference=cfg.memory_efficient_inference,
-                )
-
+            result = model.forward_with_memory(
+                query_view=batch,
+                device=device,
+                memory_feats=memory_feats,
+                additional_tokens=memory_scale_token,
+                memory_keep_ratio=cfg.fusion.memory_keep_ratio,
+                memory_efficient_inference=cfg.memory_efficient_inference,
+            )
             reconstruction = result[0]
-
+        import sys
+        sys.exit()
         save_path = output_dir / f"memory_sample_{batch_id:06d}.pt"
         torch.save({
             "rgb": single_view["img"].cpu(),
@@ -142,10 +122,6 @@ def run_demo(cfg: DictConfig):
         }, save_path)
 
         saved_items.append({"index": batch_id, "output": str(save_path)})
-
-        # 达到目标样本数量自动停止
-        if cfg.demo.num_samples > 0 and batch_id + 1 >= cfg.demo.num_samples:
-            break
 
         # 8. 生成 summary
     (output_dir / "summary.json").write_text(json.dumps(saved_items, indent=2))

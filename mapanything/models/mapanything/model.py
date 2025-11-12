@@ -666,27 +666,47 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
     def _encode_n_views(self, views):
         """
         Encode all the input views (batch of images) in a single forward pass.
-        Assumes all the input views have the same image shape, batch size, and data normalization type.
-
-        Args:
-            views (List[dict]): List of dictionaries containing the input views' images and instance information.
-
-        Returns:
-            List[torch.Tensor]: A list containing the encoded features for all N views.
+        Handles both single-view ([dict]) and multi-view ([dict, dict, ...]) cases.
         """
-        num_views = len(views)
-        data_norm_type = views[0]["data_norm_type"][0]
-        imgs_list = [view["img"] for view in views]
-        all_imgs_across_views = torch.cat(imgs_list, dim=0)
-        encoder_input = ViTEncoderInput(
-            image=all_imgs_across_views, data_norm_type=data_norm_type
-        )
-        encoder_output = self.encoder(encoder_input)
-        all_encoder_features_across_views = encoder_output.features.chunk(
-            num_views, dim=0
-        )
+        # --- 安全归一化 ---
+        if isinstance(views, dict):
+            views = [views]
+        elif isinstance(views, (list, tuple)):
+            # 如果是 [[dict]] 结构，展开一层
+            if len(views) == 1 and isinstance(views[0], (list, tuple)) and isinstance(views[0][0], dict):
+                views = views[0]
+        else:
+            raise TypeError(f"Unexpected views type: {type(views)}")
 
-        return all_encoder_features_across_views
+        num_views = len(views)
+        if num_views == 0:
+            raise ValueError("Empty views list passed to _encode_n_views().")
+
+        # --- 提取 data_norm_type ---
+        first_view = views[0]
+        data_norm_type = first_view.get("data_norm_type", None)
+        if data_norm_type is None:
+            raise ValueError("Missing 'data_norm_type' in view dict.")
+        if isinstance(data_norm_type, (list, tuple)):
+            if len(data_norm_type) == 0:
+                raise ValueError("Empty 'data_norm_type' list in view dict.")
+            data_norm_type = data_norm_type[0]
+
+        # --- 拼接图像 ---
+        imgs_list = [v["img"] for v in views]
+        if not all(torch.is_tensor(t) and t.ndim == 4 for t in imgs_list):
+            shapes = [tuple(t.shape) if torch.is_tensor(t) else type(t) for t in imgs_list]
+            raise AssertionError(f"All 'img' must be 4D tensors (B,C,H,W). Got: {shapes}")
+
+        all_imgs = torch.cat(imgs_list, dim=0)
+
+        # --- 送入 encoder ---
+        encoder_input = ViTEncoderInput(image=all_imgs, data_norm_type=data_norm_type)
+        encoder_output = self.encoder(encoder_input)
+
+        # --- 分拆回视图 ---
+        feats = encoder_output.features.chunk(num_views, dim=0)
+        return feats
 
     def _compute_pose_quats_and_trans_for_across_views_in_ref_view(
         self,
@@ -1979,7 +1999,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
     def forward_with_memory(
             self,
-            query_view: dict,  # 单视图输入 {"img":(B,C,H,W), 以及可选几何输入}
+            query_view,  # 单视图输入 {"img":(B,C,H,W), 以及可选几何输入}
+            device:str,
             memory_feats: List[List[torch.Tensor]],   # 记忆特征列表，每个 (B,C,H,W)
             additional_tokens: torch.Tensor,
             memory_keep_ratio: float = 1.0,
@@ -1993,9 +2014,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         4. 返回与 forward() 相同格式的 dense predictions
         memory_features: 来自外部存储的 IFR output.features（单视图）
         """
-        # ======================================================
-        # Step 0. 如果 memory 过大 → 对所有 memory blocks 执行随机 downsample
-        # ======================================================
         def downsample_tokens(feat_list):
             """feat_list: List[(B,C,Hm,Wm)] → return List[(B,C,h,w)]"""
             kept = []
@@ -2010,11 +2028,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 selected = flat[:, :, idx]  # (B,C,keep_n)
                 kept.append(selected)
             return kept  # List[(B,C,Lk)]
-        ###########################################################################
-        # Step 1 — Extract query encoder features（与 forward() 相同）
-        ###########################################################################
         # 需要将单视图 query 转成列表形式以复用 encode_n_views
-
         memory_token_blocks = []
         for block in memory_feats:
             # block: List[num_views]，每个 (B,C,Hm,Wm)
@@ -2028,29 +2042,21 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             block_tokens = torch.cat(block_tokens, dim=2)  # (B,C,L_block)
             memory_token_blocks.append(block_tokens)
 
-        views = [query_view]
-        all_encoder_features_across_views = self._encode_n_views(views)
+        all_encoder_features_across_views = self._encode_n_views(query_view)
         # Optional geometric fusion（depth, rays, pose…）保持一致
         with torch.autocast("cuda", enabled=False):
             all_encoder_features_across_views = (
                 self._encode_and_fuse_optional_geometric_inputs(
-                    views, all_encoder_features_across_views
+                    query_view, all_encoder_features_across_views
                 )
             )
-
         # B,C,H,W
         query_feat = all_encoder_features_across_views[0]
-        ###########################################################################
-        # Step 2 — scale token 准备
-        ###########################################################################
         B = query_feat.shape[0]
         scale_token = additional_tokens.to(query_feat.dtype)
-        ###########################################################################
-        # Step 3 — 调用 MultiViewAlternatingAttentionTransformerIFR.forward_query_with_memory
-        ###########################################################################
         final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
             query_feat=query_feat,
-            memory_feats=memory_features,
+            memory_feats=memory_feats,
             additional_tokens=scale_token,
             memory_keep_ratio=memory_keep_ratio,
         )
@@ -2096,16 +2102,12 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         with torch.autocast("cuda", enabled=False):
             dense_out, pose_out, scale_out = self.downstream_head(
                 dense_head_inputs=dense_head_inputs,
-                scale_head_inputs=scale_head_inputs,
+                scale_head_inputs=fused_scale_token,
                 img_shape=img_shape,
                 memory_efficient_inference=memory_efficient_inference,
             )
 
-        # ---------------------------------------------------------
-        # Step 6. 根据 scene_rep_type 构建最终结果
-        # ---------------------------------------------------------
         num_views = 1  # 查询视图只有 1 个
-
         # ------------------------------
         # 类型 1：pointmap (+ variants)
         # ------------------------------
@@ -2153,11 +2155,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             rep = dense_out.value.permute(0, 2, 3, 1).contiguous()
             d, z = rep.split([3, 1], dim=-1)
             t, q = pose_out.value.split([3, 4], dim=-1)
-
             from mapanything.tasks.aa_feature_fusion.common import (
                 convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap
             )
-
             pts3d = convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap(d, z, t, q)
             pts3d_cam = d * z
 

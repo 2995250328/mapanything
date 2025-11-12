@@ -6,7 +6,7 @@ batch_sizes_and_views=(
     "1 1 benchmark_518_seven_scenes"
 )
 # 3. 输入特征文件 (使用插值变量 ${root_experiments_dir})
-FEATURE_FILE='/home/xwh/project/map-anything-experiments/ace_tasks/mapanything/benchmark_518_seven_scenes_4v_aa_capture/ACE/aa_blocks/1111T08391762821587/7Scenes_chess_test_4v_intermediates.pt/7Scenes_chess_test_4v_intermediates.pt'
+FEATURE_FILE='/home/xwh/project/map-anything-experiments/ace_tasks/mapanything/benchmark_518_seven_scenes_2v_aa_capture/ACE/aa_blocks/1112T02551762887315/7Scenes_chess_test_2v_intermediates.pt/7Scenes_chess_test_2v_intermediates.pt'
 
 for combo in "${batch_sizes_and_views[@]}"; do
     read -r batch_size num_views dataset <<< "$combo"

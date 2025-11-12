@@ -407,7 +407,6 @@ def benchmark(args):
             # Transfer batch to device
             ignore_keys = set(
                 [
-                    # "depthmap",
                     "dataset",
                     "label",
                     "instance",
@@ -427,7 +426,6 @@ def benchmark(args):
             # Length of preds is equal to the number of views
             with torch.autocast("cuda", enabled=bool(args.amp), dtype=amp_dtype):
                 preds = model(batch,args.memory_efficient_inference,save_filename = current_save_filename)
-
             # Get all the information needed to compute the metrics
             gt_info, pr_info, valid_masks = get_all_info_for_metric_computation(
                 batch,

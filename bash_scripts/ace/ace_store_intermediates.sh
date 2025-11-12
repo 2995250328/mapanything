@@ -5,7 +5,6 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-set -euo pipefail
 export HYDRA_FULL_ERROR=1
 
 # Example batch size / view configuration for capturing alternating-attention features
@@ -14,7 +13,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 4 benchmark_518_eth3d_snpp_tav2"
 #)
   batch_sizes_and_views=(
-    "1 4 benchmark_518_seven_scenes"
+    "1 2 benchmark_518_seven_scenes"
 )
 
 for combo in "${batch_sizes_and_views[@]}"; do
