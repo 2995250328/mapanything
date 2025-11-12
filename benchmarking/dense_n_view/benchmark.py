@@ -13,6 +13,8 @@ import os
 import sys
 import warnings
 from pathlib import Path
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 import hydra
 import numpy as np
@@ -346,7 +348,7 @@ def benchmark(args):
         )
         for dataset in args.dataset.test_dataset.split("+")
         if "(" in dataset
-    }
+    }# 这里得到的是一个字典，键是场景的名称，值是对应的dataset
 
     # Load Model
     model = init_model(
@@ -393,11 +395,18 @@ def benchmark(args):
             # Remove unnecessary indices
             for view in batch:
                 view["idx"] = view["idx"][2:]
+            # 提取数据集名称 (例如 '7scenes')
+            ds_name = batch[0].get("dataset", ["unknown"])[0]
+            if isinstance(ds_name, torch.Tensor): ds_name = ds_name.item()
+            # 提取场景标签 (例如 'chess')
+            scene_name = batch[0].get("label", ["unknown"])[0]
+            if isinstance(scene_name, torch.Tensor): scene_name = scene_name.item()
+            current_save_filename = f"{ds_name}_{scene_name}_{n_views}v_intermediates.pt"
+            current_save_filename = current_save_filename.replace("/", "_").replace(" ", "")
 
             # Transfer batch to device
             ignore_keys = set(
                 [
-                    "depthmap",
                     "dataset",
                     "label",
                     "instance",
@@ -416,8 +425,7 @@ def benchmark(args):
             # Run model inference
             # Length of preds is equal to the number of views
             with torch.autocast("cuda", enabled=bool(args.amp), dtype=amp_dtype):
-                preds = model(batch,args.memory_efficient_inference)
-
+                preds = model(batch,args.memory_efficient_inference,save_filename = current_save_filename)
             # Get all the information needed to compute the metrics
             gt_info, pr_info, valid_masks = get_all_info_for_metric_computation(
                 batch,

@@ -1,0 +1,36 @@
+# SCR training with ACE-style buffers and AA fusion.
+defaults:
+  - default
+  - dataset: seven_scenes_wai/train/default
+  - _self_
+
+single_view:
+  include_intrinsics: true
+  include_depth: true
+  include_pose: true
+  include_scale: true
+
+training:
+  num_samples: 32
+  sample_indices: null
+  output_dir: ${hydra:run.dir}/scr_training
+  max_epochs: 5
+  log_interval: 10
+  lr: 1e-4
+  weight_decay: 1e-4
+  batch_size: 4
+  memory_efficient_inference: false
+  device: cuda
+
+buffer:
+  capacity: 256
+  shuffle: true
+
+loss:
+  reprojection_weight: 1.0
+  xyz_weight: 0.1
+  relative_weight: 0.1
+
+scr_head:
+  hidden_dim: 128
+  output_channels: 3

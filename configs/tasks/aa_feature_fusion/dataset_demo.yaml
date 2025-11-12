@@ -1,0 +1,22 @@
+# Dataset-driven reconstruction demo for MapAnything.
+defaults:
+  - default
+  - dataset: seven_scenes_wai/test/default
+  - _self_
+
+dataset:
+  num_views: 4
+  test:
+    num_views: 4
+    variable_num_views: false
+
+reconstruction:
+  device: cuda
+  num_samples: 4
+  start_index: 0
+  max_index: 1000000
+  sample_indices: null
+  views_per_sample: null
+  output_dir: ${hydra:run.dir}/dataset_reconstruction
+  memory_efficient_inference: false
+  save_pointmap_targets: true

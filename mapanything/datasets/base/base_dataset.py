@@ -8,7 +8,6 @@ Base class for MapAnything datasets.
 """
 
 from typing import List, Tuple, Union
-
 import PIL
 import numpy as np
 import torch
@@ -702,3 +701,65 @@ def view_name(view, batch_index=None):
     label = sel(view["label"])
     instance = sel(view["instance"])
     return f"{db}/{label}/{instance}"
+
+from torch.utils.data._utils.collate import default_collate
+
+class ForcedRandomDataLoader:
+    """
+    一个模拟 DataLoader 行为的迭代器。
+    - 若 num_batches 指定：产生固定批次数
+    - 若 num_batches=None：无限迭代（适合训练需要“无限数据”的情况）
+    """
+
+    def __init__(self, dataset, batch_size: int, num_batches: int = None,
+                 repeat_index: int = 0, collate_fn=None):
+        """
+        Args:
+            dataset: PyTorch 数据集（建议让其 __getitem__() 内部具有随机性）
+            batch_size: 每批的数据量
+            num_batches: 迭代次数；若为 None，则无限迭代
+            repeat_index: 每次从 dataset 的固定索引读取数据（常用于单场景随机增强）
+            collate_fn: 自定义 batch 拼接函数
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_batches = num_batches  # None → infinite
+        self.repeat_index = repeat_index
+        self.collate_fn = collate_fn if collate_fn is not None else default_collate
+
+    def __len__(self):
+        """
+        如果 num_batches 为 None，无法定义长度。
+        推荐返回一个很大的数字，以保持 tqdm 正常工作。
+        """
+        if self.num_batches is None:
+            return 10**12  # 等效“无限”，但 tqdm 可以跑
+        return self.num_batches
+
+    def __iter__(self):
+        """
+        num_batches 指定 → 限定次数
+        num_batches=None → 无限循环
+        """
+        if self.num_batches is None:
+            # ===== 无限迭代 =====
+            while True:
+                samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
+
+                # ✅ 防止 default_collate 再多包一层
+                batch = self.collate_fn(samples)
+                # 如果 batch 是单个样本的 list（例如 [[dict]]），就 flatten 一层
+                if isinstance(batch, (list, tuple)) and len(batch) == 1 and isinstance(batch[0], (list, tuple)):
+                    batch = batch[0]
+
+                yield batch
+        else:
+            # ===== 有限制的迭代 =====
+            for _ in range(self.num_batches):
+                samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
+
+                batch = self.collate_fn(samples)
+                if isinstance(batch, (list, tuple)) and len(batch) == 1 and isinstance(batch[0], (list, tuple)):
+                    batch = batch[0]
+
+                yield batch

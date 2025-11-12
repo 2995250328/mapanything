@@ -10,6 +10,6 @@ size: "large"
 with_registers: False
 # Flag to indicate whether model class uses torch hub
 uses_torch_hub: False
-#pretrained_checkpoint_path: "/home/xwh/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth" # 使用您下载权重的实际绝对路径
+pretrained_checkpoint_path: "/home/xwh/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth" # 使用您下载权重的实际绝对路径
 # Flag to indicate whether to use gradient checkpointing for encoder
 gradient_checkpointing: False

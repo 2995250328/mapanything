@@ -15,20 +15,25 @@
 2. **捕获多视图 AA 中间变量**：使用 `ace_store_intermediates.sh`（或 `mapa_24v_store_intermediates.sh`）在 7Scenes 上运行 MapAnything 推理，将所有 AA 块写入单个 `info_sharing_outputs.pt` 文件。【F:bash_scripts/ace/ace_store_intermediates.sh†L1-L78】
 3. **准备单视图输入配置**：`configs/model/task/single_view_optional_intrinsics.yaml` 仅保留图像与可选内参，避免在融合阶段重复加载多余的几何信号。【F:configs/model/task/single_view_optional_intrinsics.yaml†L1-L18】
 
-## Demo：单视图重建示例
+## Demo：数据集多视图与单视图记忆
 
-1. **运行脚本**：
+1. **多视图重建**：
    ```bash
-   STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
-   OUTPUT_ROOT="$WAI_ROOT/demo_runs" \
-   DEVICE=cuda NUM_SAMPLES=4 DATA_ROOT="$WAI_ROOT" \
+   OUTPUT_ROOT="$WAI_ROOT/dataset_runs" \
+   DEVICE=cuda NUM_SAMPLES=4 VIEWS_PER_SAMPLE=3 DATA_ROOT="$WAI_ROOT" \
    HYDRA_OVERRIDES="model.pretrained=/path/to/mapanything.ckpt" \
    bash bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh
    ```
-   - 如需指定数据索引，可通过 `SAMPLE_INDICES=0,5,7` 覆盖，脚本会自动忽略 `NUM_SAMPLES`。
-   - 额外的 Hydra 覆盖（如 `model.pretrained`、`root_data_dir`）可在 `HYDRA_OVERRIDES` 中以空格分隔追加。
-   脚本会自动把存储文件传给 Hydra 配置，输出目录中会生成每个样本对应的 `.pt` 记录与 `summary.json`。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L63】【F:configs/tasks/aa_feature_fusion/demo.yaml†L1-L18】
-2. **内部流程**：Demo 入口会加载 7Scenes 测试集的单视图样本，按配置取用内参/深度/位姿信息，然后通过融合模块与 MapAnything 的下游头部恢复点云或深度图，并序列化到磁盘。【F:mapanything/tasks/aa_feature_fusion/demo.py†L17-L137】【F:mapanything/tasks/aa_feature_fusion/demo.py†L139-L207】
+   - `START_INDEX`/`MAX_INDEX` 控制遍历区间，或通过 `SAMPLE_INDICES=0,5,7` 精确指定场景编号。
+   - 默认会为每个样本保存 `reconstruction.pt` 与 `summary.json`，其中包含每个视角的输入张量与模型输出。【F:bash_scripts/tasks/aa_feature_fusion/run_demo_reconstruction.sh†L1-L63】【F:mapanything/tasks/aa_feature_fusion/dataset_reconstruction.py†L1-L176】【F:configs/tasks/aa_feature_fusion/dataset_demo.yaml†L1-L17】
+2. **单视图 + 记忆重建**：
+   ```bash
+   STORED_FEATURE_FILE=/path/to/info_sharing_outputs.pt \
+   OUTPUT_ROOT="$WAI_ROOT/memory_runs" \
+   DEVICE=cuda NUM_SAMPLES=4 DATA_ROOT="$WAI_ROOT" \
+   bash bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh
+   ```
+   - 该脚本复用旧的 Demo 行为，通过 AA 记忆文件增强单视图推理，输出结构保持 `.pt` + `summary.json` 组合。【F:bash_scripts/tasks/aa_feature_fusion/run_memory_reconstruction.sh†L1-L61】【F:mapanything/tasks/aa_feature_fusion/demo.py†L17-L207】
 3. **可视化**：在 WSL 或本地机器执行 `python scripts/visualization/view_aa_fusion_demo.py sample.pt --save sample.png --export-pts sample.ply` 即可预览 RGB 与重建深度，并可选导出 PLY 点云。【F:scripts/visualization/view_aa_fusion_demo.py†L1-L96】
 
 ## 训练与评估脚手架
