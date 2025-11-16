@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
+from mapanything.utils.debugprinter import DebugPrinter
 from mapanything.utils.geometry import (
     apply_log_to_norm,
     convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap,
@@ -87,7 +88,6 @@ if hasattr(torch.backends.cuda, "matmul") and hasattr(
     torch.backends.cuda.matmul, "allow_tf32"
 ):
     torch.backends.cuda.matmul.allow_tf32 = True
-
 
 class MapAnything(nn.Module, PyTorchModelHubMixin):
     "Modular MapAnything model class that supports input of images & optional geometric modalities (multiple reconstruction tasks)."
@@ -1506,7 +1506,158 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             dense_final_outputs = self.downstream_dense_head(
                 dense_head_inputs, img_shape
             )
+            # Pose prediction
+            pose_final_outputs = None
+            if self.pred_head_type == "dpt+pose":
+                pose_head_outputs = self.pose_head(
+                    PredictionHeadInput(last_feature=dense_head_inputs[-1])
+                )
+                pose_final_outputs = self.pose_adaptor(
+                    AdaptorInput(
+                        adaptor_feature=pose_head_outputs.decoded_channels,
+                        output_shape_hw=img_shape,
+                    )
+                )
 
+        # Scale prediction is lightweight, so we can run it in one go
+        scale_head_output = self.scale_head(
+            PredictionHeadTokenInput(last_feature=scale_head_inputs)
+        )
+        scale_final_output = self.scale_adaptor(
+            AdaptorInput(
+                adaptor_feature=scale_head_output.decoded_channels,
+                output_shape_hw=img_shape,
+            )
+        )
+        scale_final_output = scale_final_output.value.squeeze(-1)  # (B, 1, 1) -> (B, 1)
+
+        # Clear CUDA cache for better memory efficiency
+        if memory_efficient_inference and device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return dense_final_outputs, pose_final_outputs, scale_final_output
+
+    def downstream_head_feat(
+        self,
+        dense_head_inputs: Union[torch.Tensor, List[torch.Tensor]],
+        scale_head_inputs: torch.Tensor,
+        img_shape: Tuple[int, int],
+        memory_efficient_inference: bool = False,
+    ):
+        """
+        Run Prediction Heads & Post-Process Outputs
+        """
+        # Get device
+        device = self.device
+
+        # Use mini-batch inference to run the dense prediction head (the memory bottleneck)
+        # This saves memory and is slower than running the dense prediction head in one go
+        if memory_efficient_inference:
+            # Obtain the batch size of the dense head inputs
+            if self.pred_head_type == "linear":
+                batch_size = dense_head_inputs.shape[0]
+            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                batch_size = dense_head_inputs[0].shape[0]
+            else:
+                raise ValueError(
+                    f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                )
+
+            # Compute the mini batch size and number of mini batches adaptively based on available memory
+            minibatch = self._compute_adaptive_minibatch_size()
+            num_batches = (batch_size + minibatch - 1) // minibatch
+
+            # Run prediction for each mini-batch
+            dense_final_outputs_list = []
+            pose_final_outputs_list = [] if self.pred_head_type == "dpt+pose" else None
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * minibatch
+                end_idx = min((batch_idx + 1) * minibatch, batch_size)
+
+                # Get the inputs for the current mini-batch
+                if self.pred_head_type == "linear":
+                    dense_head_inputs_batch = dense_head_inputs[start_idx:end_idx]
+                elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                    dense_head_inputs_batch = [
+                        x[start_idx:end_idx] for x in dense_head_inputs
+                    ]
+                else:
+                    raise ValueError(
+                        f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                    )
+
+                # Dense prediction (mini-batched)
+                if self.pred_head_type == "linear":
+                    dense_final_outputs_batch = self.dense_head(
+                        PredictionHeadInput(last_feature=dense_head_inputs_batch)
+                    )
+                elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                    dense_final_outputs_batch = self.dense_head(
+                        PredictionHeadLayeredInput(
+                            list_features=dense_head_inputs_batch,
+                            target_output_shape=img_shape,
+                        )
+                    )
+                dense_final_outputs_list.append(dense_final_outputs_batch)
+
+                # Pose prediction (mini-batched)
+                if self.pred_head_type == "dpt+pose":
+                    pose_head_inputs_batch = dense_head_inputs[-1][start_idx:end_idx]
+                    pose_head_outputs_batch = self.pose_head(
+                        PredictionHeadInput(last_feature=pose_head_inputs_batch)
+                    )
+                    pose_final_outputs_batch = self.pose_adaptor(
+                        AdaptorInput(
+                            adaptor_feature=pose_head_outputs_batch.decoded_channels,
+                            output_shape_hw=img_shape,
+                        )
+                    )
+                    pose_final_outputs_list.append(pose_final_outputs_batch)
+
+            # Concatenate the dense prediction head outputs from all mini-batches
+            available_keys = dense_final_outputs_batch.__dict__.keys()
+            dense_pred_data_dict = {
+                key: torch.cat(
+                    [getattr(output, key) for output in dense_final_outputs_list], dim=0
+                )
+                for key in available_keys
+            }
+            dense_final_outputs = dense_final_outputs_batch.__class__(
+                **dense_pred_data_dict
+            )
+
+            # Concatenate the pose prediction head outputs from all mini-batches
+            pose_final_outputs = None
+            if self.pred_head_type == "dpt+pose":
+                available_keys = pose_final_outputs_batch.__dict__.keys()
+                pose_pred_data_dict = {
+                    key: torch.cat(
+                        [getattr(output, key) for output in pose_final_outputs_list],
+                        dim=0,
+                    )
+                    for key in available_keys
+                }
+                pose_final_outputs = pose_final_outputs_batch.__class__(
+                    **pose_pred_data_dict
+                )
+
+            # Clear CUDA cache for better memory efficiency
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        else:
+            # Run prediction for all (batch_size * num_views) in one go
+            # Dense prediction
+            if self.pred_head_type == "linear":
+                dense_final_outputs = self.dense_head(
+                    PredictionHeadInput(last_feature=dense_head_inputs)
+                )
+            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                dense_final_outputs = self.dense_head(
+                    PredictionHeadLayeredInput(
+                        list_features=dense_head_inputs,
+                        target_output_shape=img_shape,
+                    )
+                )
             # Pose prediction
             pose_final_outputs = None
             if self.pred_head_type == "dpt+pose":
@@ -2003,7 +2154,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             device:str,
             memory_feats: List[List[torch.Tensor]],   # 记忆特征列表，每个 (B,C,H,W)
             additional_tokens: torch.Tensor,
-            memory_keep_ratio: float = 1.0,
             memory_efficient_inference: bool = False,
     ):
         """
@@ -2014,34 +2164,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         4. 返回与 forward() 相同格式的 dense predictions
         memory_features: 来自外部存储的 IFR output.features（单视图）
         """
-        def downsample_tokens(feat_list):
-            """feat_list: List[(B,C,Hm,Wm)] → return List[(B,C,h,w)]"""
-            kept = []
-            for f in feat_list:
-                Bh, Ch, Hm, Wm = f.shape
-                total = Hm * Wm
-                keep_n = max(1, int(total * memory_keep_ratio))
-
-                # flatten → random index → gather → reshape
-                flat = f.reshape(Bh, Ch, total)
-                idx = torch.randperm(total, device=device)[:keep_n]
-                selected = flat[:, :, idx]  # (B,C,keep_n)
-                kept.append(selected)
-            return kept  # List[(B,C,Lk)]
-        # 需要将单视图 query 转成列表形式以复用 encode_n_views
-        memory_token_blocks = []
-        for block in memory_feats:
-            # block: List[num_views]，每个 (B,C,Hm,Wm)
-            # 将所有视图 flatten → merge
-            merged = []
-            for view_feat in block:
-                merged.append(view_feat)  # 不下采样形状，用 tokens 压缩
-            # ↓ 对这个 block 的所有视图做 token-level downsample
-            block_tokens = downsample_tokens(merged)  # List[(B,C,K)]
-            # concat 所有视图的 token
-            block_tokens = torch.cat(block_tokens, dim=2)  # (B,C,L_block)
-            memory_token_blocks.append(block_tokens)
-
         all_encoder_features_across_views = self._encode_n_views(query_view)
         # Optional geometric fusion（depth, rays, pose…）保持一致
         with torch.autocast("cuda", enabled=False):
@@ -2058,9 +2180,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             query_feat=query_feat,
             memory_feats=memory_feats,
             additional_tokens=scale_token,
-            memory_keep_ratio=memory_keep_ratio,
+            memory_keep_ratio=1.0,
         )
-
         # final_feat: MultiViewTransformerOutput
         # final_feat.features: List[Tensor], 第一项就是 query 的最终表示
         # intermediate_feats: List[MultiViewTransformerOutput]（IFR 中间层）
@@ -2097,8 +2218,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         ###########################################################################
         # Step 5 — 调用 downstream_head（完全和 forward() 保持一致）
         ###########################################################################
-        H, W = query_feat.shape[2:]
-        img_shape = (H, W)
+        batch_size_per_view, _, height, width = query_view[0]["img"].shape
+        img_shape = (int(height), int(width))
         with torch.autocast("cuda", enabled=False):
             dense_out, pose_out, scale_out = self.downstream_head(
                 dense_head_inputs=dense_head_inputs,
@@ -2302,7 +2423,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         query_feat = all_encoder_features_across_views[0]
         scale_token = additional_tokens.to(query_feat.dtype)
-        final_feat, _ = self.info_sharing.forward_query_with_memory(
+        final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
             query_feat=query_feat,
             memory_feats=memory_feats,
             additional_tokens=scale_token,
@@ -2311,6 +2432,42 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         fused_query_feature = final_feat.features[0]
         fused_scale_token = final_feat.additional_token_features
+
+        if self.pred_head_type == "linear":
+            dense_head_inputs = fused_query_feature
+        elif self.pred_head_type in ["dpt", "dpt+pose"]:
+            dense_head_inputs_list = []
+            if self.use_encoder_features_for_dpt:
+                # (1) encoder features
+                dense_head_inputs_list.append(query_feat)
+                # (2)(3) IFR 中间两层（取前两层）
+                dense_head_inputs_list.append(intermediate_feats[0].features[0])
+                dense_head_inputs_list.append(intermediate_feats[1].features[0])
+                # (4) 最终特征
+                dense_head_inputs_list.append(fused_query_feature)
+            else:
+                dense_head_inputs_list.append(intermediate_feats[0].features[0])
+                dense_head_inputs_list.append(intermediate_feats[1].features[0])
+                dense_head_inputs_list.append(intermediate_feats[2].features[0])
+                dense_head_inputs_list.append(fused_query_feature)
+
+            dense_head_inputs = dense_head_inputs_list
+
+        batch_size_per_view, _, height, width = query_view[0]["img"].shape
+        img_shape = (int(height), int(width))
+        with torch.autocast("cuda", enabled=False):
+            dense_out_feat, pose_out, scale_out = self.downstream_head_feat(
+                dense_head_inputs=dense_head_inputs,
+                scale_head_inputs=fused_scale_token,
+                img_shape=img_shape,
+                memory_efficient_inference=memory_efficient_inference,
+            )
+        printer = DebugPrinter()
+        printer.print(dense_out_feat,"dense_out_feat")
+        printer.print(pose_out,"pose_out")
+        printer.print(scale_out,"scale_out")
+        printer.print(fused_query_feature,"fused_scale_token")
+        printer.print(fused_scale_token,"fused_scale_token")
 
         return fused_query_feature, fused_scale_token
 
@@ -2350,25 +2507,49 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         )
 
     def _prepare_output_for_disk(
-        self,
-        output: MultiViewTransformerOutput,
-        tag: str,
-        block_index: Optional[int],
+            self,
+            output: MultiViewTransformerOutput,
+            tag: str,
+            block_index: Optional[int],
     ) -> Dict[str, Any]:
-        """Detach tensors to CPU and package them for serialization."""
+        """Convert tensors to CPU without changing output structure or final file format."""
+
+        import torch
 
         block_tag = tag if block_index is None else f"{tag}_{block_index:03d}"
-        features = [tensor.detach().cpu() for tensor in output.features]
-        additional = (
-            output.additional_token_features.detach().cpu()
-            if output.additional_token_features is not None
-            else None
-        )
+
+        # ---- 1. 转 CPU 的 features ----
+        cpu_features = []
+        for tensor in output.features:
+            cpu_tensor = tensor.detach().cpu()  # 可加 .half() 节省空间
+            cpu_features.append(cpu_tensor)
+
+            # 删除 GPU tensor
+            del tensor
+            torch.cuda.empty_cache()
+
+        # ---- 2. additional_token_features ----
+        if output.additional_token_features is not None:
+            cpu_additional = output.additional_token_features.detach().cpu()  # 可加 .half()
+
+            # 清理 GPU
+            del output.additional_token_features
+            torch.cuda.empty_cache()
+
+            additional_token_features = cpu_additional
+        else:
+            additional_token_features = None
+
+        # 删除 GPU 引用（非常重要）
+        output.features = None
+        torch.cuda.empty_cache()
+
+        # ---- 3. 返回结构完全一致 ----
         return {
             "tag": block_tag,
             "block_index": block_index,
-            "features": features,
-            "additional_token_features": additional,
+            "features": cpu_features,
+            "additional_token_features": additional_token_features,
         }
 
     def _summarize_disk_block(self, block: Dict[str, Any]) -> Dict[str, Any]:
@@ -2439,14 +2620,10 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             return stored
 
         final_block = self._prepare_output_for_disk(final_output, "final", None)
-        intermediate_blocks = (
-            [
-                self._prepare_output_for_disk(output, "intermediate", idx)
-                for idx, output in enumerate(intermediate_outputs)
-            ]
-            if intermediate_outputs is not None
-            else None
-        )
+        intermediate_blocks = [
+            self._prepare_output_for_disk(output, "intermediate", idx)
+            for idx, output in enumerate(intermediate_outputs)
+        ]
 
         payload: Dict[str, Any] = {
             "return_type": self.info_sharing_return_type,

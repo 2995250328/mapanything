@@ -13,6 +13,9 @@ from mapanything.datasets.base.base_dataset import BaseDataset,ForcedRandomDataL
 from mapanything.utils.wai.core import load_data, load_frame
 
 
+import os
+import numpy as np
+
 class SevenScenesWAI(BaseDataset):
     """
     7Scenes dataset standard WAI implementation, following ETH3DWAI structure.
@@ -40,7 +43,6 @@ class SevenScenesWAI(BaseDataset):
             sample_specific_scene: Whether to sample a specific scene.
             specific_scene_name: Name of the specific scene (e.g., "chess_test").
         """
-        # Initialize the dataset attributes
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.dataset_metadata_dir = dataset_metadata_dir
@@ -56,28 +58,21 @@ class SevenScenesWAI(BaseDataset):
 
     def _load_data(self):
         "Load the precomputed dataset metadata"
-        # Load the dataset metadata corresponding to the split
-        # Expects files like: seven_scenes_scene_list_test.npy containing ['chess_test', 'fire_test', ...]
         split_metadata_path = os.path.join(
             self.dataset_metadata_dir,
             self.split,
             f"seven_scenes_scene_list_{self.split}.npy",
         )
 
-        # Relaxed loading: if metadata file is missing, scan the ROOT directory for matching suffixes
         if not os.path.exists(split_metadata_path):
-            # Fallback: scan directory if explicit list file is missing
             all_folders = sorted([d for d in os.listdir(self.ROOT) if os.path.isdir(os.path.join(self.ROOT, d))])
-            # Filter scenes that match the requested split suffix (e.g., endswith "_test")
             self.scenes = [s for s in all_folders if s.endswith(f"_{self.split}")]
         else:
             split_scene_list = np.load(split_metadata_path, allow_pickle=True)
             self.scenes = list(split_scene_list)
 
-        # Handle specific scene sampling
         if self.sample_specific_scene:
             if self.specific_scene_name not in self.scenes:
-                # Optional: Try appending split suffix if user forgot it (e.g. passed "chess" instead of "chess_test")
                 potential_name = f"{self.specific_scene_name}_{self.split}"
                 if potential_name in self.scenes:
                     self.specific_scene_name = potential_name
@@ -87,6 +82,51 @@ class SevenScenesWAI(BaseDataset):
             self.scenes = self.scenes[:self.overfit_num_sets]
 
         self.num_of_scenes = len(self.scenes)
+
+    @staticmethod
+    def _depth_to_world_points(depthmap: np.ndarray,
+                               intrinsics: np.ndarray,
+                               c2w_pose: np.ndarray) -> np.ndarray:
+        """
+        将深度图用内参反投影到相机坐标，再用 cam2world 外参变换到世界坐标。
+        对无效深度（<=0 或非有限）返回 NaN。
+
+        Args:
+            depthmap: (H, W) float32
+            intrinsics: (3, 3) float32, 对应已经 resize/crop 后的图像
+            c2w_pose: (4, 4) float32, 相机到世界的变换
+
+        Returns:
+            pts3d_world: (H, W, 3) float32，世界坐标；无效深度处为 NaN
+        """
+        H, W = depthmap.shape
+        fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+        cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+
+        # 像素网格 (u 对应列，v 对应行)
+        u, v = np.meshgrid(np.arange(W, dtype=np.float32),
+                           np.arange(H, dtype=np.float32))
+
+        z = depthmap.astype(np.float32)
+        valid = np.isfinite(z) & (z > 0.0)
+
+        # 相机坐标系下三维点
+        x = (u - cx) / fx * z
+        y = (v - cy) / fy * z
+        xyz_cam = np.stack([x, y, z], axis=-1)  # (H, W, 3)
+
+        # 变换到世界坐标：X_w = R * X_c + t
+        R = c2w_pose[:3, :3].astype(np.float32)
+        t = c2w_pose[:3, 3].astype(np.float32)
+
+        # (H, W, 3) @ (3, 3)^T -> (H, W, 3)，再加 t
+        pts3d_world = xyz_cam @ R.T + t
+
+        # 无效位置写 NaN
+        if not valid.all():
+            pts3d_world[~valid] = np.nan
+
+        return pts3d_world.astype(np.float32)
 
     def _get_views(self, sampled_idx, num_views_to_sample, resolution):
         # Get the scene name of the sampled index (e.g., "chess_test")
@@ -107,7 +147,6 @@ class SevenScenesWAI(BaseDataset):
         num_views_in_scene = len(scene_file_names)
 
         # Load the scene pairwise covisibility mmap
-        # Strictly following ETH3D's 'v0' structure, with a safe fallback if missing
         covisibility_version_key = "v0"
         covisibility_map_dir = os.path.join(
             scene_root, "covisibility", covisibility_version_key
@@ -123,7 +162,6 @@ class SevenScenesWAI(BaseDataset):
             except StopIteration:
                 pass  # Directory exists but empty
 
-        # Fallback to fully connected if no covisibility map is found
         if pairwise_covisibility is None:
             pairwise_covisibility = np.ones((num_views_in_scene, num_views_in_scene), dtype=np.float32)
 
@@ -132,10 +170,8 @@ class SevenScenesWAI(BaseDataset):
             num_views_to_sample, num_views_in_scene, pairwise_covisibility
         )
 
-        # Get the views corresponding to the selected view indices
         views = []
         for view_index in view_indices:
-            # Load the data corresponding to the view
             view_file_name = scene_file_names[view_index]
             view_data = load_frame(
                 scene_root,
@@ -144,16 +180,15 @@ class SevenScenesWAI(BaseDataset):
                 scene_meta=scene_meta,
             )
 
-            # Convert necessary data to numpy
+            # HWC uint8 image
             image = view_data["image"].permute(1, 2, 0).numpy()
-            # Using clip is safer for 7Scenes data before casting to uint8
             image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
-            depthmap = view_data["depth"].numpy().astype(np.float32)
-            intrinsics = view_data["intrinsics"].numpy().astype(np.float32)
-            c2w_pose = view_data["extrinsics"].numpy().astype(np.float32)
+            depthmap = view_data["depth"].numpy().astype(np.float32)     # (H, W)
+            intrinsics = view_data["intrinsics"].numpy().astype(np.float32)  # (3, 3)
+            c2w_pose = view_data["extrinsics"].numpy().astype(np.float32)    # (4, 4)
 
-            # Resize the data to match the desired resolution
+            # Resize/crop to target resolution (intrinsics updated inside)
             image, depthmap, intrinsics = self._crop_resize_if_necessary(
                 image=image,
                 resolution=resolution,
@@ -162,21 +197,19 @@ class SevenScenesWAI(BaseDataset):
                 additional_quantities=None,
             )
 
-            # Append the view dictionary to the list of views
             views.append(
                 dict(
                     img=image,
                     depthmap=depthmap,
-                    camera_pose=c2w_pose,  # cam2world
+                    camera_pose=c2w_pose,          # cam2world
                     camera_intrinsics=intrinsics,
                     dataset="7Scenes",
                     label=scene_name,
                     instance=os.path.join("images", str(view_file_name)),
+                    # pts3d=pts3d,                   # <<< 新增键值对
                 )
             )
-
         return views
-
 
 def get_parser():
     import argparse
@@ -194,108 +227,315 @@ def get_parser():
     parser.add_argument(
         "-nv",
         "--num_of_views",
-        default=1,
+        default=2,
         type=int,
     )
 
     return parser
 
-
 if __name__ == "__main__":
     import numpy as np
     from tqdm import tqdm
-    import cv2
+    import cv2, json
     from pathlib import Path
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import torch
 
-    from mapanything.datasets.base.base_dataset import view_name
-    from mapanything.utils.image import rgb
     from mapanything.utils.viz import script_add_rerun_args
+    from mapanything.utils.image import rgb
 
+    # ========= 形状规格化工具 =========
+    def to_hw(depth):
+        """返回 (H, W) float32；把 (1,H,W)/(H,W,1) 等 squeeze 成 2D"""
+        arr = np.asarray(depth)
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            # 常见情况：C×H×W，把 C==1 的 squeeze
+            if arr.ndim == 3 and 1 in arr.shape:
+                arr = np.squeeze(arr)
+        assert arr.ndim == 2, f"depth must be HxW, got shape {arr.shape}"
+        return arr.astype(np.float32)
+
+    def as33(K):
+        """返回 (3,3) float32"""
+        K = np.asarray(K).squeeze()
+        assert K.shape[-2:] == (3,3), f"K must be 3x3, got {K.shape}"
+        return K.astype(np.float32)
+
+    def as44(T):
+        """返回 (4,4) float32"""
+        T = np.asarray(T).squeeze()
+        assert T.shape[-2:] == (4,4), f"pose must be 4x4, got {T.shape}"
+        return T.astype(np.float32)
+
+    def img_to_hwc01(img, norm_type="dinov2"):
+        """
+        把数据里的 img 还原为 H×W×3、[0,1] 用于可视化。
+        你原来用的 rgb() 会做反归一化，这里统一转成 HWC、[0,1]。
+        """
+        img_np = rgb(img, norm_type=norm_type)  # 返回一般是 H×W×3 或 C×H×W
+        arr = np.asarray(img_np)
+        if arr.ndim == 3 and arr.shape[0] in (1,3) and arr.shape[-1] not in (1,3):
+            # 形如 C×H×W -> H×W×C
+            arr = np.moveaxis(arr, 0, -1)
+        if arr.ndim == 2:
+            arr = np.stack([arr]*3, axis=-1)
+        # 夹紧到 [0,1]
+        arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
+        return arr
+
+    # ========= 几何函数 =========
+    def invert_se3(c2w: np.ndarray) -> np.ndarray:
+        R, t = c2w[:3, :3], c2w[:3, 3]
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[:3, :3] = R.T
+        w2c[:3, 3] = -R.T @ t
+        return w2c
+
+    def depth_to_world_points(depthmap: np.ndarray, K: np.ndarray, c2w_pose: np.ndarray) -> np.ndarray:
+        """depth: (H,W); K:(3,3); c2w:(4,4) -> pts3d:(H,W,3)；无效处 NaN"""
+        H, W = depthmap.shape
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+
+        u, v = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+        z = depthmap.astype(np.float32)
+        valid = np.isfinite(z) & (z > 0.0)
+
+        x = (u - cx) / fx * z
+        y = (v - cy) / fy * z
+        xyz_cam = np.stack([x, y, z], axis=-1)
+
+        R = c2w_pose[:3, :3].astype(np.float32)
+        t = c2w_pose[:3, 3].astype(np.float32)
+        pts3d_world = xyz_cam @ R.T + t
+        pts3d_world[~valid] = np.nan
+        return pts3d_world.astype(np.float32)
+
+    def single_view_diagnostics(view: dict):
+        """
+        要求 view 里：
+          depthmap: H×W
+          camera_intrinsics: 3×3
+          camera_pose: 4×4
+          pts3d: H×W×3
+        """
+        K   = as33(view["camera_intrinsics"])
+        c2w = as44(view["camera_pose"])
+        w2c = invert_se3(c2w)
+
+        depth = to_hw(view["depthmap"])
+        pts3d = np.asarray(view["pts3d"]).astype(np.float32)
+        assert pts3d.ndim == 3 and pts3d.shape[2] == 3, f"pts3d must be HxWx3, got {pts3d.shape}"
+        H, W = depth.shape
+
+        valid = np.isfinite(depth) & (depth > 0) & np.isfinite(pts3d).all(axis=-1)
+        if valid.sum() == 0:
+            raise RuntimeError("有效深度点为 0。")
+
+        Xw = pts3d[valid]
+        Xw_h = np.concatenate([Xw, np.ones((Xw.shape[0], 1), np.float32)], axis=1)
+        Xc = (w2c @ Xw_h.T).T[:, :3]
+        zc = Xc[:, 2]
+
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+        up = fx * (Xc[:, 0] / zc) + cx
+        vp = fy * (Xc[:, 1] / zc) + cy
+
+        U, V = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+        du = up - U[valid]; dv = vp - V[valid]
+        dpx = np.sqrt(du**2 + dv**2)
+
+        dz = np.abs(zc - depth[valid])
+        med_depth = float(np.median(depth[valid]))
+        rel_dz_mean = float((dz / max(med_depth, 1e-6)).mean())
+
+        nan_in_pts = np.isnan(pts3d).any(axis=-1)
+        invalid_depth = ~np.isfinite(depth) | (depth <= 0)
+        nan_invalid_agree_ratio = float((nan_in_pts == invalid_depth).mean())
+
+        report = {
+            "valid_ratio": float(valid.mean()),
+            "front_ratio": float((zc > 0).mean()),
+            "reproj_err_px_mean": float(dpx.mean()),
+            "reproj_err_px_p95": float(np.percentile(dpx, 95)),
+            "depth_abs_err_mean": float(dz.mean()),
+            "depth_abs_err_p95": float(np.percentile(dz, 95)),
+            "depth_rel_err_mean": rel_dz_mean,
+            "median_depth": med_depth,
+            "nan_invalid_agree_ratio": nan_invalid_agree_ratio,
+        }
+        return report, dpx, up, vp, valid
+
+    def pair_view_reprojection_stats(view_src: dict, view_tgt: dict) -> dict:
+        """把 src 的 pts3d 投到 tgt，返回 inside/infront 比例等。"""
+        Kt   = as33(view_tgt["camera_intrinsics"])
+        c2w_t = as44(view_tgt["camera_pose"])
+        w2c_t = invert_se3(c2w_t)
+
+        depth_t = to_hw(view_tgt["depthmap"])
+        Ht, Wt = depth_t.shape
+
+        pts3d_src = np.asarray(view_src["pts3d"]).astype(np.float32)
+        valid_src = np.isfinite(pts3d_src).all(axis=-1)
+        if valid_src.sum() == 0:
+            return {"num_src_valid": 0}
+
+        Xw = pts3d_src[valid_src]
+        Xw_h = np.concatenate([Xw, np.ones((Xw.shape[0], 1), np.float32)], axis=1)
+        Xt = (w2c_t @ Xw_h.T).T[:, :3]
+        zt = Xt[:, 2]
+
+        fx, fy, cx, cy = float(Kt[0, 0]), float(Kt[1, 1]), float(Kt[0, 2]), float(Kt[1, 2])
+        ut = fx * (Xt[:, 0] / zt) + cx
+        vt = fy * (Xt[:, 1] / zt) + cy
+
+        infront = zt > 0
+        inside = (ut >= 0) & (ut < Wt) & (vt >= 0) & (vt < Ht) & infront
+
+        margin_u = np.minimum(ut, Wt - 1 - ut)
+        margin_v = np.minimum(vt, Ht - 1 - vt)
+        margin = np.minimum(margin_u, margin_v)
+        margin_inside = margin[inside]
+
+        return {
+            "num_src_valid": int(valid_src.sum()),
+            "infront_ratio": float(infront.mean()),
+            "inside_ratio": float(inside.mean()),
+            "margin_px_p50": float(np.percentile(margin_inside, 50)) if margin_inside.size else 0.0,
+            "margin_px_p10": float(np.percentile(margin_inside, 10)) if margin_inside.size else 0.0,
+        }
+
+    def save_overlay(img01, up, vp, valid_mask, out_path: Path, stride=8):
+        H, W = valid_mask.shape
+        valid_idx_flat = np.flatnonzero(valid_mask.ravel())
+        if valid_idx_flat.size == 0:
+            return
+        sel_flat = valid_idx_flat[::max(1, stride)]
+        # 建立 valid_flat -> 顺序索引 的映射（因为 up/vp 只对应 valid 的顺序）
+        order = np.empty(valid_mask.size, dtype=np.int64); order.fill(-1)
+        order[valid_idx_flat] = np.arange(valid_idx_flat.size)
+        sel_order = order[sel_flat]
+
+        plt.figure(figsize=(6, 6))
+        plt.imshow((img01 * 255).astype(np.uint8))
+        plt.scatter(up[sel_order], vp[sel_order], s=2, alpha=0.7)
+        plt.title("Reprojected pixels overlay")
+        plt.axis("off"); plt.tight_layout()
+        plt.savefig(out_path, dpi=150); plt.close()
+
+    def save_hist(dpx, out_path: Path):
+        plt.figure()
+        plt.hist(dpx, bins=60)
+        plt.xlabel("Reprojection error (px)"); plt.ylabel("Count")
+        plt.title("Reprojection error histogram")
+        plt.tight_layout(); plt.savefig(out_path, dpi=150); plt.close()
+
+    # ========= 你的原始参数与数据加载 =========
     parser = get_parser()
     script_add_rerun_args(parser)
     args = parser.parse_args()
 
-    # =========================================
-    # 配置
-    # =========================================
     BATCH_SIZE = 1
-    MAX_BATCHES = 1  # 你想要提取的批次数量
-    SAVE_DIR = Path("/home/xwh/project/tmp/")
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    # =========================================
-    # 1. 初始化数据集
-    # 关键：确保 seed=None 或者不传，以允许随机性
-    # =========================================
-    try:
-        dataset = SevenScenesWAI(
-            num_views=args.num_of_views,
-            split=args.split,
-            covisibility_thres=0.025,
-            ROOT=args.root_dir,
-            dataset_metadata_dir=args.dataset_metadata_dir,
-            sample_specific_scene=True,
-            specific_scene_name='chess_test',
-            resolution=(518, 392),
-            transform="imgnorm",
-            data_norm_type="dinov2",
-            # seed=777,  <--- 务必注释掉或设为 None
-        )
-    except Exception as e:
-        print(f"Error initializing dataset: {e}")
-        exit()
+    MAX_BATCHES = 1
+    SAVE_DIR = Path("/home/xwh/project/tmp/"); SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    dataset = SevenScenesWAI(
+        num_views=args.num_of_views,
+        split=args.split,
+        covisibility_thres=0.025,
+        ROOT=args.root_dir,
+        dataset_metadata_dir=args.dataset_metadata_dir,
+        sample_specific_scene=True,
+        specific_scene_name='chess_test',
+        resolution=(518, 392),
+        transform="imgnorm",
+        data_norm_type="dinov2",
+    )
 
     print(f"Dataset initialized. Length: {len(dataset)}")
     print(f"Starting manual extraction of {MAX_BATCHES} diverse batches...")
 
     dataloader = ForcedRandomDataLoader(
         dataset=dataset,
-        batch_size=1,  # 你想要的 batch size
-        num_batches=1  # 你想要遍历多少个 batch 后结束
+        batch_size=1,
+        num_batches=MAX_BATCHES
     )
 
-    # =========================================
-    # 2. 手动循环构建 Batch
-    # =========================================
     for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Loading Data")):
-
-   # =========================================
-        # 3. 保存逻辑 (与之前相同，略有调整以适应 batch_data 结构)
-        # =========================================
-        # 注意：default_collate 打包后，batch_data 依然是一个 list (长度为 num_views)，
-        # 其中的每个元素是一个 dict，dict 里的值现在有了 (B, ...) 的维度。
-
         num_views_in_batch = len(batch_data)
-        # 获取当前 batch 的实际大小 (应该等于 BATCH_SIZE)
         current_batch_size = batch_data[0]['img'].shape[0]
 
         for sample_i in range(current_batch_size):
-            global_sample_idx = batch_idx * BATCH_SIZE + sample_i
-            sample_dir = SAVE_DIR / f"batch{batch_idx:03d}_sample{sample_i:03d}_idx{global_sample_idx:06d}"
+            sample_dir = SAVE_DIR / f"batch{batch_idx:03d}_sample{sample_i:03d}"
             sample_dir.mkdir(parents=True, exist_ok=True)
 
-            # 从 batch 中解压出单个样本的数据用于保存
-            views = []
+            # 解包单样本
+            raw_views = []
             for view_idx in range(num_views_in_batch):
-                view_sample = {}
-                for key, value in batch_data[view_idx].items():
-                    if isinstance(value, torch.Tensor):
-                        view_sample[key] = value[sample_i].cpu().numpy()
-                    elif isinstance(value, (list, tuple)):
-                        view_sample[key] = value[sample_i]
+                d = {}
+                for k, v in batch_data[view_idx].items():
+                    if isinstance(v, torch.Tensor):
+                        d[k] = v[sample_i].detach().cpu().numpy()
+                    elif isinstance(v, (list, tuple)):
+                        d[k] = v[sample_i]
                     else:
-                        view_sample[key] = value
-                views.append(view_sample)
+                        d[k] = v
+                raw_views.append(d)
+            # 规格化 + 点云计算 + 诊断
+            views = []
+            for v_idx, v in enumerate(raw_views):
+                img01 = img_to_hwc01(v['img'], norm_type=v.get('data_norm_type', 'dinov2'))
+                depth = to_hw(v['depthmap'])
+                K     = as33(v['camera_intrinsics'])
+                c2w   = as44(v['camera_pose'])
+                pts3d = v['pts3d']
+                print(pts3d.shape)
 
-            # --- 执行你的保存和可视化代码 ---
-            # save_views_data(views, sample_dir)
-            # 这里简写，请替换为你完整的保存 RGB/Depth/Pose 的循环代码
-            for v_idx, view in enumerate(views):
-                # 示例：仅保存 RGB 验证差异性
-                if 'img' in view:
-                    # 假设 rgb() 是你的反归一化函数
-                    img_np = rgb(view['img'], norm_type=view.get('data_norm_type', 'dinov2'))
-                    cv2.imwrite(str(sample_dir / f"view{v_idx:02d}_rgb.png"),
-                                cv2.cvtColor((img_np * 255).clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                view_local = dict(v)
+                view_local['img01'] = img01     # 仅可视化用
+                view_local['depthmap'] = depth  # 2D
+                view_local['camera_intrinsics'] = K
+                view_local['camera_pose'] = c2w
+                view_local['pts3d'] = pts3d
 
-    print("Finished manual diverse sampling.")
+                # 保存 RGB 便于肉眼看
+                cv2.imwrite(str(sample_dir / f"view{v_idx:02d}_rgb.png"),
+                            cv2.cvtColor((img01 * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+                try:
+                    report, dpx, up, vp, valid = single_view_diagnostics(view_local)
+                except Exception as e:
+                    print(f"[view {v_idx}] diagnostics failed: {e}")
+                    continue
+
+                with open(sample_dir / f"view{v_idx:02d}_diagnostics.json", "w") as f:
+                    json.dump(report, f, indent=2)
+
+                save_overlay(img01, up, vp, valid, sample_dir / f"view{v_idx:02d}_reproj_overlay.png", stride=8)
+                save_hist(dpx, sample_dir / f"view{v_idx:02d}_reproj_hist.png")
+
+                print(f"[batch{batch_idx} view{v_idx}] "
+                      f"front={report['front_ratio']:.3f} "
+                      f"reproj_mean={report['reproj_err_px_mean']:.3f} "
+                      f"p95={report['reproj_err_px_p95']:.3f} "
+                      f"valid={report['valid_ratio']:.3f}")
+
+                views.append(view_local)
+
+            # 跨视角：需要至少两帧
+            if len(views) >= 2:
+                for a in range(len(views)):
+                    for b in range(len(views)):
+                        if a == b: continue
+                        cross = pair_view_reprojection_stats(views[a], views[b])
+                        with open(sample_dir / f"cross_{a}_to_{b}.json", "w") as f:
+                            json.dump(cross, f, indent=2)
+                        print(f"[cross {a}->{b}] inside={cross.get('inside_ratio',0):.3f} "
+                              f"infront={cross.get('infront_ratio',0):.3f} "
+                              f"N={cross.get('num_src_valid',0)}")
+
+    print("Finished manual diverse sampling & diagnostics.")
+
