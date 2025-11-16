@@ -1,11 +1,11 @@
-"""ACE-style regression head training using stored AA memory features."""
+"""ACE 风格的回归头训练入口。"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import hydra
 import torch
@@ -19,26 +19,111 @@ from mapanything.tasks.ace import ACERegressionHead, load_memory_features, move_
 from mapanything.utils.geometry import quaternion_to_rotation_matrix
 
 
-class FeatureBufferDataset(Dataset):
-    def __init__(self, samples: List[Dict[str, Any]]):
-        self.samples = samples
-
-    def __len__(self) -> int:  # pragma: no cover - trivial
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:  # pragma: no cover - thin wrapper
-        return self.samples[idx]
+# ---------------------------------------------------------------------------
+# 数据结构
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class TrainingSample:
+class BufferTensors:
     features: torch.Tensor
     target_world: torch.Tensor
-    valid_mask: torch.Tensor
+    pixels: torch.Tensor
     intrinsics: torch.Tensor
     c2w: torch.Tensor
-    pixel_grid: torch.Tensor
-    scene_name: str
+    valid_mask: torch.Tensor
+
+
+class FeatureReplayBuffer:
+    """仿照 ACE，把随机采样的像素特征/位姿放入固定大小的缓冲区。"""
+
+    def __init__(self, capacity: int, feat_dim: int, device: torch.device):
+        self.capacity = capacity
+        self.device = device
+        self.size = 0
+        self.storage = BufferTensors(
+            features=torch.empty((capacity, feat_dim), device=device, dtype=torch.float32),
+            target_world=torch.empty((capacity, 3), device=device, dtype=torch.float32),
+            pixels=torch.empty((capacity, 2), device=device, dtype=torch.float32),
+            intrinsics=torch.empty((capacity, 3, 3), device=device, dtype=torch.float32),
+            c2w=torch.empty((capacity, 4, 4), device=device, dtype=torch.float32),
+            valid_mask=torch.zeros((capacity,), device=device, dtype=torch.bool),
+        )
+
+    @property
+    def is_full(self) -> bool:
+        return self.size >= self.capacity
+
+    def _remaining(self) -> int:
+        return max(0, self.capacity - self.size)
+
+    def add_view(
+        self,
+        fused_feature: torch.Tensor,
+        target_world: torch.Tensor,
+        valid_mask: torch.Tensor,
+        intrinsics: torch.Tensor,
+        c2w: torch.Tensor,
+        max_per_view: int,
+    ) -> int:
+        """向缓冲区写入当前视角的随机像素样本。"""
+
+        if self.is_full:
+            return 0
+
+        c, h, w = fused_feature.shape
+        feats_flat = fused_feature.reshape(c, -1).transpose(0, 1)
+        targets_flat = target_world.reshape(3, -1).transpose(0, 1)
+        mask_flat = valid_mask.reshape(-1) > 0.5
+        if mask_flat.sum() == 0:
+            return 0
+
+        pixel_grid = _pixel_grid(h, w, fused_feature.device)
+        pixels_flat = pixel_grid.reshape(2, -1).transpose(0, 1)
+
+        valid_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+        perm = torch.randperm(valid_idx.numel(), device=fused_feature.device)
+        chosen = valid_idx[perm[:max_per_view]]
+        if chosen.numel() == 0:
+            return 0
+
+        chosen = chosen[: self._remaining()]
+        slot = slice(self.size, self.size + chosen.numel())
+
+        self.storage.features[slot] = feats_flat[chosen].to(self.device)
+        self.storage.target_world[slot] = targets_flat[chosen].to(self.device)
+        self.storage.pixels[slot] = pixels_flat[chosen].to(self.device)
+        self.storage.intrinsics[slot] = intrinsics.to(self.device)
+        self.storage.c2w[slot] = c2w.to(self.device)
+        self.storage.valid_mask[slot] = True
+
+        self.size += chosen.numel()
+        return chosen.numel()
+
+
+class BufferDataset(Dataset):
+    """薄包装，直接从缓冲区张量读取样本。"""
+
+    def __init__(self, buffer: FeatureReplayBuffer):
+        self.buffer = buffer
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return self.buffer.size
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:  # pragma: no cover - thin wrapper
+        return {
+            "features": self.buffer.storage.features[idx],
+            "target_world": self.buffer.storage.target_world[idx],
+            "pixels": self.buffer.storage.pixels[idx],
+            "intrinsics": self.buffer.storage.intrinsics[idx],
+            "c2w": self.buffer.storage.c2w[idx],
+            "valid_mask": self.buffer.storage.valid_mask[idx],
+        }
+
+
+# ---------------------------------------------------------------------------
+# 基础几何工具
+# ---------------------------------------------------------------------------
 
 
 def _pixel_grid(height: int, width: int, device: torch.device) -> torch.Tensor:
@@ -48,11 +133,32 @@ def _pixel_grid(height: int, width: int, device: torch.device) -> torch.Tensor:
     return torch.stack([xx, yy], dim=0)
 
 
+def _project_points(
+    points_world: torch.Tensor, intrinsics: torch.Tensor, c2w: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """将世界坐标投影到像素平面，返回像素坐标与有效性掩码。"""
+
+    if points_world.dim() == 2:
+        points_world = points_world.unsqueeze(-1)
+
+    R = c2w[:, :3, :3]
+    t = c2w[:, :3, 3:4]
+    cam = torch.bmm(R.transpose(1, 2), points_world - t)
+
+    z = cam[:, 2:3]
+    valid = z > 1e-6
+    pixels = torch.bmm(intrinsics, cam)
+    pixels = pixels[:, :2] / z.clamp(min=1e-6)
+    return pixels.transpose(1, 2), valid.squeeze(1)
+
+
 def _project_world_points(
     points_world: torch.Tensor,
     intrinsics: torch.Tensor,
     c2w: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """稠密投影版本，兼容 Bx3xHxW 的输入。"""
+
     batch, _, height, width = points_world.shape
     if intrinsics.dim() == 2:
         intrinsics = intrinsics.unsqueeze(0)
@@ -78,11 +184,9 @@ def _project_world_points(
 def _masked_smooth_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if mask.dtype != torch.bool:
         mask = mask > 0.5
-    if mask.dim() == 3:
-        mask = mask.unsqueeze(1)
     if mask.sum() == 0:
         return pred.new_tensor(0.0)
-    return F.smooth_l1_loss(pred[mask.expand_as(pred)], target[mask.expand_as(target)])
+    return F.smooth_l1_loss(pred[mask], target[mask])
 
 
 def _resolve_intrinsics(view: Dict[str, Any], device: torch.device) -> torch.Tensor:
@@ -135,6 +239,11 @@ def _prepare_targets(view: Dict[str, Any], feature_hw: Tuple[int, int], device: 
     return pts3d, valid_mask
 
 
+# ---------------------------------------------------------------------------
+# 缓冲区构建与损失
+# ---------------------------------------------------------------------------
+
+
 def _collect_buffer(
     cfg: DictConfig,
     model,
@@ -142,18 +251,22 @@ def _collect_buffer(
     memory_feats,
     memory_token,
     device: torch.device,
-):
-    samples: List[Dict[str, Any]] = []
-    for idx in range(min(cfg.training.num_samples, len(dataset))):
+) -> Tuple[FeatureReplayBuffer, int]:
+    samples_seen = 0
+    buffer: FeatureReplayBuffer | None = None
+
+    for idx in range(len(dataset)):
+        if buffer is not None and buffer.is_full:
+            break
+
         views = dataset[idx]
         if not views:
             continue
         view = views[0]
-        scene_name = view.get("label") or view.get("scene_name") or str(idx)
         prepared = move_view_to_device(view, device)
 
         with torch.no_grad():
-            dense_feature, _ = model.forward_with_memory_dense_feature(
+            fused_feature, _ = model.forward_with_memory_dense_feature(
                 query_view=[prepared],
                 device=str(device),
                 memory_feats=memory_feats,
@@ -162,68 +275,71 @@ def _collect_buffer(
                 memory_efficient_inference=cfg.training.memory_efficient_inference,
             )
 
-        feature_hw = dense_feature.shape[-2:]
+        feature_hw = fused_feature.shape[-2:]
         target_world, valid_mask = _prepare_targets(view, feature_hw, device)
         intrinsics = _resolve_intrinsics(view, device).to(torch.float32)
         c2w = _resolve_pose(view, device).to(torch.float32)
-        pixel_grid = _pixel_grid(feature_hw[0], feature_hw[1], device)
 
-        feature_cpu = dense_feature.detach().cpu()
-        if feature_cpu.shape[0] == 1:
-            feature_cpu = feature_cpu.squeeze(0)
+        if buffer is None:
+            buffer = FeatureReplayBuffer(cfg.training.buffer_capacity, fused_feature.shape[1], device=torch.device("cpu"))
 
-        target_world = target_world.detach().cpu()
-        valid_mask = valid_mask.detach().cpu()
-        if target_world.shape[0] == 1:
-            target_world = target_world.squeeze(0)
-        if valid_mask.shape[0] == 1:
-            valid_mask = valid_mask.squeeze(0)
-
-        intrinsics_cpu = intrinsics.detach().cpu()
-        c2w_cpu = c2w.detach().cpu()
-        if intrinsics_cpu.shape[0] == 1:
-            intrinsics_cpu = intrinsics_cpu.squeeze(0)
-        if c2w_cpu.shape[0] == 1:
-            c2w_cpu = c2w_cpu.squeeze(0)
-
-        samples.append(
-            TrainingSample(
-                features=feature_cpu,
-                target_world=target_world,
-                valid_mask=valid_mask,
-                intrinsics=intrinsics_cpu,
-                c2w=c2w_cpu,
-                pixel_grid=pixel_grid.detach().cpu(),
-                scene_name=scene_name,
-            ).__dict__
+        added = buffer.add_view(
+            fused_feature.squeeze(0).detach(),
+            target_world.squeeze(0).detach(),
+            valid_mask.squeeze(0).detach(),
+            intrinsics.squeeze(0).detach(),
+            c2w.squeeze(0).detach(),
+            cfg.training.samples_per_view,
         )
 
-        if len(samples) >= cfg.training.buffer_capacity:
+        samples_seen += 1
+        if samples_seen >= cfg.training.max_buffer_views:
             break
 
-    if not samples:
+    if buffer is None or buffer.size == 0:
         raise RuntimeError("No training samples were collected. Check dataset or configuration.")
-    return FeatureBufferDataset(samples), samples[0]["features"].shape[0]
+    return buffer, buffer.storage.features.shape[1]
 
 
 def _loss_fn(preds: torch.Tensor, batch: Dict[str, torch.Tensor], loss_cfg: DictConfig):
-    coords = preds[:, :3]
-    conf_logits = preds[:, 3:4]
-    confidence = torch.sigmoid(conf_logits)
+    # 稠密图像推理（eval）使用 Bx4xHxW 形状
+    if preds.dim() == 4:
+        coords = preds[:, :3]
+        conf_logits = preds[:, 3:4]
+        confidence = torch.sigmoid(conf_logits)
 
-    target_world = batch["target_world"].to(coords.device)
-    intrinsics = batch["intrinsics"].to(coords.device)
-    c2w = batch["c2w"].to(coords.device)
-    valid_mask = batch["valid_mask"].to(coords.device)
+        target_world = batch["target_world"].to(coords.device)
+        intrinsics = batch["intrinsics"].to(coords.device)
+        c2w = batch["c2w"].to(coords.device)
+        valid_mask = batch["valid_mask"].to(coords.device)
 
-    pred_pixels, pred_valid = _project_world_points(coords, intrinsics, c2w)
-    target_pixels, target_valid = _project_world_points(target_world, intrinsics, c2w)
-    combined_mask = valid_mask * pred_valid * target_valid
+        pred_pixels, pred_valid = _project_world_points(coords, intrinsics, c2w)
+        target_pixels, target_valid = _project_world_points(target_world, intrinsics, c2w)
+        combined_mask = valid_mask * pred_valid * target_valid
 
-    reprojection = _masked_smooth_l1(pred_pixels, target_pixels, combined_mask)
-    xyz_loss = _masked_smooth_l1(coords, target_world, valid_mask)
-    conf_target = valid_mask.clamp(min=0.0, max=1.0)
-    conf_loss = F.binary_cross_entropy(confidence, conf_target, reduction="mean")
+        reprojection = _masked_smooth_l1(pred_pixels, target_pixels, combined_mask)
+        xyz_loss = _masked_smooth_l1(coords, target_world, valid_mask)
+        conf_target = valid_mask.clamp(min=0.0, max=1.0)
+        conf_loss = F.binary_cross_entropy(confidence, conf_target, reduction="mean")
+    else:
+        coords = preds[:, :3]
+        conf_logits = preds[:, 3]
+        confidence = torch.sigmoid(conf_logits)
+
+        target_world = batch["target_world"].to(coords.device)
+        intrinsics = batch["intrinsics"].to(coords.device)
+        c2w = batch["c2w"].to(coords.device)
+        pixels = batch["pixels"].to(coords.device)
+        valid_mask = batch["valid_mask"].to(coords.device)
+
+        coords_exp = coords.unsqueeze(-1)
+        proj_pixels, proj_valid = _project_points(coords_exp, intrinsics, c2w)
+        pixel_mask = (valid_mask & proj_valid.squeeze(1)).unsqueeze(-1).expand_as(proj_pixels.squeeze(1))
+        xyz_mask = valid_mask.unsqueeze(-1).expand_as(coords)
+
+        reprojection = _masked_smooth_l1(proj_pixels.squeeze(1), pixels, pixel_mask)
+        xyz_loss = _masked_smooth_l1(coords, target_world, xyz_mask)
+        conf_loss = F.binary_cross_entropy(confidence, valid_mask.float(), reduction="mean")
 
     total = (
         loss_cfg.reprojection_weight * reprojection
@@ -240,6 +356,11 @@ def _loss_fn(preds: torch.Tensor, batch: Dict[str, torch.Tensor], loss_cfg: Dict
     return total, metrics
 
 
+# ---------------------------------------------------------------------------
+# 训练入口
+# ---------------------------------------------------------------------------
+
+
 def run_training(cfg: DictConfig) -> Dict[str, str]:
     device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
@@ -252,9 +373,9 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
     memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
     dataset = instantiate_dataset(cfg.dataset.dataset_str)
 
-    buffer_ds, in_channels = _collect_buffer(cfg, model, dataset, memory_feats, memory_token, device)
+    buffer, in_channels = _collect_buffer(cfg, model, dataset, memory_feats, memory_token, device)
     dataloader = DataLoader(
-        buffer_ds,
+        BufferDataset(buffer),
         batch_size=cfg.training.batch_size,
         shuffle=cfg.training.shuffle,
         num_workers=cfg.training.num_workers,
@@ -280,7 +401,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
 
             global_step += 1
             if global_step % cfg.training.log_interval == 0:
-                print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}))
+                print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
 
     ckpt_path = output_dir / "ace_regression_head.pt"
     torch.save({"state_dict": head.state_dict(), "in_channels": in_channels}, ckpt_path)

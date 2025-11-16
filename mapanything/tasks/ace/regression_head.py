@@ -21,6 +21,10 @@ class ACERegressionHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover - thin wrapper
+        if x.dim() == 2:
+            x = x.unsqueeze(-1).unsqueeze(-1)
+            out = self.net(x)
+            return out.flatten(1)
         return self.net(x)
 
 

@@ -34,8 +34,9 @@ training:
   weight_decay: 1e-4
   batch_size: 4
   num_workers: 2
-  num_samples: 32
-  buffer_capacity: 256
+  samples_per_view: 512
+  max_buffer_views: 64
+  buffer_capacity: 8192
   shuffle: true
   memory_efficient_inference: false
 
