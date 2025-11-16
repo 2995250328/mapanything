@@ -2249,6 +2249,71 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return res
 
+    def forward_with_memory_dense_feature(
+            self,
+            query_view,
+            device: str,
+            memory_feats: List[List[torch.Tensor]],
+            additional_tokens: torch.Tensor,
+            memory_keep_ratio: float = 1.0,
+            memory_efficient_inference: bool = False,
+    ):
+        """返回融合后的稠密特征，用于仅重新训练回归头。
+
+        该函数遵循 :func:`forward_with_memory` 的编排：
+
+        1. 对单视图进行编码。
+        2. 利用存储的 memory 特征进行跨视图信息交互。
+        3. 返回融合后的 query 特征 (B, C, H, W) 以及 scale token (B, C, 1)。
+
+        参数与 ``forward_with_memory`` 保持一致，但不会执行下游 head，
+        因此非常适合在冻结 backbone/encoder 时重新训练轻量回归头。
+        """
+
+        def downsample_tokens(feat_list):
+            kept = []
+            for f in feat_list:
+                Bh, Ch, Hm, Wm = f.shape
+                total = Hm * Wm
+                keep_n = max(1, int(total * memory_keep_ratio))
+
+                flat = f.reshape(Bh, Ch, total)
+                idx = torch.randperm(total, device=device)[:keep_n]
+                selected = flat[:, :, idx]
+                kept.append(selected)
+            return kept
+
+        memory_token_blocks = []
+        for block in memory_feats:
+            merged = []
+            for view_feat in block:
+                merged.append(view_feat)
+            block_tokens = downsample_tokens(merged)
+            block_tokens = torch.cat(block_tokens, dim=2)
+            memory_token_blocks.append(block_tokens)
+
+        all_encoder_features_across_views = self._encode_n_views(query_view)
+        with torch.autocast("cuda", enabled=False):
+            all_encoder_features_across_views = (
+                self._encode_and_fuse_optional_geometric_inputs(
+                    query_view, all_encoder_features_across_views
+                )
+            )
+
+        query_feat = all_encoder_features_across_views[0]
+        scale_token = additional_tokens.to(query_feat.dtype)
+        final_feat, _ = self.info_sharing.forward_query_with_memory(
+            query_feat=query_feat,
+            memory_feats=memory_feats,
+            additional_tokens=scale_token,
+            memory_keep_ratio=memory_keep_ratio,
+        )
+
+        fused_query_feature = final_feat.features[0]
+        fused_scale_token = final_feat.additional_token_features
+
+        return fused_query_feature, fused_scale_token
+
     def _clone_tensor_for_storage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Detach, clone, and optionally move a tensor for intermediate storage."""
 
