@@ -708,7 +708,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         num_workers=cfg.training.num_workers,
     )
 
-    head = ACERegressionHead(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
+    head = ACEHead_Pointwise_Decoupled(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     output_dir = Path(cfg.training.output_dir).expanduser()
@@ -720,6 +720,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         for batch in bufferloader:
             features = batch["features"].to(device)
             preds = head(features)
+            preds[:3] = preds[:3] *
             loss, metrics = _loss_fn(preds, batch,repro_loss,global_step, cfg.loss)
 
             optimizer.zero_grad(set_to_none=True)
