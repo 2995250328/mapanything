@@ -12,7 +12,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
     read -r batch_size num_views dataset <<< "$combo"
     echo "Running $dataset with batch_size=$batch_size and num_views=$num_views"
     python3  \
-        mapanything/tasks/ace/train.py \
+        mapanything/tasks/train.py \
         machine=aws \
         dataset=$dataset \
         dataset.num_workers=1 \

@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from mapanything.models import init_model
 from mapanything.tasks.aa_feature_fusion.common import instantiate_dataset
 from mapanything.tasks.ace import ACERegressionHead, load_memory_features, move_view_to_device
-from mapanything.tasks.ace.train import (
+from mapanything.tasks.train import (
     _loss_fn,
     _prepare_targets,
     _resolve_intrinsics,

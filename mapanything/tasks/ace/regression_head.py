@@ -88,11 +88,41 @@ class ACEHead_Pointwise_FiLM(nn.Module):
             out = out.flatten(1)  # [N,4]
         return out
 
-class ACEHead_Pointwise_Decoupled(nn.Module):
+class ScaleMLP(nn.Module):
+    """仅用 token 预测正数尺度 s（逐样本/逐视角独立）。"""
+    def __init__(self, token_dim: int, hidden: int = 128,
+                 s_min: float = 1e-3, s_max: float = 1e3):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim, hidden), nn.GELU(),
+            nn.Linear(hidden, 1)
+        )
+        self.s_min = s_min
+        self.s_max = s_max
+
+    def forward(self, token: torch.Tensor) -> torch.Tensor:
+        # raw -> softplus 保证 >0，再 clamp 到合理范围
+        raw = self.mlp(token).squeeze(-1)           # [N] 或 [B]
+        s = F.softplus(raw) + 1e-8
+        s = torch.clamp(s, min=self.s_min, max=self.s_max)
+        return s  # [N] 或 [B]
+
+class ACEHead_Pointwise_Decoupled_WithScale(nn.Module):
     """
-    逐点 1x1 回归头：输出无尺度 XYZ_unit + conf_logit，不做任何空间聚合。
+    逐点 1x1 回归头：输出无尺度 XYZ_unit 与尺度 s。
+    - 特征 -> 1x1 MLP -> XYZ_unit（不聚合邻域）
+    - scale_token -> MLP -> s（正数）
+    - 不做空间卷积，适合来自不同图像/不同区域的混合 batch
+
+    forward 返回:
+      - coords_unit: [B,3,H,W] 或 [N,3]  （输入为 [N,C] 时返回 [N,3]）
+      - scale:       [B] 或 [N]          （与 batch 维对应）
     """
-    def __init__(self, in_channels: int, hidden_dim: int = 512, depth: int = 8, out_channels: int = 4):
+    def __init__(self,
+                 in_channels: int,
+                 token_dim: int,
+                 hidden_dim: int = 512,
+                 depth: int = 8):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
@@ -101,24 +131,35 @@ class ACEHead_Pointwise_Decoupled(nn.Module):
             nn.GELU(),
         )
         self.blocks = nn.ModuleList([PointwiseBlock(hidden_dim) for _ in range(depth)])
-        self.head   = nn.Sequential(
+        self.head_coords = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False), nn.GELU(),
-            nn.Conv2d(hidden_dim, out_channels, 1, bias=True)  # 3D_unit + conf_logit
+            nn.Conv2d(hidden_dim, 4, 1, bias=True)  # 仅输出 XYZ_unit
         )
+        self.scale_head = ScaleMLP(token_dim=token_dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, scale_token: torch.Tensor):
+        """
+        x: [B,C,H,W] 或 [N,C]（逐点特征）
+        scale_token: [B,T] 或 [N,T]（与 batch 维一一对应）
+        """
         squeeze_hw = False
         if x.dim() == 2:
+            # 稀疏样本：按 [N,C] 处理（不聚合），内部 reshape 成 [N,C,1,1]
             x = x.unsqueeze(-1).unsqueeze(-1)
             squeeze_hw = True
 
         h = self.stem(x)
         for blk in self.blocks:
             h = blk(h)
-        out = self.head(h)  # [B,4,H,W] or [N,4,1,1]
+        out = self.head_coords(h)  # [B,3,H,W] 或 [N,3,1,1]
+
+        # 尺度仅由 token 决定，与空间无关
+        s = self.scale_head(scale_token)   # [B] 或 [N]
+
         if squeeze_hw:
-            out = out.flatten(1)  # [N,4]
-        return out
+            out = out.squeeze(-1).squeeze(-1)  # [N,3]
+
+        return out, s
 
 def load_regression_head(
     head: nn.Module,

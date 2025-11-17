@@ -12,6 +12,7 @@ root_experiments_dir: ${machine.root_experiments_dir}
 root_uniception_pretrained_checkpoints_dir: ${machine.root_uniception_pretrained_checkpoints_dir}
 
 model:
+  head_mode: "film"         # film直接得到有尺度结果，Decoupled得到无尺度坐标和尺度信息
   head_checkpoint: null     # "/path/to/head_only.ckpt" 时启用加载
   head_strict: false        # 是否严格加载（通常 false 更稳）
   head_prefixes: ["", "module.", "head.", "reg_head.", "ace_head."]  # 可覆盖

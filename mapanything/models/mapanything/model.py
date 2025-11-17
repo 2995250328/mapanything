@@ -14,6 +14,7 @@ from pathlib import Path
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+import math
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
@@ -1648,11 +1649,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             # Run prediction for all (batch_size * num_views) in one go
             # Dense prediction
             if self.pred_head_type == "linear":
-                dense_final_outputs = self.dense_head(
+                dense_final_outputs = self.dpt_feature_head(
                     PredictionHeadInput(last_feature=dense_head_inputs)
                 )
             elif self.pred_head_type in ["dpt", "dpt+pose"]:
-                dense_final_outputs = self.dense_head(
+                dense_final_outputs = self.dpt_feature_head(
                     PredictionHeadLayeredInput(
                         list_features=dense_head_inputs,
                         target_output_shape=img_shape,
@@ -2210,9 +2211,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 dense_head_inputs_list.append(intermediate_feats[1].features[0])
                 dense_head_inputs_list.append(intermediate_feats[2].features[0])
                 dense_head_inputs_list.append(fused_query_feature)
-
-            dense_head_inputs = dense_head_inputs_list
-
         else:
             raise ValueError(f"Invalid pred_head_type: {self.pred_head_type}")
         ###########################################################################
@@ -2221,14 +2219,20 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         batch_size_per_view, _, height, width = query_view[0]["img"].shape
         img_shape = (int(height), int(width))
         with torch.autocast("cuda", enabled=False):
+            if self.pred_head_type == "linear":
+                dense_head_inputs = dense_head_inputs
+            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                dense_head_inputs = dense_head_inputs_list
+            scale_head_inputs = (
+                final_feat.additional_token_features
+            )
             dense_out, pose_out, scale_out = self.downstream_head(
                 dense_head_inputs=dense_head_inputs,
-                scale_head_inputs=fused_scale_token,
+                scale_head_inputs=scale_head_inputs,
                 img_shape=img_shape,
                 memory_efficient_inference=memory_efficient_inference,
             )
 
-        num_views = 1  # 查询视图只有 1 个
         # ------------------------------
         # 类型 1：pointmap (+ variants)
         # ------------------------------
@@ -2391,27 +2395,53 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         因此非常适合在冻结 backbone/encoder 时重新训练轻量回归头。
         """
 
-        def downsample_tokens(feat_list):
+        def downsample_tokens(feat_list: List[torch.Tensor], memory_keep_ratio: float = 1.0):
+            """
+            对每个视角的特征 [B,C,H,W] 随机子采样 H*W 个 token 中的 keep_n 个，
+            并将形状保持为 4D：[B,C,1,keep_n]（给后续插值/注意力模块使用）。
+            返回 List[Tensor]，与输入 feat_list 等长（逐视角保留）。
+            """
             kept = []
             for f in feat_list:
-                Bh, Ch, Hm, Wm = f.shape
-                total = Hm * Wm
-                keep_n = max(1, int(total * memory_keep_ratio))
+                assert f.dim() == 4, f"downsample_tokens expects [B,C,H,W], got {tuple(f.shape)}"
+                B, C, H, W = f.shape
+                T = H * W
 
-                flat = f.reshape(Bh, Ch, total)
-                idx = torch.randperm(total, device=device)[:keep_n]
-                selected = flat[:, :, idx]
+                keep_n = max(1, min(T, int(math.ceil(T * float(memory_keep_ratio)))))
+
+                flat = f.reshape(B, C, T)  # [B,C,T]
+                if keep_n == T:
+                    selected = flat  # [B,C,T]
+                else:
+                    idx = torch.randperm(T, device=f.device)[:keep_n]
+                    selected = flat.index_select(2, idx)  # [B,C,keep_n]
+
+                # 还原 4D，形成“1 x keep_n”的伪二维网格
+                selected = selected.view(B, C, 1, keep_n)  # [B,C,1,keep_n]
                 kept.append(selected)
             return kept
 
-        memory_token_blocks = []
-        for block in memory_feats:
+        # ------------------- 这里是调用处的修改 -------------------
+        memory_token_blocks: List[List[torch.Tensor]] = []
+        for block in memory_feats:  # block: List[Tensor[B,C,H,W]]，每个元素是一个视角的特征
+            # （可选）如果担心某些输入不是 4D，可在这里做兜底处理
             merged = []
             for view_feat in block:
-                merged.append(view_feat)
-            block_tokens = downsample_tokens(merged)
-            block_tokens = torch.cat(block_tokens, dim=2)
-            memory_token_blocks.append(block_tokens)
+                if view_feat.dim() == 4:
+                    merged.append(view_feat)
+                elif view_feat.dim() == 3:  # [B,C,T] -> [B,C,1,T]
+                    merged.append(view_feat.unsqueeze(2))
+                elif view_feat.dim() == 2:  # [B,C]   -> [B,C,1,1]
+                    merged.append(view_feat.unsqueeze(-1).unsqueeze(-1))
+                else:
+                    raise ValueError(f"Unexpected view_feat shape: {tuple(view_feat.shape)}")
+
+            # 逐视角采样，保留为 List[Tensor]，不再拼接
+            block_tokens_list = downsample_tokens(merged, memory_keep_ratio=memory_keep_ratio)
+            # 类型: List[Tensor[B,C,1,keep_n_i]]，与视角数量一致
+            memory_token_blocks.append(block_tokens_list)
+        printer = DebugPrinter()
+        # printer.print(memory_token_blocks,"memory_token_blocks")
 
         all_encoder_features_across_views = self._encode_n_views(query_view)
         with torch.autocast("cuda", enabled=False):
@@ -2425,7 +2455,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         scale_token = additional_tokens.to(query_feat.dtype)
         final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
             query_feat=query_feat,
-            memory_feats=memory_feats,
+            memory_feats=memory_token_blocks,
             additional_tokens=scale_token,
             memory_keep_ratio=memory_keep_ratio,
         )
@@ -2451,14 +2481,19 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 dense_head_inputs_list.append(intermediate_feats[2].features[0])
                 dense_head_inputs_list.append(fused_query_feature)
 
-            dense_head_inputs = dense_head_inputs_list
-
         batch_size_per_view, _, height, width = query_view[0]["img"].shape
         img_shape = (int(height), int(width))
         with torch.autocast("cuda", enabled=False):
+            if self.pred_head_type == "linear":
+                dense_head_inputs = dense_head_inputs
+            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                dense_head_inputs = dense_head_inputs_list
+            scale_head_inputs = (
+                final_feat.additional_token_features
+            )
             dense_out_feat, pose_out, scale_out = self.downstream_head_feat(
                 dense_head_inputs=dense_head_inputs,
-                scale_head_inputs=fused_scale_token,
+                scale_head_inputs=scale_head_inputs,
                 img_shape=img_shape,
                 memory_efficient_inference=memory_efficient_inference,
             )
@@ -2469,7 +2504,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         printer.print(fused_query_feature,"fused_scale_token")
         printer.print(fused_scale_token,"fused_scale_token")
 
-        return fused_query_feature, fused_scale_token
+        return fused_query_feature, fused_scale_token, dense_out_feat, pose_out, scale_out
 
     def _clone_tensor_for_storage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Detach, clone, and optionally move a tensor for intermediate storage."""

@@ -18,15 +18,19 @@ from tqdm import tqdm
 from mapanything.datasets import SevenScenesWAI
 from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
-from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled, load_memory_features, ReproLoss
+from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled_WithScale, ACEHead_Pointwise_FiLM, load_memory_features, ReproLoss
+from mapanything.utils.debugprinter import DebugPrinter
 from mapanything.utils.geometry import quaternion_to_rotation_matrix
 
+
+printer = DebugPrinter()
 # ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
 @dataclass
 class BufferTensors:
     features: torch.Tensor
+    scale_token: torch.Tensor
     target_world: torch.Tensor
     pixels: torch.Tensor
     intrinsics: torch.Tensor
@@ -41,6 +45,7 @@ class FeatureReplayBuffer:
         self.size = 0
         self.storage = BufferTensors(
             features=torch.empty((buffer_size, feat_dim), device=device, dtype=torch.float32),
+            scale_token=torch.empty((buffer_size,feat_dim), device=device, dtype=torch.float32),
             target_world=torch.empty((buffer_size, 3), device=device, dtype=torch.float32),
             pixels=torch.empty((buffer_size, 2), device=device, dtype=torch.float32),
             intrinsics=torch.empty((buffer_size, 3, 3), device=device, dtype=torch.float32),
@@ -57,6 +62,7 @@ class FeatureReplayBuffer:
     def add_view(
             self,
             fused_feature: torch.Tensor,  # [1,C,H,W] 或 [C,H,W]；已上采样到原图分辨率
+            scale_token: torch.Tensor,   # scale token
             target_world: torch.Tensor,  # [H,W,3] / [3,H,W] / [1,3,H,W] 世界坐标
             valid_mask: torch.Tensor,  # [H,W] / [1,1,H,W] / [1,H,W] 有效像素
             intrinsics: torch.Tensor,  # [3,3]
@@ -76,6 +82,17 @@ class FeatureReplayBuffer:
         elif fused_feature.dim() == 3:
             c, h, w = fused_feature.shape
             feat_CHW = fused_feature
+        else:
+            raise ValueError(f"Unexpected fused_feature shape: {tuple(fused_feature.shape)}")
+
+        # scale_token -> [C,H,W]
+        if scale_token.dim() == 4:
+            b, c, h, w = scale_token.shape
+            assert b == 1, f"add_view expects single-view tensor, got batch={b}"
+            scale_CHW = scale_token[0]
+        elif scale_token.dim() == 3:
+            c, h, w = scale_token.shape
+            scale_CHW = scale_token
         else:
             raise ValueError(f"Unexpected fused_feature shape: {tuple(fused_feature.shape)}")
 
@@ -119,6 +136,7 @@ class FeatureReplayBuffer:
         # -------- 展平并构建像素坐标 --------
         # features_flat: [N,C]，targets_flat: [N,3]，pixels_flat: [N,2] (u,v)
         feats_flat = feat_CHW.view(c, -1).t()  # [N,C]
+        scale_flat = scale_CHW.view(c, -1).t()
         targets_flat = tw_HWC.view(-1, 3)  # [N,3]
         mask_flat = vm_HW.view(-1)  # [N]
 
@@ -153,6 +171,7 @@ class FeatureReplayBuffer:
         slot = slice(self.size, self.size + chosen.numel())
 
         self.storage.features[slot] = feats_flat[chosen].to(self.device)
+        self.storage.scale_token[slot] = scale_flat[chosen].to(self.device)
         self.storage.target_world[slot] = targets_flat[chosen].to(self.device)
         self.storage.pixels[slot] = pixels_flat[chosen].to(self.device)  # (u,v)
 
@@ -177,6 +196,7 @@ class BufferDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:  # pragma: no cover - thin wrapper
         return {
             "features": self.buffer.storage.features[idx],
+            "scale_token": self.buffer.storage.scale_token[idx],
             "target_world": self.buffer.storage.target_world[idx],
             "pixels": self.buffer.storage.pixels[idx],
             "intrinsics": self.buffer.storage.intrinsics[idx],
@@ -347,7 +367,7 @@ def _collect_buffer(
                 view[name] = view[name].to(device, non_blocking=True)
 
         with torch.no_grad():
-            fused_feature, _ = model.forward_with_memory_dense_feature(
+            fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
                 query_view=batch,
                 device=str(device),
                 memory_feats=memory_feats,
@@ -355,17 +375,19 @@ def _collect_buffer(
                 memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                 memory_efficient_inference=cfg.training.memory_efficient_inference,
             )
-            fused_feature = upsampler(batch[0]["img"],fused_feature)
+            printer.print(dense_feat,"dense_feat")
+            dense_feat_up = upsampler(batch[0]["img"],dense_feat.features_upsampled_8x)
 
         target_world, valid_mask = _prepare_targets(view, device)
         intrinsics = _resolve_intrinsics(view, device).to(torch.float32)
         c2w = _resolve_pose(view, device).to(torch.float32)
 
         if buffer is None:
-            buffer = FeatureReplayBuffer(cfg.training.buffer_size, fused_feature.shape[1], device=torch.device("cpu"))
+            buffer = FeatureReplayBuffer(cfg.training.buffer_size, dense_feat_up.shape[1], device=torch.device("cpu"))
 
         added = buffer.add_view(
-            fused_feature.squeeze(0).detach(),
+            dense_feat_up.squeeze(0).detach(),
+            fused_token.squeeze(0).detach(),
             target_world.squeeze(0).detach(),
             valid_mask.squeeze(0).detach(),
             intrinsics.squeeze(0).detach(),
@@ -423,35 +445,38 @@ def _project_world_points_sparse(
 # prior：无 GT 时让深度中位数靠近 depth_prior。
 # 正则权重建议从 1e-4 ~ 1e-3 起步，防止盖过主监督信号。
 def _loss_fn(
-    preds: torch.Tensor,           # [N,4]  => [X,Y,Z, raw]
+    preds,                           # Tensor [N,4] 或 (Tensor[N,4], scale[N]) 或 {"preds":..., "scale":...}
     batch: DictConfig | dict,
     repro_loss,
     global_step,
     loss_cfg: DictConfig,
 ):
     """
-    Heteroscedastic loss over sparse buffer samples (+ optional scale regularization).
+    兼容两种回归头：
+      - FiLM: preds = Tensor[N,4]  (已是有尺度 XYZ + raw)
+      - Decoupled+Scale: preds = (Tensor[N,4], scale[N]) 或 dict{"preds":Tensor[N,4], "scale":Tensor[N]}
 
     Required in batch:
       - intrinsics: [N,3,3]
       - c2w: [N,3,4] or [N,4,4]
       - pixels: [N,2]       (if mode='reproj')
-      - target_world: [N,3] (if mode='xyz' or scale_reg.match_to_gt)
+      - target_world: [N,3] (if mode='xyz' 或 scale_reg.match_to_gt)
 
-    loss_cfg (keys used here):
+    loss_cfg keys:
       - mode: 'reproj' | 'xyz'                      (default 'reproj')
       - conf_mode: 'log_sigma' | 'confidence'       (default 'log_sigma')
-      - sigma_min: 1e-4, sigma_max: 10.0
-      - depth_min: 1e-4, depth_max: 50.0
-      - repro_loss_hard_clamp: 100.0
-      - depth_target: 2.0
-      - eps: 1e-8
-      - scale_reg:
-          enabled: bool
-          variant: 'match_to_gt' | 'unit' | 'prior'
-          weight: float
-          depth_prior: float  # for 'prior'
+      - sigma_min/sigma_max/depth_min/depth_max/eps
+      - repro_loss_hard_clamp, depth_target
+      - scale_reg: {enabled, variant: 'match_to_gt'|'unit'|'prior', weight, depth_prior}
     """
+    # ---------- unpack two head cases ----------
+    scale = None
+    if isinstance(preds, (tuple, list)):
+        preds, scale = preds
+    elif isinstance(preds, dict):
+        scale = preds.get("scale", None)
+        preds = preds["preds"]
+
     device     = preds.device
     mode       = getattr(loss_cfg, "mode", "reproj")
     conf_mode  = getattr(loss_cfg, "conf_mode", "log_sigma")
@@ -462,17 +487,31 @@ def _loss_fn(
     eps        = float(getattr(loss_cfg, "eps", 1e-8))
     sqrt2      = math.sqrt(2.0)
 
-    coords = preds[:, :3]  # [N,3]
-    raw    = preds[:, 3]   # [N]
+    # flatten BCHW 情况（通常你的缓冲区已是 [N,4]；这里容错）
+    if preds.dim() == 4:  # [B,4,H,W] -> [N,4]
+        B, C, H, W = preds.shape
+        preds = preds.permute(0, 2, 3, 1).reshape(-1, C)
+
+    coords_pred_in = preds[:, :3]  # 若带 scale，这是 XYZ_unit；否则是有尺度 XYZ
+    raw            = preds[:, 3]   # 异方差 raw
 
     # -------- map raw -> sigma (>0) --------
     if conf_mode == "confidence":
-        p = torch.sigmoid(raw)  # [N]
+        p = torch.sigmoid(raw)
         sigma = (1.0 - p) * sigma_max + p * sigma_min
     else:  # 'log_sigma'
         sigma = F.softplus(raw) + eps
         sigma = torch.clamp(sigma, min=sigma_min, max=sigma_max)
-    log_sigma = torch.log(sigma)  # [N]
+    log_sigma = torch.log(sigma)
+
+    # 如果提供了 scale，则这是 Decoupled 情况：先把无尺度坐标乘回尺度
+    if scale is not None:
+        scale = scale.to(device).view(-1)                   # [N]
+        coords_unit = coords_pred_in                        # for scale regularization('unit')
+        coords      = coords_unit * scale.unsqueeze(-1)     # 有尺度坐标，进入主监督
+    else:
+        coords_unit = None
+        coords      = coords_pred_in                        # FiLM 情况：已是有尺度
 
     # =============== helpers ===============
     def _invert_c2w_to_w2c(c2w: torch.Tensor):
@@ -485,53 +524,41 @@ def _loss_fn(
             t = -R @ tcw
         return R, t
 
-    def _scale_reg_add(total_loss, metrics, z_pred_flat, *, variant: str, weight: float,
+    def _scale_reg_add(total_loss, z_flat: torch.Tensor,
+                       *, variant: str, weight: float,
                        c2w=None, target_world=None, depth_prior=None):
-        """
-        轻微尺度正则；返回(updated_total, reg_value)
-        - z_pred_flat: [N] 预测相机系深度（已 clamp）
-        - variant:
-            - 'match_to_gt': 需要 target_world, c2w
-            - 'unit':        中位数 -> 1
-            - 'prior':       中位数 -> depth_prior
-        """
+        """对 z 的中位数做轻微尺度正则；返回 total_loss+reg, reg_value"""
         if weight <= 0:
             return total_loss, 0.0
-
-        # 预测深度中位数
-        med_pred = torch.median(z_pred_flat)
+        med_pred = torch.median(z_flat)
 
         if variant == "match_to_gt":
             if target_world is None or c2w is None:
                 return total_loss, 0.0
-            # 计算 GT 深度中位数
-            R, t = _invert_c2w_to_w2c(c2w.to(z_pred_flat.device))
-            Xw_gt = target_world.to(z_pred_flat.device).unsqueeze(-1)  # [N,3,1]
+            R, t = _invert_c2w_to_w2c(c2w.to(z_flat.device))
+            Xw_gt = target_world.to(z_flat.device).unsqueeze(-1)  # [N,3,1]
             Zg = (R @ Xw_gt + t)[:, 2, 0].clamp_min(depth_min)
             med_gt = torch.median(Zg)
             reg = weight * torch.abs(torch.log((med_pred + eps) / (med_gt + eps)))
 
         elif variant == "unit":
-            # 让 log(median) ~ 0  <=> median ~ 1
+            # 让 median(z_unit) ≈ 1
             reg = weight * torch.abs(torch.log(med_pred + eps))
 
         elif variant == "prior":
             if depth_prior is None:
                 return total_loss, 0.0
             reg = weight * torch.abs(torch.log((med_pred + eps) / (float(depth_prior) + eps)))
-
         else:
             return total_loss, 0.0
 
-        total_loss = total_loss + reg
-        metrics["scale_reg"] = float(reg.detach().cpu())
-        return total_loss, float(reg.detach().cpu())
+        return total_loss + reg, float(reg.detach().cpu())
 
     # =============== main branches ===============
     if mode == "xyz":
         target_world = batch["target_world"].to(device)  # [N,3]
         diff = coords - target_world                     # [N,3]
-        err = torch.norm(diff, dim=1, p=2)               # [N]
+        err  = torch.norm(diff, dim=1, p=2)              # [N]
         loss_vec = log_sigma + sqrt2 * (err / sigma)
         total = loss_vec.mean()
 
@@ -539,20 +566,33 @@ def _loss_fn(
         sr = getattr(loss_cfg, "scale_reg", None)
         scale_reg_val = 0.0
         if sr and getattr(sr, "enabled", False) and "c2w" in batch:
-            # 计算预测相机深度（用于尺度统计）
             c2w = batch["c2w"].to(device)
             R, t = _invert_c2w_to_w2c(c2w)
-            Xw = coords.unsqueeze(-1)                      # [N,3,1]
-            Zp = (R @ Xw + t)[:, 2, 0].clamp_min(depth_min)  # [N]
-            total, scale_reg_val = _scale_reg_add(
-                total, {},
-                Zp,
-                variant=getattr(sr, "variant", "match_to_gt"),
-                weight=float(getattr(sr, "weight", 1e-3)),
-                c2w=c2w,
-                target_world=target_world,
-                depth_prior=getattr(sr, "depth_prior", None),
-            )
+
+            if getattr(sr, "variant", "match_to_gt") == "unit" and (coords_unit is not None):
+                # 解耦场景：对无尺度深度做 unit 正则
+                Xw_u = coords_unit.unsqueeze(-1)                     # [N,3,1]
+                Zu   = (R @ Xw_u + t)[:, 2, 0].clamp_min(depth_min)  # [N]
+                total, scale_reg_val = _scale_reg_add(
+                    total, Zu, variant="unit", weight=float(getattr(sr, "weight", 1e-3))
+                )
+            else:
+                # 其他：对有尺度深度做 match_to_gt/prior
+                Xw_p = coords.unsqueeze(-1)
+                Zp   = (R @ Xw_p + t)[:, 2, 0].clamp_min(depth_min)
+                variant = getattr(sr, "variant", "match_to_gt")
+                if variant == "match_to_gt":
+                    total, scale_reg_val = _scale_reg_add(
+                        total, Zp, variant="match_to_gt",
+                        weight=float(getattr(sr, "weight", 1e-3)),
+                        c2w=c2w, target_world=target_world
+                    )
+                elif variant == "prior":
+                    total, scale_reg_val = _scale_reg_add(
+                        total, Zp, variant="prior",
+                        weight=float(getattr(sr, "weight", 1e-3)),
+                        depth_prior=getattr(sr, "depth_prior", 1.0)
+                    )
 
         metrics = {
             "err_mean_m": float(err.mean().detach().cpu()),
@@ -569,78 +609,66 @@ def _loss_fn(
         c2w = batch["c2w"].to(device)         # [N,3,4] or [N,4,4]
         px  = batch["pixels"].to(device)      # [N,2]
 
-        # world -> cam
-        R, t = _invert_c2w_to_w2c(c2w)        # [N,3,3], [N,3,1]
+        R, t = _invert_c2w_to_w2c(c2w)
         Xw   = coords.unsqueeze(-1)           # [N,3,1]
         Xc   = R @ Xw + t                     # [N,3,1]
 
-        z         = Xc[:, 2:3, :]                    # [N,1,1]
+        z         = Xc[:, 2:3, :]
         z_clamped = z.clamp_min(depth_min)
-        z_flat    = z_clamped[:, 0, 0]               # [N] for reg
+        z_flat    = z_clamped[:, 0, 0]
 
-        # 像素投影（ACE）
-        uvh = K @ Xc                                  # [N,3,1]
-        uv  = (uvh[:, :2, :] / z_clamped).squeeze(-1) # [N,2]
+        uvh = K @ Xc
+        uv  = (uvh[:, :2, :] / z_clamped).squeeze(-1)  # [N,2]
 
-        # L1 重投影误差（ACE）
-        repro_diff = (uv - px)                        # [N,2]
-        repro_err  = repro_diff.abs().sum(dim=1)      # [N] (L1)
+        repro_err = (uv - px).abs().sum(dim=1)         # L1, [N]
 
-        # 有效/无效掩码（ACE）
         invalid_min_depth = (z.squeeze(-1).squeeze(-1) < depth_min)
         invalid_repro     = (repro_err > float(getattr(loss_cfg, "repro_loss_hard_clamp", 100.0)))
         invalid_max_depth = (z.squeeze(-1).squeeze(-1) > depth_max)
         invalid_mask = invalid_min_depth | invalid_repro | invalid_max_depth
         valid_mask   = ~invalid_mask
 
-        # 有效：ACE ReproLoss
         if valid_mask.any():
             loss_valid = repro_loss.compute(repro_err[valid_mask], global_step)
         else:
             loss_valid = coords.sum() * 0.0
 
-        # 无效：proxy 到相机坐标（ACE）
         if invalid_mask.any():
             if "intrinsics_inv" in batch:
                 invK = batch["intrinsics_inv"].to(device)
             else:
                 invK = torch.inverse(K)
-
-            uv1    = torch.cat([px, torch.ones_like(px[:, :1])], dim=1).unsqueeze(-1)  # [N,3,1]
-            Xc_tgt = float(getattr(loss_cfg, "depth_target", 2.0)) * (invK @ uv1)      # [N,3,1]
+            uv1    = torch.cat([px, torch.ones_like(px[:, :1])], dim=1).unsqueeze(-1)
+            Xc_tgt = float(getattr(loss_cfg, "depth_target", 2.0)) * (invK @ uv1)
             loss_invalid = (Xc_tgt - Xc).abs()[invalid_mask].sum()
         else:
             loss_invalid = coords.sum() * 0.0
 
         total = (loss_valid + loss_invalid) / coords.shape[0]
 
-        # ---------- scale regularization (optional) ----------
+        # ---------- scale regularization ----------
         sr = getattr(loss_cfg, "scale_reg", None)
         scale_reg_val = 0.0
         if sr and getattr(sr, "enabled", False):
             variant = getattr(sr, "variant", "prior")
             weight  = float(getattr(sr, "weight", 1e-3))
             if variant == "match_to_gt" and ("target_world" in batch):
-                # 有 GT 时也可做 match_to_gt
                 target_world = batch["target_world"].to(device)
                 total, scale_reg_val = _scale_reg_add(
-                    total, {},
-                    z_flat,
-                    variant="match_to_gt",
-                    weight=weight,
-                    c2w=c2w,
-                    target_world=target_world,
+                    total, z_flat, variant="match_to_gt", weight=weight,
+                    c2w=c2w, target_world=target_world
                 )
-            elif variant in ("prior", "unit"):
-                # reproj 分支通常不是“无尺度”，更合理的是 'prior'
-                depth_prior = getattr(sr, "depth_prior", 1.0)
-                use_variant = "prior" if variant != "match_to_gt" else "prior"
+            elif variant == "unit" and (coords_unit is not None):
+                # 解耦：对无尺度深度做 unit 正则更合理
+                Xw_u = coords_unit.unsqueeze(-1)
+                Zu   = (R @ Xw_u + t)[:, 2, 0].clamp_min(depth_min)
                 total, scale_reg_val = _scale_reg_add(
-                    total, {},
-                    z_flat,
-                    variant=use_variant,
-                    weight=weight,
-                    depth_prior=depth_prior,
+                    total, Zu, variant="unit", weight=weight
+                )
+            else:
+                depth_prior = getattr(sr, "depth_prior", 1.0)
+                total, scale_reg_val = _scale_reg_add(
+                    total, z_flat, variant="prior", weight=weight, depth_prior=depth_prior
                 )
 
         metrics = {
@@ -652,13 +680,13 @@ def _loss_fn(
         if sr and getattr(sr, "enabled", False):
             metrics["scale_reg"] = scale_reg_val
         return total, metrics
-
 # ---------------------------------------------------------------------------
 # 训练入口
 # ---------------------------------------------------------------------------
 def run_training(cfg: DictConfig) -> Dict[str, str]:
 
-    device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+    # device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     # 加载mapanything模型
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
@@ -679,7 +707,22 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         circle_schedule=(cfg.loss.repro_loss_schedule == 'circle')
     )
     # 从保存的中间特征文件中读取
-    memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
+    # memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
+
+    dtype = torch.float16  # 如果想省显存可换成 torch.float16
+    B = 1  # 每个视角的 batch size
+    num_views = 1  # 每层包含的视角数量
+    # 24 层；每层的 (C,H,W) 都是 (768,1,1)
+    specs = [(768, 1, 1)] * 24
+    # --- 构建 24 层内存特征：List[  List[Tensor[B,768,1,1]]  ] ---
+    memory_feats = [
+        [torch.randn(B, C, H, W, device=device, dtype=dtype) for _ in range(num_views)]
+        for (C, H, W) in specs
+    ]
+    # printer.print(memory_feats, "memory_feats")
+    # # 若你的 forward 里需要 additional_tokens（仅占位，不参与计算）
+    memory_token = torch.zeros(B, 768, 1, device=device, dtype=dtype)
+
     # 创建dataset
     dataset = SevenScenesWAI(
         num_views=cfg.dataset.num_views,
@@ -700,15 +743,17 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         batch_size=1  # 你想要的 batch size
     )
     # 创建 training buffer
-    buffer, in_channels = _collect_buffer(cfg, model,upsampler ,dataloader, memory_feats, memory_token, device)
+    buffer, in_channels = _collect_buffer(cfg, model, upsampler, dataloader, memory_feats, memory_token, device)
     bufferloader = DataLoader(
         BufferDataset(buffer),
         batch_size=cfg.training.batch_size,
         shuffle=cfg.training.shuffle,
         num_workers=cfg.training.num_workers,
     )
-
-    head = ACEHead_Pointwise_Decoupled(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
+    if cfg.model.head_mode == "film":
+        head = ACEHead_Pointwise_FiLM(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
+    else:
+        head = ACEHead_Pointwise_Decoupled_WithScale(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     output_dir = Path(cfg.training.output_dir).expanduser()
@@ -719,9 +764,10 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         head.train()
         for batch in bufferloader:
             features = batch["features"].to(device)
-            preds = head(features)
-            preds[:3] = preds[:3] *
-            loss, metrics = _loss_fn(preds, batch,repro_loss,global_step, cfg.loss)
+            scale = batch["scale"].to(device)
+            preds = head(features,scale)
+
+            loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -735,7 +781,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
     torch.save({"state_dict": head.state_dict(), "in_channels": in_channels}, ckpt_path)
     return {"checkpoint": str(ckpt_path), "steps": str(global_step), "in_channels": str(in_channels)}
 
-@hydra.main(version_base=None, config_path="../../../configs", config_name="train")
+@hydra.main(version_base=None, config_path="../../configs", config_name="train")
 def main(cfg: DictConfig):
     cfg = OmegaConf.structured(OmegaConf.to_yaml(cfg))
     info = run_training(cfg)
