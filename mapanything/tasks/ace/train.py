@@ -18,7 +18,7 @@ from tqdm import tqdm
 from mapanything.datasets import SevenScenesWAI
 from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
-from mapanything.tasks.ace import ACERegressionHead, load_memory_features, ReproLoss
+from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled, load_memory_features, ReproLoss
 from mapanything.utils.geometry import quaternion_to_rotation_matrix
 
 # ---------------------------------------------------------------------------
