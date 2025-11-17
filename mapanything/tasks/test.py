@@ -10,16 +10,17 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from mapanything.datasets import SevenScenesWAI
+from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
 from mapanything.tasks.aa_feature_fusion.common import instantiate_dataset
-from mapanything.tasks.ace import ACERegressionHead, load_memory_features, move_view_to_device
+from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled_WithScale, ACEHead_Pointwise_FiLM, load_memory_features, move_view_to_device, load_regression_head
 from mapanything.tasks.train import (
     _loss_fn,
     _prepare_targets,
     _resolve_intrinsics,
     _resolve_pose,
 )
-
 
 def _load_head(cfg: DictConfig, in_channels: int, device: torch.device) -> ACERegressionHead:
     head = ACERegressionHead(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
@@ -43,7 +44,26 @@ def run_eval(cfg: DictConfig) -> Dict[str, Any]:
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
     memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
-    dataset = instantiate_dataset(cfg.dataset.dataset_str)
+
+    # 创建dataset
+    dataset = SevenScenesWAI(
+        num_views=cfg.dataset.num_views,
+        split="train",
+        covisibility_thres=0.025,
+        ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes",
+        dataset_metadata_dir="/mnt/storage/xwh/map-anything/mapanything_dataset_metadata",
+        sample_specific_scene=True,
+        specific_scene_name='chess_train',
+        resolution=(518, 392),
+        transform="imgnorm",
+        data_norm_type="dinov2",
+        seed=777
+    )
+    # 创建无限读取器
+    dataloader = ForcedRandomDataLoader(
+        dataset=dataset,
+        batch_size=1  # 你想要的 batch size
+    )
 
     # Prepare one sample to infer channel count
     sample_view = dataset[0][0]
@@ -61,6 +81,8 @@ def run_eval(cfg: DictConfig) -> Dict[str, Any]:
 
     output_dir = Path(cfg.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    upsampler = torch.hub.load('wimmerth/anyup', 'anyup')  # 如需可：, trust_repo=True
+    upsampler.eval()  # 推理模式
 
     metrics: List[Dict[str, float]] = []
     saved: List[Dict[str, Any]] = []
@@ -69,7 +91,7 @@ def run_eval(cfg: DictConfig) -> Dict[str, Any]:
         view = dataset[idx][0]
         prepared = move_view_to_device(view, device)
         with torch.no_grad():
-            dense_feature, _ = model.forward_with_memory_dense_feature(
+            fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
                 query_view=[prepared],
                 device=str(device),
                 memory_feats=memory_feats,
@@ -77,9 +99,10 @@ def run_eval(cfg: DictConfig) -> Dict[str, Any]:
                 memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                 memory_efficient_inference=cfg.training.memory_efficient_inference,
             )
-            preds = head(dense_feature)
+            dense_feat_up = upsampler(batch[0]["img"], fused_feature)
+            preds = head(dense_feat_up,fused_token)
 
-        target_world, valid_mask = _prepare_targets(view, dense_feature.shape[-2:], device)
+        target_world, valid_mask = _prepare_targets(view, device)
         batch = {
             "target_world": target_world,
             "valid_mask": valid_mask,

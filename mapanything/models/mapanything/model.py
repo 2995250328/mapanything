@@ -84,6 +84,7 @@ from uniception.models.prediction_heads.linear import LinearFeature
 from uniception.models.prediction_heads.mlp_head import MLPHead
 from uniception.models.prediction_heads.pose_head import PoseHead
 
+printer = DebugPrinter()
 # Enable TF32 precision if supported (for GPU >= Ampere and PyTorch >= 1.12)
 if hasattr(torch.backends.cuda, "matmul") and hasattr(
     torch.backends.cuda.matmul, "allow_tf32"
@@ -2440,8 +2441,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             block_tokens_list = downsample_tokens(merged, memory_keep_ratio=memory_keep_ratio)
             # 类型: List[Tensor[B,C,1,keep_n_i]]，与视角数量一致
             memory_token_blocks.append(block_tokens_list)
-        printer = DebugPrinter()
-        # printer.print(memory_token_blocks,"memory_token_blocks")
 
         all_encoder_features_across_views = self._encode_n_views(query_view)
         with torch.autocast("cuda", enabled=False):
@@ -2497,12 +2496,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 img_shape=img_shape,
                 memory_efficient_inference=memory_efficient_inference,
             )
-        printer = DebugPrinter()
-        printer.print(dense_out_feat,"dense_out_feat")
-        printer.print(pose_out,"pose_out")
-        printer.print(scale_out,"scale_out")
-        printer.print(fused_query_feature,"fused_scale_token")
-        printer.print(fused_scale_token,"fused_scale_token")
 
         return fused_query_feature, fused_scale_token, dense_out_feat, pose_out, scale_out
 

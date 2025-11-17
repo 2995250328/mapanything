@@ -16,6 +16,8 @@ model:
   head_checkpoint: null     # "/path/to/head_only.ckpt" 时启用加载
   head_strict: false        # 是否严格加载（通常 false 更稳）
   head_prefixes: ["", "module.", "head.", "reg_head.", "ace_head."]  # 可覆盖
+head:
+  hidden_dim: 256
 
 fusion:
   stored_feature_file: ???
@@ -31,8 +33,7 @@ training:
   weight_decay: 1e-4
   batch_size: 5120
   num_workers: 2
-  num_samples: 32
-  buffer_size: 25600
+  buffer_size: 20480
   samples_per_view: 1024
   shuffle: true
   memory_efficient_inference: false
@@ -44,6 +45,7 @@ loss:
   depth_target: 10.0         # 无效样本 proxy 的常数深度（米）
   # 选择误差类型：'reproj'（重投影）或 'xyz'（3D点）
   mode: reproj
+#  mode: xyz
   # 置信通道解释：'log_sigma'（推荐，raw -> softplus -> sigma）或 'confidence'（raw->sigmoid=p，再映射到sigma区间）
   conf_mode: log_sigma
   # sigma 的下/上界，防止除零或数值爆炸
@@ -60,9 +62,6 @@ loss:
     variant: match_to_gt   # 或 unit / prior
     weight: 1.0e-3
     depth_prior: 1.0       # 仅 variant=prior 时使用
-
-head:
-  hidden_dim: 128
 
 seed: 0
 # Disable CUDNN Benchmark (Disable for variable resolution & number of view training)

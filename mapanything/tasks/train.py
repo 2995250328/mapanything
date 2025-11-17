@@ -62,9 +62,9 @@ class FeatureReplayBuffer:
     def add_view(
             self,
             fused_feature: torch.Tensor,  # [1,C,H,W] 或 [C,H,W]；已上采样到原图分辨率
-            scale_token: torch.Tensor,   # scale token
-            target_world: torch.Tensor,  # [H,W,3] / [3,H,W] / [1,3,H,W] 世界坐标
-            valid_mask: torch.Tensor,  # [H,W] / [1,1,H,W] / [1,H,W] 有效像素
+            scale_token: torch.Tensor,  # 本次视角的单一 token，形如 [C,1] / [1,C] / [C] / [1,C,1] / [C,1,1]
+            target_world: torch.Tensor,  # [H,W,3] / [3,H,W] / [1,3,H,W]
+            valid_mask: torch.Tensor,  # [H,W] / [1,1,H,W] / [1,H,W]
             intrinsics: torch.Tensor,  # [3,3]
             c2w: torch.Tensor,  # [4,4] 或 [3,4]
             max_per_view: int,
@@ -72,9 +72,7 @@ class FeatureReplayBuffer:
         """从特征图随机采样 max_per_view 个有效像素，写入缓冲区（不超过剩余容量）。"""
         if self.is_full:
             return 0
-
-        # -------- 形状归一 --------
-        # features -> [C,H,W]
+        # -------- 形状归一：features -> [C,H,W] --------
         if fused_feature.dim() == 4:
             b, c, h, w = fused_feature.shape
             assert b == 1, f"add_view expects single-view tensor, got batch={b}"
@@ -84,19 +82,29 @@ class FeatureReplayBuffer:
             feat_CHW = fused_feature
         else:
             raise ValueError(f"Unexpected fused_feature shape: {tuple(fused_feature.shape)}")
-
-        # scale_token -> [C,H,W]
-        if scale_token.dim() == 4:
-            b, c, h, w = scale_token.shape
-            assert b == 1, f"add_view expects single-view tensor, got batch={b}"
-            scale_CHW = scale_token[0]
-        elif scale_token.dim() == 3:
-            c, h, w = scale_token.shape
-            scale_CHW = scale_token
+        # -------- 形状归一：scale_token -> [C]（本视角共享一个 token）--------
+        st = scale_token
+        if st.dim() == 1:
+            scale_vec = st
+        elif st.dim() == 2 and 1 in st.shape:
+            # 支持 [C,1] / [1,C]
+            scale_vec = st.view(-1)
+        elif st.dim() == 3 and (st.shape[-1] == 1 or st.shape[-2] == 1):
+            # 支持 [1,C,1] / [C,1,1]
+            scale_vec = st.view(-1)
+        elif st.dim() == 4 and st.shape[0] == 1 and st.shape[-2:] == (1, 1):
+            # 罕见： [1,C,1,1]
+            scale_vec = st.view(-1)
         else:
-            raise ValueError(f"Unexpected fused_feature shape: {tuple(fused_feature.shape)}")
+            raise ValueError(f"Unexpected scale_token shape for a per-view token: {tuple(st.shape)}")
+        if scale_vec.numel() != c:
+            raise ValueError(
+                f"Scale token length ({scale_vec.numel()}) != feature dim ({c}). "
+                f"Make sure your token size matches channel dim."
+            )
+        scale_vec = scale_vec.to(feat_CHW.device).contiguous()  # [C]
 
-        # target_world -> [H,W,3]
+        # -------- target_world -> [H,W,3] --------
         if target_world.dim() == 4:  # [1,3,H,W]
             assert target_world.shape[0] == 1
             tw = target_world[0]
@@ -114,7 +122,7 @@ class FeatureReplayBuffer:
         else:
             raise ValueError(f"Unexpected target_world shape: {tuple(target_world.shape)}")
 
-        # valid_mask -> [H,W] (bool)
+        # -------- valid_mask -> [H,W] (bool) --------
         if valid_mask is None:
             vm_HW = torch.ones((h, w), dtype=torch.bool, device=feat_CHW.device)
         else:
@@ -126,62 +134,49 @@ class FeatureReplayBuffer:
                 vm_HW = valid_mask.to(torch.bool)
             else:
                 raise ValueError(f"Unexpected valid_mask shape: {tuple(valid_mask.shape)}")
-
-        # 尺寸一致性检查
+        # -------- 尺寸检查 --------
         assert tw_HWC.shape[0] == h and tw_HWC.shape[1] == w, \
             f"Size mismatch: features ({h},{w}) vs target_world {tuple(tw_HWC.shape[:2])}"
         assert vm_HW.shape[0] == h and vm_HW.shape[1] == w, \
             f"Size mismatch: features ({h},{w}) vs valid_mask {tuple(vm_HW.shape)}"
-
         # -------- 展平并构建像素坐标 --------
-        # features_flat: [N,C]，targets_flat: [N,3]，pixels_flat: [N,2] (u,v)
         feats_flat = feat_CHW.view(c, -1).t()  # [N,C]
-        scale_flat = scale_CHW.view(c, -1).t()
         targets_flat = tw_HWC.view(-1, 3)  # [N,3]
         mask_flat = vm_HW.view(-1)  # [N]
-
-        if mask_flat.any().item() is False:
+        if not mask_flat.any().item():
             return 0
 
-        # 像素网格 (u,v)
         ys, xs = torch.meshgrid(
             torch.arange(h, device=feat_CHW.device),
             torch.arange(w, device=feat_CHW.device),
             indexing="ij"
         )
-        pixels_flat = torch.stack([xs, ys], dim=-1).view(-1, 2)  # [N,2]; 注意顺序(u,x列),(v,y行)
-
-        # -------- 采样（仅有效区域，且不超过剩余容量）--------
+        pixels_flat = torch.stack([xs, ys], dim=-1).view(-1, 2)  # [N,2]  (u,v)
+        # -------- 采样（仅有效，且不超过剩余容量）--------
         valid_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
         if valid_idx.numel() == 0:
             return 0
-
         remaining = self._remaining() if hasattr(self, "_remaining") else (self.capacity - self.size)
         if remaining <= 0:
             return 0
-
         num_to_take = min(max_per_view, valid_idx.numel(), remaining)
         perm = torch.randperm(valid_idx.numel(), device=feat_CHW.device)
         chosen = valid_idx[perm[:num_to_take]]
-
         if chosen.numel() == 0:
             return 0
 
         # -------- 写入缓冲区 --------
         slot = slice(self.size, self.size + chosen.numel())
-
         self.storage.features[slot] = feats_flat[chosen].to(self.device)
-        self.storage.scale_token[slot] = scale_flat[chosen].to(self.device)
         self.storage.target_world[slot] = targets_flat[chosen].to(self.device)
         self.storage.pixels[slot] = pixels_flat[chosen].to(self.device)  # (u,v)
-
-        # 视角常量（对该视角的每个样本相同），依靠广播赋值
+        # 视角常量：intrinsics / c2w
         self.storage.intrinsics[slot] = intrinsics.to(self.device)
         self.storage.c2w[slot] = c2w.to(self.device)
-
-        self.storage.valid_mask[slot] = True
-
+        # 每个采样都使用同一个 per-view scale token（广播）
+        self.storage.scale_token[slot] = scale_vec.unsqueeze(0).expand(chosen.numel(), -1).to(self.device)
         self.size += chosen.numel()
+
         return int(chosen.numel())
 
 class BufferDataset(Dataset):
@@ -206,57 +201,6 @@ class BufferDataset(Dataset):
 # ---------------------------------------------------------------------------
 # 基础几何工具
 # ---------------------------------------------------------------------------
-def fmap_to_image_pixel_centers(
-    orig_hw,     # (H, W)
-    feat_hw,     # (Hf, Wf)
-    device=None,
-    dtype=torch.float32,
-):
-    """
-    返回 coords: [Hf, Wf, 2]，其中 coords[..., 0]=u (列/x), coords[..., 1]=v (行/y)
-    采用像素中心系：u = (xf + 0.5) * Sx - 0.5, v = (yf + 0.5) * Sy - 0.5
-    适用于常规 SAME padding 下采样（无特殊对齐/裁剪）。
-    """
-    H, W   = int(orig_hw[0]), int(orig_hw[1])
-    Hf, Wf = int(feat_hw[0]), int(feat_hw[1])
-    assert H > 0 and W > 0 and Hf > 0 and Wf > 0, "sizes must be positive"
-
-    Sx = W / float(Wf)
-    Sy = H / float(Hf)
-
-    yf = torch.arange(Hf, dtype=dtype, device=device)  # 行
-    xf = torch.arange(Wf, dtype=dtype, device=device)  # 列
-    YF, XF = torch.meshgrid(yf, xf, indexing="ij")     # [Hf,Wf]
-
-    U = (XF + 0.5) * Sx - 0.5   # 原图的列/x
-    V = (YF + 0.5) * Sy - 0.5   # 原图的行/y
-    coords = torch.stack([U, V], dim=-1)               # [Hf,Wf,2] -> (u,v)
-    return coords
-
-def _pixel_grid(height: int, width: int, device: torch.device) -> torch.Tensor:
-    ys = torch.arange(height, dtype=torch.float32, device=device) + 0.5
-    xs = torch.arange(width, dtype=torch.float32, device=device) + 0.5
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    return torch.stack([xx, yy], dim=0)
-
-def _project_points(
-    points_world: torch.Tensor, intrinsics: torch.Tensor, c2w: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """将世界坐标投影到像素平面，返回像素坐标与有效性掩码。"""
-
-    if points_world.dim() == 2:
-        points_world = points_world.unsqueeze(-1)
-
-    R = c2w[:, :3, :3]
-    t = c2w[:, :3, 3:4]
-    cam = torch.bmm(R.transpose(1, 2), points_world - t)
-
-    z = cam[:, 2:3]
-    valid = z > 1e-6
-    pixels = torch.bmm(intrinsics, cam)
-    pixels = pixels[:, :2] / z.clamp(min=1e-6)
-    return pixels.transpose(1, 2), valid.squeeze(1)
-
 def _project_world_points(
     points_world: torch.Tensor,
     intrinsics: torch.Tensor,
@@ -284,13 +228,6 @@ def _project_world_points(
     pixels = torch.bmm(intrinsics, cam_points)
     pixels = pixels[:, :2, :] / z.clamp(min=1e-6)
     return pixels.view(batch, 2, height, width), valid.view(batch, 1, height, width)
-
-def _masked_smooth_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    if mask.dtype != torch.bool:
-        mask = mask > 0.5
-    if mask.sum() == 0:
-        return pred.new_tensor(0.0)
-    return F.smooth_l1_loss(pred[mask], target[mask])
 
 def _resolve_intrinsics(view: Dict[str, Any], device: torch.device) -> torch.Tensor:
     if "camera_intrinsics" in view:
@@ -349,58 +286,79 @@ def _collect_buffer(
 ) -> Tuple[FeatureReplayBuffer, int]:
     buffer: FeatureReplayBuffer | None = None
 
-    for batch_id, views in tqdm(enumerate(dataset), desc="Creating Training Buffer"):
-        batch = views
-        # 移除不必要的键
-        for view in batch:
-            if "idx" in view:
-                view["idx"] = view["idx"][2:]
-        # 转到 GPU
-        ignore_keys = {
-            "dataset", "label", "instance", "idx",
-            "true_shape", "rng", "data_norm_type",
-        }
-        for view in batch:
-            for name in view.keys():
-                if name in ignore_keys:
-                    continue
-                view[name] = view[name].to(device, non_blocking=True)
+    # 兼容两种命名：buffer_size / buffer_capacity
+    capacity = int(getattr(cfg.training, "buffer_size",
+                    getattr(cfg.training, "buffer_capacity", 0)))
+    if capacity <= 0:
+        raise ValueError("training.buffer_size / training.buffer_capacity 未正确设置为正整数。")
+    # 基于容量的进度条
+    pbar = tqdm(total=capacity, desc="Filling training buffer", unit="sample", leave=False)
+    try:
+        for batch_id, views in enumerate(dataset):
+            batch = views
+            # 移除不必要的键
+            for view in batch:
+                if "idx" in view:
+                    view["idx"] = view["idx"][2:]
+            # 转到 GPU（忽略无关键）
+            ignore_keys = {
+                "dataset", "label", "instance", "idx",
+                "true_shape", "rng", "data_norm_type",
+            }
+            for view in batch:
+                for name in list(view.keys()):
+                    if name in ignore_keys:
+                        continue
+                    view[name] = view[name].to(device, non_blocking=True)
 
-        with torch.no_grad():
-            fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
-                query_view=batch,
-                device=str(device),
-                memory_feats=memory_feats,
-                additional_tokens=memory_token,
-                memory_keep_ratio=cfg.fusion.memory_keep_ratio,
-                memory_efficient_inference=cfg.training.memory_efficient_inference,
+            with torch.no_grad():
+                fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
+                    query_view=batch,
+                    device=str(device),
+                    memory_feats=memory_feats,
+                    additional_tokens=memory_token,
+                    memory_keep_ratio=cfg.fusion.memory_keep_ratio,
+                    memory_efficient_inference=cfg.training.memory_efficient_inference,
+                )
+                # 上采样到原图分辨率（无梯度）
+                dense_feat_up = upsampler(batch[0]["img"], fused_feature)
+                printer.print(dense_feat_up, "dense_feat_up")
+                printer.print(fused_token, "fused_token")
+
+            # 仅取本批的第一个视角（你的管线里 num_views=1）
+            view = batch[0]
+            target_world, valid_mask = _prepare_targets(view, device)
+            intrinsics = _resolve_intrinsics(view, device).to(torch.float32)
+            c2w = _resolve_pose(view, device).to(torch.float32)
+            # 初始化缓冲区（在 CPU 更省显存；add_view 内部会把样本拷到 buffer.device）
+            if buffer is None:
+                in_channels = int(dense_feat_up.shape[1])
+                buffer = FeatureReplayBuffer(capacity, in_channels, device=torch.device("cpu"))
+
+            # 写入本视角采样
+            added = buffer.add_view(
+                dense_feat_up.squeeze(0).detach(),   # [C,H,W]
+                fused_token.squeeze(0).detach(),     # [C,1] / [C]（per-view token）
+                target_world.squeeze(0).detach(),    # [H,W,3]
+                valid_mask.squeeze(0).detach(),      # [H,W]
+                intrinsics.squeeze(0).detach(),      # [3,3]
+                c2w.squeeze(0).detach(),             # [4,4] / [3,4]
+                cfg.training.samples_per_view,
             )
-            printer.print(dense_feat,"dense_feat")
-            dense_feat_up = upsampler(batch[0]["img"],dense_feat.features_upsampled_8x)
+            # 用“实际写入数量”推进进度条
+            if added > 0:
+                pbar.update(added)
 
-        target_world, valid_mask = _prepare_targets(view, device)
-        intrinsics = _resolve_intrinsics(view, device).to(torch.float32)
-        c2w = _resolve_pose(view, device).to(torch.float32)
+            # 不要调用成函数：is_full 是属性
+            if buffer.is_full:
+                break
 
-        if buffer is None:
-            buffer = FeatureReplayBuffer(cfg.training.buffer_size, dense_feat_up.shape[1], device=torch.device("cpu"))
+        if buffer is None or buffer.size == 0:
+            raise RuntimeError("No training samples were collected. Check dataset or configuration.")
+        return buffer, buffer.storage.features.shape[1]
 
-        added = buffer.add_view(
-            dense_feat_up.squeeze(0).detach(),
-            fused_token.squeeze(0).detach(),
-            target_world.squeeze(0).detach(),
-            valid_mask.squeeze(0).detach(),
-            intrinsics.squeeze(0).detach(),
-            c2w.squeeze(0).detach(),
-            cfg.training.samples_per_view,
-        )
-
-        if buffer.is_full():
-            break
-
-    if buffer is None or buffer.size == 0:
-        raise RuntimeError("No training samples were collected. Check dataset or configuration.")
-    return buffer, buffer.storage.features.shape[1]
+    finally:
+        pbar.close()
 
 def _invert_c2w_to_w2c(c2w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -719,7 +677,6 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         [torch.randn(B, C, H, W, device=device, dtype=dtype) for _ in range(num_views)]
         for (C, H, W) in specs
     ]
-    # printer.print(memory_feats, "memory_feats")
     # # 若你的 forward 里需要 additional_tokens（仅占位，不参与计算）
     memory_token = torch.zeros(B, 768, 1, device=device, dtype=dtype)
 
@@ -764,8 +721,11 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         head.train()
         for batch in bufferloader:
             features = batch["features"].to(device)
-            scale = batch["scale"].to(device)
+            scale = batch["scale_token"].to(device)
+            printer.print(features, "features")
+            printer.print(scale, "scale")
             preds = head(features,scale)
+            printer.print(preds, "preds")
 
             loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
 
