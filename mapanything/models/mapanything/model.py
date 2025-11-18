@@ -8,6 +8,7 @@ MapAnything model class defined using UniCeption modules.
 """
 
 import warnings
+import dataclasses
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -138,6 +139,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self.name = name
         self.encoder_config = encoder_config
         self.dpt_indices = info_sharing_config.get("dpt_indices", None)
+        self.geometric_input_config = geometric_input_config
         self.info_sharing_config = info_sharing_config
         self.pred_head_config = pred_head_config
         self.geometric_input_config = geometric_input_config
@@ -1408,14 +1410,13 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         dense_head_inputs: Union[torch.Tensor, List[torch.Tensor]],
         scale_head_inputs: torch.Tensor,
         img_shape: Tuple[int, int],
-        memory_efficient_inference: bool = False,
+        memory_efficient_inference: bool = True,
     ):
         """
         Run Prediction Heads & Post-Process Outputs
         """
         # Get device
         device = self.device
-
         # Use mini-batch inference to run the dense prediction head (the memory bottleneck)
         # This saves memory and is slower than running the dense prediction head in one go
         if memory_efficient_inference:
@@ -1691,7 +1692,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def forward(self, views, memory_efficient_inference=False,save_filename="info_sharing_outputs.pt"):
+    def forward(self, views, memory_efficient_inference=False, save_filename="info_sharing_outputs.pt"):
         """
         Forward pass performing the following operations:
         1. Encodes the N input views (images).
@@ -1766,6 +1767,27 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 intermediate_info_sharing_multi_view_feat,
             ) = self.info_sharing(info_sharing_input)
 
+        def _detach_clone_tree(x):
+            """递归复制：Tensor -> detach().clone()；容器 -> 递归处理；其他 -> deepcopy。"""
+            if isinstance(x, torch.Tensor):
+                return x.detach().clone()  # 新内存，并断开 autograd
+            if isinstance(x, dict):
+                return {k: _detach_clone_tree(v) for k, v in x.items()}
+            if isinstance(x, (list, tuple)):
+                out = [_detach_clone_tree(v) for v in x]
+                return type(x)(out) if isinstance(x, tuple) else out
+            if dataclasses.is_dataclass(x):
+                return type(x)(**{f.name: _detach_clone_tree(getattr(x, f.name))
+                                  for f in dataclasses.fields(x)})
+            return copy.deepcopy(x)  # 兜底
+
+        if self.store_info_sharing_intermediate_features and self.dpt_indices is not None:
+            dpt_info_sharing_multi_view_feat = [
+                _detach_clone_tree(intermediate_info_sharing_multi_view_feat[i])
+                for i in self.dpt_indices
+            ]
+        final_info_sharing_feat = _detach_clone_tree(final_info_sharing_multi_view_feat)
+
         if self.store_info_sharing_intermediate_features:
             self._stored_info_sharing_features = self._capture_info_sharing_features(
                 final_info_sharing_multi_view_feat,
@@ -1775,18 +1797,10 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         else:
             self._stored_info_sharing_features = None
 
-        if self.store_info_sharing_intermediate_features and self.dpt_indices is not None:
-            # 先保存当前 24 层完整特征（它们已经保存在 _stored_info_sharing_features 内）
-            # 然后只保留 dpt_indices 对应的层
-            intermediate_info_sharing_multi_view_feat = [
-                intermediate_info_sharing_multi_view_feat[i]
-                for i in self.dpt_indices
-            ]
-
         if self.pred_head_type == "linear":
             # Stack the features for all views
             dense_head_inputs = torch.cat(
-                final_info_sharing_multi_view_feat.features, dim=0
+                final_info_sharing_feat.features, dim=0
             )
         elif self.pred_head_type in ["dpt", "dpt+pose"]:
             # Get the list of features for all views
@@ -1799,38 +1813,38 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 dense_head_inputs_list.append(stacked_encoder_features)
                 # Stack the first intermediate features for all views
                 stacked_intermediate_features_1 = torch.cat(
-                    intermediate_info_sharing_multi_view_feat[0].features, dim=0
+                    dpt_info_sharing_multi_view_feat[0].features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_intermediate_features_1)
                 # Stack the second intermediate features for all views
                 stacked_intermediate_features_2 = torch.cat(
-                    intermediate_info_sharing_multi_view_feat[1].features, dim=0
+                    dpt_info_sharing_multi_view_feat[1].features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_intermediate_features_2)
                 # Stack the last layer features for all views
                 stacked_final_features = torch.cat(
-                    final_info_sharing_multi_view_feat.features, dim=0
+                    final_info_sharing_feat.features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_final_features)
             else:
                 # Stack the first intermediate features for all views
                 stacked_intermediate_features_1 = torch.cat(
-                    intermediate_info_sharing_multi_view_feat[0].features, dim=0
+                    dpt_info_sharing_multi_view_feat[0].features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_intermediate_features_1)
                 # Stack the second intermediate features for all views
                 stacked_intermediate_features_2 = torch.cat(
-                    intermediate_info_sharing_multi_view_feat[1].features, dim=0
+                    dpt_info_sharing_multi_view_feat[1].features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_intermediate_features_2)
                 # Stack the third intermediate features for all views
                 stacked_intermediate_features_3 = torch.cat(
-                    intermediate_info_sharing_multi_view_feat[2].features, dim=0
+                    dpt_info_sharing_multi_view_feat[2].features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_intermediate_features_3)
                 # Stack the last layer
                 stacked_final_features = torch.cat(
-                    final_info_sharing_multi_view_feat.features, dim=0
+                    final_info_sharing_feat.features, dim=0
                 )
                 dense_head_inputs_list.append(stacked_final_features)
         else:
@@ -1845,7 +1859,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             elif self.pred_head_type in ["dpt", "dpt+pose"]:
                 dense_head_inputs = dense_head_inputs_list
             scale_head_inputs = (
-                final_info_sharing_multi_view_feat.additional_token_features
+                final_info_sharing_feat.additional_token_features
             )
 
             # Run the downstream heads
@@ -2379,7 +2393,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             self,
             query_view,
             device: str,
-            memory_feats: List[List[torch.Tensor]],
+            memory_tokens_per_block: List[Optional[torch.Tensor]],
             additional_tokens: torch.Tensor,
             memory_keep_ratio: float = 1.0,
             memory_efficient_inference: bool = False,
@@ -2395,53 +2409,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         参数与 ``forward_with_memory`` 保持一致，但不会执行下游 head，
         因此非常适合在冻结 backbone/encoder 时重新训练轻量回归头。
         """
-
-        def downsample_tokens(feat_list: List[torch.Tensor], memory_keep_ratio: float = 1.0):
-            """
-            对每个视角的特征 [B,C,H,W] 随机子采样 H*W 个 token 中的 keep_n 个，
-            并将形状保持为 4D：[B,C,1,keep_n]（给后续插值/注意力模块使用）。
-            返回 List[Tensor]，与输入 feat_list 等长（逐视角保留）。
-            """
-            kept = []
-            for f in feat_list:
-                assert f.dim() == 4, f"downsample_tokens expects [B,C,H,W], got {tuple(f.shape)}"
-                B, C, H, W = f.shape
-                T = H * W
-
-                keep_n = max(1, min(T, int(math.ceil(T * float(memory_keep_ratio)))))
-
-                flat = f.reshape(B, C, T)  # [B,C,T]
-                if keep_n == T:
-                    selected = flat  # [B,C,T]
-                else:
-                    idx = torch.randperm(T, device=f.device)[:keep_n]
-                    selected = flat.index_select(2, idx)  # [B,C,keep_n]
-
-                # 还原 4D，形成“1 x keep_n”的伪二维网格
-                selected = selected.view(B, C, 1, keep_n)  # [B,C,1,keep_n]
-                kept.append(selected)
-            return kept
-
-        # ------------------- 这里是调用处的修改 -------------------
-        memory_token_blocks: List[List[torch.Tensor]] = []
-        for block in memory_feats:  # block: List[Tensor[B,C,H,W]]，每个元素是一个视角的特征
-            # （可选）如果担心某些输入不是 4D，可在这里做兜底处理
-            merged = []
-            for view_feat in block:
-                if view_feat.dim() == 4:
-                    merged.append(view_feat)
-                elif view_feat.dim() == 3:  # [B,C,T] -> [B,C,1,T]
-                    merged.append(view_feat.unsqueeze(2))
-                elif view_feat.dim() == 2:  # [B,C]   -> [B,C,1,1]
-                    merged.append(view_feat.unsqueeze(-1).unsqueeze(-1))
-                else:
-                    raise ValueError(f"Unexpected view_feat shape: {tuple(view_feat.shape)}")
-
-            # 逐视角采样，保留为 List[Tensor]，不再拼接
-            block_tokens_list = downsample_tokens(merged, memory_keep_ratio=memory_keep_ratio)
-            # 类型: List[Tensor[B,C,1,keep_n_i]]，与视角数量一致
-            memory_token_blocks.append(block_tokens_list)
-
         all_encoder_features_across_views = self._encode_n_views(query_view)
         with torch.autocast("cuda", enabled=False):
             all_encoder_features_across_views = (
@@ -2452,9 +2419,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         query_feat = all_encoder_features_across_views[0]
         scale_token = additional_tokens.to(query_feat.dtype)
-        final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
+        final_feat, intermediate_feats = self.info_sharing.forward_query_with_merge_memory(
             query_feat=query_feat,
-            memory_feats=memory_token_blocks,
+            memory_tokens_per_block=memory_tokens_per_block,
             additional_tokens=scale_token,
             memory_keep_ratio=memory_keep_ratio,
         )
@@ -2614,7 +2581,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         base_dir = self.info_sharing_storage_path
         base_dir.mkdir(parents=True, exist_ok=True)
         run_dir = base_dir / (
-            datetime.utcnow().strftime("%m%dT%H%M%s")
+            datetime.utcnow().strftime("%m%dT%H%M")
         ) / Path(filename)
         run_dir.mkdir(parents=True, exist_ok=False)
         self._info_sharing_storage_run_dir = run_dir
@@ -2667,12 +2634,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             "storage_mode": "disk",
             "storage_directory": str(run_dir),
             "storage_file": str(storage_file),
-            "final": self._summarize_disk_block(final_block),
-            "intermediate": (
-                [self._summarize_disk_block(block) for block in intermediate_blocks]
-                if intermediate_blocks is not None
-                else None
-            ),
         }
 
         return stored

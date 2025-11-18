@@ -13,7 +13,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 4 benchmark_518_eth3d_snpp_tav2"
 #)
   batch_sizes_and_views=(
-    "1 100 benchmark_518_seven_scenes"
+    "1 96 benchmark_518_seven_scenes"
 )
 
 for combo in "${batch_sizes_and_views[@]}"; do
@@ -34,7 +34,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model/task=images_and_full_geometry \
         model.encoder.uses_torch_hub=True \
         model.pretrained='${root_pretrained_checkpoints_dir}/facebook_map-anything.pth' \
-        +model.memory_efficient_inference=True \
+        memory_efficient_inference=True \
         hydra.run.dir='${root_experiments_dir}/ace_tasks/mapanything/'"${dataset}"'_'"${num_views}"'v_aa_capture'
 
     echo "Finished $dataset with ACE AA feature capture. Each run writes an info_sharing_outputs.pt file under ${run_dir_cli}/ACE/aa_blocks."

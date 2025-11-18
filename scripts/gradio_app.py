@@ -58,7 +58,7 @@ def get_logo_base64():
 
 # MapAnything Configuration
 high_level_config = {
-    "path": "configs/train.yaml",
+    "path": "configs/ace_train.yaml",
     "hf_model_name": "facebook/map-anything",
     "model_str": "mapanything",
     "config_overrides": [

@@ -22,19 +22,7 @@ from mapanything.tasks.train import (
     _resolve_pose,
 )
 
-def _load_head(cfg: DictConfig, in_channels: int, device: torch.device) -> ACERegressionHead:
-    head = ACERegressionHead(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
-    if cfg.head.checkpoint:
-        payload = torch.load(cfg.head.checkpoint, map_location="cpu")
-        state_dict = payload.get("state_dict", payload)
-        inferred_channels = payload.get("in_channels")
-        if inferred_channels is not None and inferred_channels != in_channels:
-            head = ACERegressionHead(in_channels=inferred_channels, hidden_dim=cfg.head.hidden_dim).to(device)
-        head.load_state_dict(state_dict, strict=False)
-    return head
-
-
-def run_eval(cfg: DictConfig) -> Dict[str, Any]:
+def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
@@ -43,22 +31,31 @@ def run_eval(cfg: DictConfig) -> Dict[str, Any]:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
+    head = ACEHead_Pointwise_FiLM(in_channels=cfg.head.in_channels, hidden_dim=cfg.head.hidden_dim)
+    head_ckpt = getattr(cfg.head, "checkpoint", None)
+    if head_ckpt:
+        report = load_regression_head(
+            head,
+            head_ckpt,
+            device="cpu",  # 建议先在 CPU 过一遍
+            strict=False,  # 不要求严格，允许部分缺失
+            allowed_prefixes=("", "module.", "head.", "reg_head.", "ace_head."),
+            rename_map=None,  # 如需兼容旧命名，传映射表
+        )
+        _logger.info(
+            "Loaded regression head from %s | used=%d, total_in_ckpt=%d, missing=%d, unexpected=%d, skipped_shape=%d",
+            head_ckpt, report["used_from_ckpt"], report["total_in_ckpt"],
+            len(report["missing"]), len(report["unexpected"]), len(report["skipped_shape"])
+        )
+        if report["skipped_shape"]:
+            _logger.debug("Skipped (shape mismatch): %s", report["skipped_shape"][:10])
+    head.eval().to(device)
+
     memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
 
     # 创建dataset
-    dataset = SevenScenesWAI(
-        num_views=cfg.dataset.num_views,
-        split="train",
-        covisibility_thres=0.025,
-        ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes",
-        dataset_metadata_dir="/mnt/storage/xwh/map-anything/mapanything_dataset_metadata",
-        sample_specific_scene=True,
-        specific_scene_name='chess_train',
-        resolution=(518, 392),
-        transform="imgnorm",
-        data_norm_type="dinov2",
-        seed=777
-    )
+    if isinstance(cfg.dataset.train_dataset, str):
+        dataset = eval(cfg.dataset.train_dataset)
     # 创建无限读取器
     dataloader = ForcedRandomDataLoader(
         dataset=dataset,
@@ -77,7 +74,6 @@ def run_eval(cfg: DictConfig) -> Dict[str, Any]:
             memory_keep_ratio=cfg.fusion.memory_keep_ratio,
             memory_efficient_inference=cfg.training.memory_efficient_inference,
         )
-    head = _load_head(cfg, sample_feature.shape[1], device)
 
     output_dir = Path(cfg.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)

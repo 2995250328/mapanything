@@ -22,9 +22,9 @@ loss:
   confidence_weight: 1.0
 
 head:
-  hidden_dim: 128
-  checkpoint: ???
-  in_channels: null
+  hidden_dim: 256
+  checkpoint: "/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace_regression_head.pt"
+  in_channels: 768
 
 eval:
   max_samples: 50

@@ -161,73 +161,144 @@ class ACEHead_Pointwise_Decoupled_WithScale(nn.Module):
 
         return out, s
 
+
 def load_regression_head(
-    head: nn.Module,
-    checkpoint: str | Path,
-    *,
-    device: str = "cpu",
-    strict: bool = False,
-    allowed_prefixes: Iterable[str] = ("", "module.", "head.", "reg_head.", "ace_head."),
-    rename_map: Optional[Dict[str, str]] = None,
+        head: nn.Module,
+        checkpoint: str | Path,
+        *,
+        device: str = "cpu",
+        strict: bool = False,
+        # 这里的 prefixes 支持递归剥离，顺序很重要，长的放前面更安全
+        allowed_prefixes: Iterable[str] = ("module.", "ace_head.", "reg_head.", "head."),
+        rename_map: Optional[Dict[str, str]] = None,
+        verbose: bool = False
 ) -> Dict[str, Any]:
     """
-    仅加载回归头参数：
-    - 自动剥离常见前缀（module./head./reg_head./ace_head.）
-    - 仅保留与 head.state_dict() 键名匹配且 shape 一致的权重
-    - 跳过 shape 不一致项，避免误加载
-    - 返回加载报告（loaded/missing/unexpected/skipped_shape）
-
-    Args:
-        head: 回归头模块（如 ACEHead_Pointwise_FiLM / ACEHead_Pointwise_Decoupled）
-        checkpoint: ckpt 路径；支持 {'state_dict': ...} 或 直接 state_dict
-        device: 加载映射设备（建议 'cpu'）
-        strict: 传给 load_state_dict 的 strict 标志
-        allowed_prefixes: 允许剥离的前缀集合
-        rename_map: 旧->新 键名映射（可用于兼容老版本命名）
-
-    Returns:
-        report: {
-            'loaded': List[str],
-            'missing': List[str],
-            'unexpected': List[str],
-            'skipped_shape': List[Tuple[name, ckpt_shape, head_shape]],
-            'total_in_ckpt': int,
-            'used_from_ckpt': int
-        }
+    通用回归头加载器。支持自动前缀剥离、键名重映射和形状安全检查。
     """
-    payload = torch.load(str(checkpoint), map_location=device)
-    sd = payload.get("state_dict", payload)
 
-    tgt_sd = head.state_dict()
-    filtered = OrderedDict()
-    skipped_shape: list[Tuple[str, Tuple[int, ...], Tuple[int, ...]]] = []
+    # 1. 加载 Checkpoint
+    if isinstance(checkpoint, (str, Path)):
+        if not Path(checkpoint).exists():
+            raise FileNotFoundError(f"Checkpoint not found at: {checkpoint}")
+        payload = torch.load(str(checkpoint), map_location=device)
+    else:
+        payload = checkpoint  # 允许直接传入 dict
 
-    def strip_prefix(k: str) -> str:
-        for p in allowed_prefixes:
-            if p and k.startswith(p):
-                return k[len(p):]
-        return k  # 包含空前缀情况
+    source_sd = payload.get("state_dict", payload)
+    target_sd = head.state_dict()
 
-    for k, v in sd.items():
-        name = strip_prefix(k)
-        if rename_map and name in rename_map:
-            name = rename_map[name]
-        if name in tgt_sd:
-            if tgt_sd[name].shape == v.shape:
-                filtered[name] = v
-            else:
-                skipped_shape.append((name, tuple(v.shape), tuple(tgt_sd[name].shape)))
-
-    incompat = head.load_state_dict(filtered, strict=strict)
-
+    loaded_sd = OrderedDict()
     report = {
-        "loaded": sorted(list(filtered.keys())),
-        "missing": sorted(list(incompat.missing_keys)),
-        "unexpected": sorted(list(incompat.unexpected_keys)),
-        "skipped_shape": skipped_shape,
-        "total_in_ckpt": len(sd),
-        "used_from_ckpt": len(filtered),
+        "loaded": [],
+        "missing": [],  # 目标有，但在 ckpt 没找到
+        "unexpected": [],  # ckpt 有，但在目标不需要
+        "skipped_shape": [],  # 名字对上了，但形状不对
+        "remapped": [],  # 发生了重命名
+        "total_in_ckpt": len(source_sd),
     }
+
+    # --- 内部辅助函数：尝试剥离前缀 ---
+    def try_match_key(src_k: str, target_keys: set) -> str | None:
+        """
+        尝试通过剥离前缀或重命名来匹配 target_keys 中的键。
+        返回匹配到的 target_key，如果没有匹配则返回 None。
+        """
+        # 1. 直接匹配
+        if src_k in target_keys:
+            return src_k
+
+        # 2. 应用 rename_map (在剥离前缀之前尝试，处理如 'head.' -> 'head_coords.' 的情况)
+        current_k = src_k
+        if rename_map:
+            for old_pattern, new_pattern in rename_map.items():
+                if old_pattern in current_k:
+                    # 简单的字符串替换，通常用于前缀替换
+                    candidate = current_k.replace(old_pattern, new_pattern)
+                    if candidate in target_keys:
+                        report["remapped"].append(f"{src_k} -> {candidate}")
+                        return candidate
+                    # 更新 current_k 以便后续剥离前缀逻辑基于新名字继续尝试
+                    # current_k = candidate
+
+        # 3. 递归/贪婪剥离前缀
+        # 逻辑：比如 key 是 "module.ace_head.stem.0.weight"
+        # 我们尝试剥离 "module." -> "ace_head.stem.0.weight" -> 检查是否存在
+        # 再剥离 "ace_head." -> "stem.0.weight" -> 检查是否存在
+
+        potential_key = src_k
+        found = False
+
+        # 为了防止死循环，设置最大剥离深度
+        max_depth = 5
+        for _ in range(max_depth):
+            matched_prefix = None
+            for p in allowed_prefixes:
+                if potential_key.startswith(p):
+                    potential_key = potential_key[len(p):]
+                    matched_prefix = p
+                    break  # 找到一个前缀就剥离，然后重新检查是否存在
+
+            if potential_key in target_keys:
+                return potential_key
+
+            # 如果还要应用 rename_map (在剥离后)
+            if rename_map:
+                for old_p, new_p in rename_map.items():
+                    if old_p in potential_key:
+                        cand = potential_key.replace(old_p, new_p)
+                        if cand in target_keys:
+                            report["remapped"].append(f"{src_k} -> {cand}")
+                            return cand
+
+            # 如果这一轮没有剥离任何前缀，说明已经到底了，无法匹配
+            if matched_prefix is None:
+                break
+
+        return None
+
+    # --- 主循环：遍历 Source ---
+    target_keys_set = set(target_sd.keys())
+    used_source_keys = set()
+
+    for src_k, src_v in source_sd.items():
+        tgt_k = try_match_key(src_k, target_keys_set)
+
+        if tgt_k:
+            # 名字匹配上了，检查形状
+            tgt_v = target_sd[tgt_k]
+            if src_v.shape != tgt_v.shape:
+                report["skipped_shape"].append((tgt_k, tuple(src_v.shape), tuple(tgt_v.shape)))
+            else:
+                loaded_sd[tgt_k] = src_v
+                report["loaded"].append(tgt_k)
+                used_source_keys.add(src_k)  # 记录原始 key 被使用了
+        else:
+            pass  # 这个 key 在 target 中完全没用到，属于 unexpected
+
+    # --- 填充结果 ---
+    incompat = head.load_state_dict(loaded_sd, strict=strict)
+
+    # 修正 missing_keys：load_state_dict 返回的是相对于 loaded_sd 的缺失
+    # 但我们更关心相对于 target_sd 到底缺了啥
+    # 这里 incompat.missing_keys 实际上就是 report['missing']
+    report["missing"] = sorted(list(incompat.missing_keys))
+
+    # unexpected keys 计算：ckpt 中没被用到的 key
+    report["unexpected"] = sorted(list(set(source_sd.keys()) - used_source_keys))
+
+    report["used_from_ckpt"] = len(loaded_sd)
+
+    # --- 简单的打印/日志 ---
+    if verbose:
+        print(f"[LoadReport] Loaded: {len(report['loaded'])}/{len(target_sd)} keys.")
+        if report["remapped"]:
+            print(f"[LoadReport] Remapped {len(report['remapped'])} keys (e.g., {report['remapped'][0]}).")
+        if report["skipped_shape"]:
+            print(f"[LoadReport] Shape Mismatch: {len(report['skipped_shape'])} keys.")
+        if report["missing"]:
+            print(f"[LoadReport] Missing: {len(report['missing'])} keys (e.g., {report['missing'][0]}).")
+
     return report
 
 """

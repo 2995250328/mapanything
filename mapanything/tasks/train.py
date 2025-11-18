@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union, Optional
 
 import hydra
 import math
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -24,6 +25,184 @@ from mapanything.utils.geometry import quaternion_to_rotation_matrix
 
 
 printer = DebugPrinter()
+# -----------------------------
+# 1) 轻量 k-means：把大量 token 聚成 K 个中心（作为 memory token）
+# -----------------------------
+@torch.no_grad()
+def kmeans_merge(x: torch.Tensor, k: int, iters: int = 6, metric: str = "cosine"):
+    """
+    x: [N, C]  (已加过位置编码的 token 序列)
+    返回:
+      centers: [k, C]
+      assign_weights: [k, 1] 每个簇的权重 (sqrt(count))，可用于后续加权
+    """
+    assert x.dim() == 2
+    n, c = x.shape
+    k = min(k, n)
+    if k == n:
+        return x.clone(), torch.ones(k, 1, device=x.device, dtype=x.dtype)
+
+    # 归一化对齐 cosine 距离
+    if metric == "cosine":
+        x_norm = F.normalize(x, dim=-1)
+    else:
+        x_norm = x
+
+    # 初始化：随机选 k 个点
+    idx = torch.randperm(n, device=x.device)[:k]
+    centers = x_norm[idx].clone()  # 用于分配
+    true_centers = x[idx].clone()  # 用于输出（不丢失原值缩放）
+
+    for _ in range(iters):
+        # 计算距离并分配
+        if metric == "cosine":
+            # 最大相似度 -> 最近中心
+            sim = torch.matmul(x_norm, centers.T)  # [N, k]
+            labels = sim.argmax(dim=1)
+        else:
+            dist = torch.cdist(x_norm, centers, p=2)  # [N, k]
+            labels = dist.argmin(dim=1)
+
+        # 聚合得到新中心（用原始 x 求均值，避免累积归一化误差）
+        counts = torch.bincount(labels, minlength=k).clamp_(min=1).to(x.dtype)  # [k]
+        sums = torch.zeros(k, c, device=x.device, dtype=x.dtype)
+        sums.index_add_(0, labels, x)
+        new_centers = sums / counts.unsqueeze(1)  # [k, C]
+
+        # 收敛性检查（可选）
+        shift = (new_centers - true_centers).pow(2).mean()
+        true_centers = new_centers
+        if shift < 1e-6:
+            break
+
+        # 用于下一轮分配的“归一化中心”
+        centers = F.normalize(true_centers, dim=-1) if metric == "cosine" else true_centers
+
+    assign_weights = torch.sqrt(counts).unsqueeze(1)  # [k, 1]，权重 = sqrt(簇大小)
+    return true_centers, assign_weights
+
+# -----------------------------
+# 2) 按块聚合器：对 24 个块分别把 N 视图的 token 聚成 K_b 个记忆 token
+# -----------------------------
+class BlockwiseAggregator(nn.Module):
+    def __init__(
+        self,
+        num_blocks: int = 24,
+        tokens_per_block: Union[int, List[int]] = 256,
+        kmeans_iters: int = 6,
+        metric: str = "cosine",
+        pre_cap: Optional[int] = 8192,
+        weight_scale: bool = True,
+    ):
+        """
+        现在的输入结构：
+        memory_feats: List[List[Tensor]]
+          - 外层长度 = num_blocks（例如 24）
+          - 内层长度 = N_view（例如 48）
+          - 每个 Tensor 形状通常为 [1, C, H, W]（也兼容 [C,H,W] / [T,C]）
+
+        tokens_per_block: 单个 int 或 长度为 num_blocks 的列表
+        pre_cap: 每块聚合前随机下采样上限，控制速度/显存；None 表示不截断
+        weight_scale: 是否用 sqrt(count) 对中心缩放（频次加权）
+        """
+        super().__init__()
+        self.num_blocks = num_blocks
+        if isinstance(tokens_per_block, int):
+            self.tokens_per_block = [tokens_per_block] * num_blocks
+        else:
+            assert len(tokens_per_block) == num_blocks
+            self.tokens_per_block = tokens_per_block
+        self.kmeans_iters = kmeans_iters
+        self.metric = metric
+        self.pre_cap = pre_cap
+        self.weight_scale = weight_scale
+
+    @staticmethod
+    def _to_tokens(feat: torch.Tensor) -> torch.Tensor:
+        """
+        将单个视图的中间特征转为一维 token:
+          支持 [1,C,H,W] / [B,C,H,W] / [C,H,W] / [T,C]
+        返回 [T, C]
+        """
+        if feat.dim() == 2:
+            # [T, C] -> 已经是 token
+            return feat.contiguous()
+        elif feat.dim() == 3:
+            # [C, H, W] -> [H*W, C]
+            C, H, W = feat.shape
+            return feat.permute(1, 2, 0).reshape(H * W, C).contiguous()
+        elif feat.dim() == 4:
+            # [B, C, H, W] -> [B*H*W, C]
+            B, C, H, W = feat.shape
+            return feat.permute(0, 2, 3, 1).reshape(B * H * W, C).contiguous()
+        else:
+            raise ValueError(f"Unsupported feat dim={feat.dim()}, expected 2/3/4.")
+    @torch.no_grad()
+    def forward(self, memory_feats: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+        """
+        memory_feats: 外层按 block，内层按 view
+            memory_feats[b][v] ~ Tensor([1, C, H, W])（或兼容形状）
+            假设所有视图的特征已带位置编码，这里不再添加任何位置编码。
+
+        返回:
+            memory_tokens_per_block: 长度 = num_blocks；第 b 个元素形状 [K_b, C]
+        """
+        assert len(memory_feats) == self.num_blocks, \
+            f"期望 {self.num_blocks} 个块，收到 {len(memory_feats)}"
+
+        memory_tokens_per_block: List[torch.Tensor] = []
+
+        for b in range(self.num_blocks):
+            views = memory_feats[b]
+            assert len(views) > 0, f"block {b} 为空"
+            # 取第一个视图确定设备/精度
+            first_valid = None
+            for t in views:
+                if t is not None:
+                    first_valid = t
+                    break
+            if first_valid is None:
+                raise ValueError(f"block {b} 全为 None")
+
+            dev = first_valid.device
+            dtype = first_valid.dtype
+
+            tokens_b = []
+            for v, feat in enumerate(views):
+                if feat is None:
+                    continue
+                # 保证同一 block 的视图在同一 device
+                if feat.device != dev:
+                    feat = feat.to(dev, non_blocking=True)
+                tb = self._to_tokens(feat)  # [T_vb, C]
+                # 基本健壮性检查
+                assert tb.dim() == 2, f"block {b}, view {v} 转换失败，得到维度 {tb.dim()}"
+                tokens_b.append(tb)
+
+            if len(tokens_b) == 0:
+                # 全 None 时返回空张量，或直接报错均可
+                memory_tokens_per_block.append(
+                    torch.empty(0, first_valid.shape[-3] if first_valid.dim() >= 3 else first_valid.shape[-1],
+                                device=dev, dtype=dtype)
+                )
+                continue
+
+            x = torch.cat(tokens_b, dim=0)  # [T_total_b, C]
+            # 预裁剪以控显存/加速
+            if self.pre_cap is not None and x.shape[0] > self.pre_cap:
+                idx = torch.randperm(x.shape[0], device=dev)[: self.pre_cap]
+                x = x.index_select(0, idx)
+
+            Kb = int(self.tokens_per_block[b])
+            # 轻量 k-means 合并为 memory token
+            centers, weights = kmeans_merge(x, k=Kb, iters=self.kmeans_iters, metric=self.metric)  # [Kb,C], [Kb,1]
+            if self.weight_scale:
+                centers = centers * weights  # 频次加权
+
+            memory_tokens_per_block.append(centers.to(device=dev, dtype=dtype))
+
+        return memory_tokens_per_block
+
 # ---------------------------------------------------------------------------
 # 数据结构
 # ---------------------------------------------------------------------------
@@ -315,15 +494,14 @@ def _collect_buffer(
                 fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
                     query_view=batch,
                     device=str(device),
-                    memory_feats=memory_feats,
+                    memory_tokens_per_block=memory_feats,
                     additional_tokens=memory_token,
                     memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                     memory_efficient_inference=cfg.training.memory_efficient_inference,
                 )
                 # 上采样到原图分辨率（无梯度）
                 dense_feat_up = upsampler(batch[0]["img"], fused_feature)
-                printer.print(dense_feat_up, "dense_feat_up")
-                printer.print(fused_token, "fused_token")
+                # dense_feat_up = upsampler(batch[0]["img"], dense_feat.features_upsampled_8x)
 
             # 仅取本批的第一个视角（你的管线里 num_views=1）
             view = batch[0]
@@ -643,8 +821,8 @@ def _loss_fn(
 # ---------------------------------------------------------------------------
 def run_training(cfg: DictConfig) -> Dict[str, str]:
 
-    # device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     # 加载mapanything模型
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
@@ -653,7 +831,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
     # 使用anyup进行特征图上采样
     upsampler = torch.hub.load('wimmerth/anyup', 'anyup')  # 如需可：, trust_repo=True
-    upsampler.eval()  # 推理模式
+    upsampler.to(device).eval()  # 推理模式
     # 总迭代次数
     iterations = cfg.training.epochs * (cfg.training.buffer_size // cfg.training.batch_size )
     # 构建重投影损失计算类
@@ -665,42 +843,29 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         circle_schedule=(cfg.loss.repro_loss_schedule == 'circle')
     )
     # 从保存的中间特征文件中读取
-    # memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
-
-    dtype = torch.float16  # 如果想省显存可换成 torch.float16
-    B = 1  # 每个视角的 batch size
-    num_views = 1  # 每层包含的视角数量
-    # 24 层；每层的 (C,H,W) 都是 (768,1,1)
-    specs = [(768, 1, 1)] * 24
-    # --- 构建 24 层内存特征：List[  List[Tensor[B,768,1,1]]  ] ---
-    memory_feats = [
-        [torch.randn(B, C, H, W, device=device, dtype=dtype) for _ in range(num_views)]
-        for (C, H, W) in specs
-    ]
-    # # 若你的 forward 里需要 additional_tokens（仅占位，不参与计算）
-    memory_token = torch.zeros(B, 768, 1, device=device, dtype=dtype)
+    memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
+    aggregator = BlockwiseAggregator(
+        num_blocks=24,
+        tokens_per_block=256,  # 或者 [256,256,...] 按块自定义
+        kmeans_iters=6,
+        metric="cosine",
+        pre_cap=8192,
+        weight_scale=True,
+    ).eval()
+    with torch.no_grad():
+        memory_tokens_per_block = aggregator(memory_feats)  # len=24, 每个 [K_b, C]
+    printer.print(memory_tokens_per_block,"memory_tokens_per_block")
 
     # 创建dataset
-    dataset = SevenScenesWAI(
-        num_views=cfg.dataset.num_views,
-        split="train",
-        covisibility_thres=0.025,
-        ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes",
-        dataset_metadata_dir="/mnt/storage/xwh/map-anything/mapanything_dataset_metadata",
-        sample_specific_scene=True,
-        specific_scene_name='chess_train',
-        resolution=(518, 392),
-        transform="imgnorm",
-        data_norm_type="dinov2",
-        seed=777
-    )
+    if isinstance(cfg.dataset.train_dataset, str):
+        dataset = eval(cfg.dataset.train_dataset)
     # 创建无限读取器
     dataloader = ForcedRandomDataLoader(
         dataset=dataset,
         batch_size=1  # 你想要的 batch size
     )
     # 创建 training buffer
-    buffer, in_channels = _collect_buffer(cfg, model, upsampler, dataloader, memory_feats, memory_token, device)
+    buffer, in_channels = _collect_buffer(cfg, model, upsampler, dataloader, memory_tokens_per_block, memory_token, device)
     bufferloader = DataLoader(
         BufferDataset(buffer),
         batch_size=cfg.training.batch_size,
@@ -722,10 +887,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         for batch in bufferloader:
             features = batch["features"].to(device)
             scale = batch["scale_token"].to(device)
-            printer.print(features, "features")
-            printer.print(scale, "scale")
-            preds = head(features,scale)
-            printer.print(preds, "preds")
+            preds = head(features, scale)
 
             loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
 
@@ -737,11 +899,21 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
             if global_step % cfg.training.log_interval == 0:
                 print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
 
-    ckpt_path = output_dir / "ace_regression_head.pt"
+    ckpt_name = (
+        f"ace_"
+        f"head-{cfg.model.head_mode}_"
+        f"loss-{cfg.loss.mode}_"
+        f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"  # 处理布尔值
+        f"var-{cfg.loss.scale_reg.variant}_"
+        f"ep{cfg.training.epochs}_"
+        f"buf{cfg.training.buffer_size}"
+        ".pt"
+    )
+    ckpt_path = output_dir / ckpt_name
     torch.save({"state_dict": head.state_dict(), "in_channels": in_channels}, ckpt_path)
     return {"checkpoint": str(ckpt_path), "steps": str(global_step), "in_channels": str(in_channels)}
 
-@hydra.main(version_base=None, config_path="../../configs", config_name="train")
+@hydra.main(version_base=None, config_path="../../configs", config_name="ace_train")
 def main(cfg: DictConfig):
     cfg = OmegaConf.structured(OmegaConf.to_yaml(cfg))
     info = run_training(cfg)
