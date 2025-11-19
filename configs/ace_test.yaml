@@ -10,6 +10,7 @@ mapanything_dataset_metadata_dir: ${machine.mapanything_dataset_metadata_dir}
 root_pretrained_checkpoints_dir: ${machine.root_pretrained_checkpoints_dir}
 root_experiments_dir: ${machine.root_experiments_dir}
 root_uniception_pretrained_checkpoints_dir: ${machine.root_uniception_pretrained_checkpoints_dir}
+device: cuda
 
 fusion:
   stored_feature_file: ???
@@ -26,5 +27,15 @@ head:
   checkpoint: "/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace_regression_head.pt"
   in_channels: 768
 
-eval:
-  max_samples: 50
+seed: 0
+# Disable CUDNN Benchmark (Disable for variable resolution & number of view training)
+disable_cudnn_benchmark: true
+# Batch size for inference (Metrics are computed per multi-view set and averaged, not per batch of multi-view sets)
+batch_size: 10
+# Use mixed precision for inference
+amp: 1
+# Floating point type to use for mixed precision
+amp_dtype: "bf16"
+# 显存优化
+memory_efficient_inference: False
+
