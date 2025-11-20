@@ -35,11 +35,11 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_workers=4 \
         dataset.num_views=$num_views \
         batch_size=$batch_size \
-        model=mapanything \
+        model=map-anything \
         model/task=mvs \
         model.encoder.uses_torch_hub=False \
         model.pretrained='${root_pretrained_checkpoints_dir}/facebook_map-anything.pth' \
-        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_24v_mvs'
+        hydra.run.dir='${root_experiments_dir}/map-anything/benchmarking/dense_'"${num_views}"'_view/mapa_24v_mvs'
 
     echo "Finished running $dataset with batch_size=$batch_size and num_views=$num_views"
 done

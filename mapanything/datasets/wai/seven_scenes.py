@@ -272,7 +272,7 @@ def get_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-rd", "--root_dir", default="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes", type=str)
+    parser.add_argument("-rd", "--root_dir", default="/mnt/storage/xwh/map-anything-dataset/wai_data/7scenes", type=str)
     parser.add_argument(
         "-dmd",
         "--dataset_metadata_dir",

@@ -10,7 +10,7 @@ Before training, setup all the WAI format data following the [Data Processing RE
 
 ```bash
 # Verify BlendedMVS dataloader with Rerun visualization
-python mapanything/datasets/wai/blendedmvs.py \
+python map-anything/datasets/wai/blendedmvs.py \
     --root_dir /path/to/blendedmvs \
     --dataset_metadata_dir /path/to/metadata \
     --num_of_views 4 \

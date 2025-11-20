@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union, Optional
@@ -11,6 +12,7 @@ import hydra
 import math
 import torch
 import torch.nn.functional as F
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -830,7 +832,18 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
     # 使用anyup进行特征图上采样
-    upsampler = torch.hub.load('wimmerth/anyup', 'anyup')  # 如需可：, trust_repo=True
+    hub_dir = torch.hub.get_dir()
+    repo_dir_name = 'wimmerth_anyup_main'  # GitHub 仓库下载后的默认文件夹名
+    local_cache_path = os.path.join(hub_dir, repo_dir_name)
+
+    if os.path.exists(local_cache_path):
+        print(f"Loading AnyUp from local cache: {local_cache_path}")
+        # source='local' 时，第一个参数必须是本地的绝对路径
+        upsampler = torch.hub.load(local_cache_path, 'anyup', source='local', trust_repo=True)
+    else:
+        print("Downloading AnyUp from GitHub...")
+        # 第一次下载，或缓存不存在时使用默认方式
+        upsampler = torch.hub.load('wimmerth/anyup', 'anyup', trust_repo=True)
     upsampler.to(device).eval()  # 推理模式
     # 总迭代次数
     iterations = cfg.training.epochs * (cfg.training.buffer_size // cfg.training.batch_size )
@@ -875,7 +888,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
     if cfg.model.head_mode == "film":
         head = ACEHead_Pointwise_FiLM(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
     else:
-        head = ACEHead_Pointwise_Decoupled_WithScale(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
+        head = ACEHead_Pointwise_Decoupled_WithScale(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim, token_dim=in_channels).to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     output_dir = Path(cfg.training.output_dir).expanduser()
@@ -898,12 +911,20 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
             global_step += 1
             if global_step % cfg.training.log_interval == 0:
                 print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
-
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # 从 Hydra 运行时配置中读取用户选择的 'model/task'
+        task_name = HydraConfig.get().runtime.choices.get("model/task", "default")
+    except Exception:
+        # 如果未通过 Hydra 运行或获取失败，提供默认值
+        task_name = "unknown"
+    # 2. 构建包含 task 名称的文件名
     ckpt_name = (
         f"ace_"
+        f"task-{task_name}_"  # <--- 新增: 将 images_only 添加进去
         f"head-{cfg.model.head_mode}_"
         f"loss-{cfg.loss.mode}_"
-        f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"  # 处理布尔值
+        f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"
         f"var-{cfg.loss.scale_reg.variant}_"
         f"ep{cfg.training.epochs}_"
         f"buf{cfg.training.buffer_size}"

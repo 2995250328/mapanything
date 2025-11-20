@@ -6,10 +6,10 @@ defaults:
   - task: calibrated_sfm
 
 # String for model factory
-model_str: "mapanything"
+model_str: "map-anything"
 # Model config
 model_config:
-  name: "mapanything"
+  name: "map-anything"
   encoder_config: ${model.encoder}
   info_sharing_config: ${model.info_sharing}
   pred_head_config: ${model.pred_head}

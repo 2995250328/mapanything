@@ -27,10 +27,10 @@ for task in "${tasks[@]}"; do
         dataset.num_workers=12 \
         dataset.num_views=2 \
         batch_size=10 \
-        model=mapanything \
+        model=map-anything \
         model/task=$task \
-        model.pretrained='${root_experiments_dir}/mapanything/training/mapa_curri_4v_13d_48ipg_64g/checkpoint-last.pth' \
-        hydra.run.dir='${root_experiments_dir}/mapanything/two_view_benchmarking/mapa_4v_'"${task}"''
+        model.pretrained='${root_experiments_dir}/map-anything/training/mapa_curri_4v_13d_48ipg_64g/checkpoint-last.pth' \
+        hydra.run.dir='${root_experiments_dir}/map-anything/two_view_benchmarking/mapa_4v_'"${task}"''
 
     echo "Finished running with task=$task"
 done

@@ -6,11 +6,6 @@ usage() {
 Usage: seven_scenes_to_wai.sh [--datasets scene1[,scene2...]] [--device DEVICE] [--moge-batch-size N] \
                               [--moge-model PATH_OR_REPO] <processed_root> <wai_output_dir> <conda_env> \
                               [conversion overrides...]
-  processed_root 目录需要包含 pgt_7scenes_* 子目录 (train/test/calibration/depth/poses/rgb)。
-  --datasets 支持用逗号分隔的场景列表，例如 --datasets chess 或 --datasets chess,heads。
-  --device 控制转换与后处理脚本使用的 PyTorch 设备（默认 cuda，可设置为 cpu、cuda:1 等）。
-  --moge-batch-size 指定 MoGe 推理批大小；默认保持配置文件中的设定。
-  --moge-model     覆盖 MoGe 权重位置，可填写本地 .pt 文件路径或 Hugging Face 仓库名。
 EOF
 }
 
@@ -22,34 +17,22 @@ MOGE_MODEL=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --datasets)
-      if [[ $# -lt 2 ]]; then
-        usage
-        exit 1
-      fi
+      if [[ $# -lt 2 ]]; then usage; exit 1; fi
       DATASET_FILTER="$2"
       shift 2
       ;;
     --device)
-      if [[ $# -lt 2 ]]; then
-        usage
-        exit 1
-      fi
+      if [[ $# -lt 2 ]]; then usage; exit 1; fi
       DEVICE="$2"
       shift 2
       ;;
     --moge-batch-size)
-      if [[ $# -lt 2 ]]; then
-        usage
-        exit 1
-      fi
+      if [[ $# -lt 2 ]]; then usage; exit 1; fi
       MOGE_BATCH_SIZE="$2"
       shift 2
       ;;
     --moge-model)
-      if [[ $# -lt 2 ]]; then
-        usage
-        exit 1
-      fi
+      if [[ $# -lt 2 ]]; then usage; exit 1; fi
       MOGE_MODEL="$2"
       shift 2
       ;;
@@ -79,6 +62,20 @@ shift 3
 
 CONVERSION_OVERRIDES=("$@")
 
+# ---------------------------------------------------------
+# 【核心修改】：定义 Python 的绝对路径
+# 逻辑：不再依赖系统 path 中的 conda，而是直接指向 Miniconda3 的环境路径
+# ---------------------------------------------------------
+if [[ "${CONDA_ENV}" == "base" ]]; then
+    PYTHON_CMD="/home/xwh/miniconda3/bin/python"
+else
+    PYTHON_CMD="/home/xwh/miniconda3/envs/${CONDA_ENV}/bin/python"
+fi
+
+echo "Using Python executable: ${PYTHON_CMD}"
+
+# ---------------------------------------------------------
+
 if [[ -n "${DATASET_FILTER}" ]]; then
   IFS=',' read -r -a _dataset_array <<< "${DATASET_FILTER}"
   dataset_entries=()
@@ -102,15 +99,14 @@ mkdir -p "${WAI_DIR}"
 
 set -x
 
-conda run -n "${CONDA_ENV}" \
-  python -m wai_processing.scripts.conversion.seven_scenes \
+# 修改：直接使用 PYTHON_CMD 替代 conda run -n ... python
+"${PYTHON_CMD}" -m wai_processing.scripts.conversion.seven_scenes \
   original_root="${PROCESSED_ROOT}" \
   root="${WAI_DIR}" \
   device="${DEVICE}" \
   "${CONVERSION_OVERRIDES[@]}"
 
-conda run -n "${CONDA_ENV}" \
-  python -m wai_processing.scripts.covisibility \
+"${PYTHON_CMD}" -m wai_processing.scripts.covisibility \
   "${REPO_ROOT}/data_processing/wai_processing/configs/covisibility/covisibility_gt_depth_224x224.yaml" \
   root="${WAI_DIR}" \
   device="${DEVICE}"
@@ -128,6 +124,5 @@ if [[ -n "${MOGE_MODEL}" ]]; then
   MOGE_ARGS+=("model_path=${MOGE_MODEL}")
 fi
 
-conda run -n "${CONDA_ENV}" \
-  python -m wai_processing.scripts.run_moge \
+"${PYTHON_CMD}" -m wai_processing.scripts.run_moge \
   "${MOGE_ARGS[@]}"

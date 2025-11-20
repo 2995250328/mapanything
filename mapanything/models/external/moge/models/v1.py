@@ -304,7 +304,7 @@ class MoGeModel(nn.Module):
         # Minimal modifications have been made: removing irrelevant code, unnecessary warnings and fixing importing issues.
         hub_loader = getattr(
             importlib.import_module(
-                "mapanything.models.external.dinov2.hub.backbones", __package__
+                "map-anything.models.external.dinov2.hub.backbones", __package__
             ),
             encoder,
         )

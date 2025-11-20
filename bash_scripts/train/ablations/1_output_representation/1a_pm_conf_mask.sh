@@ -28,4 +28,4 @@ torchrun --nproc_per_node ${NUM_GPUS} \
     train_params.warmup_epochs=5 \
     train_params.keep_freq=100 \
     train_params.max_num_of_imgs_per_gpu=24 \
-    hydra.run.dir='${root_experiments_dir}/mapanything/training_ablations/1a_pm_conf_mask'
+    hydra.run.dir='${root_experiments_dir}/map-anything/training_ablations/1a_pm_conf_mask'

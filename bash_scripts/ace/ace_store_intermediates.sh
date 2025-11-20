@@ -21,7 +21,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
 
     echo "Running $dataset with batch_size=$batch_size, num_views=$num_views (ACE AA feature capture enabled)"
 
-    run_dir_cli='${root_experiments_dir}/ace_tasks/mapanything/'"${dataset}"'_'"${num_views}"'v_aa_capture'
+    run_dir_cli='${root_experiments_dir}/ace_tasks/map-anything/'"${dataset}"'_'"${num_views}"'v_aa_capture'
 
     python3 \
         benchmarking/dense_n_view/benchmark.py \
@@ -35,7 +35,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model.encoder.uses_torch_hub=True \
         model.pretrained='${root_pretrained_checkpoints_dir}/facebook_map-anything.pth' \
         memory_efficient_inference=True \
-        hydra.run.dir='${root_experiments_dir}/ace_tasks/mapanything/'"${dataset}"'_'"${num_views}"'v_aa_capture'
+        hydra.run.dir='${root_experiments_dir}/ace_tasks/map-anything/'"${dataset}"'_'"${num_views}"'v_aa_capture'
 
     echo "Finished $dataset with ACE AA feature capture. Each run writes an info_sharing_outputs.pt file under ${run_dir_cli}/ACE/aa_blocks."
 done

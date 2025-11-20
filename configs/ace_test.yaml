@@ -24,7 +24,7 @@ loss:
 
 head:
   hidden_dim: 256
-  checkpoint: "/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace_regression_head.pt"
+  checkpoint: "/home/xwh/project/map-anything-experiments/map-anything/memory/ace_dataset/ace_regression/ace_regression_head.pt"
   in_channels: 768
 
 seed: 0

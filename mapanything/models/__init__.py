@@ -61,7 +61,7 @@ def init_model(
 # Define model configurations with import paths
 MODEL_CONFIGS = {
     # Core models
-    "mapanything": {
+    "map-anything": {
         "class": MapAnything,
     },
     "mapanything_ablations": {
@@ -72,39 +72,39 @@ MODEL_CONFIGS = {
     },
     # External models
     "anycalib": {
-        "module": "mapanything.models.external.anycalib",
+        "module": "map-anything.models.external.anycalib",
         "class_name": "AnyCalibWrapper",
     },
     "dust3r": {
-        "module": "mapanything.models.external.dust3r",
+        "module": "map-anything.models.external.dust3r",
         "class_name": "DUSt3RBAWrapper",
     },
     "mast3r": {
-        "module": "mapanything.models.external.mast3r",
+        "module": "map-anything.models.external.mast3r",
         "class_name": "MASt3RSGAWrapper",
     },
     "moge": {
-        "module": "mapanything.models.external.moge",
+        "module": "map-anything.models.external.moge",
         "class_name": "MoGeWrapper",
     },
     "must3r": {
-        "module": "mapanything.models.external.must3r",
+        "module": "map-anything.models.external.must3r",
         "class_name": "MUSt3RWrapper",
     },
     "pi3": {
-        "module": "mapanything.models.external.pi3",
+        "module": "map-anything.models.external.pi3",
         "class_name": "Pi3Wrapper",
     },
     "pow3r": {
-        "module": "mapanything.models.external.pow3r",
+        "module": "map-anything.models.external.pow3r",
         "class_name": "Pow3RWrapper",
     },
     "pow3r_ba": {
-        "module": "mapanything.models.external.pow3r",
+        "module": "map-anything.models.external.pow3r",
         "class_name": "Pow3RBAWrapper",
     },
     "vggt": {
-        "module": "mapanything.models.external.vggt",
+        "module": "map-anything.models.external.vggt",
         "class_name": "VGGTWrapper",
     },
     # Add other model classes here

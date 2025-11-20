@@ -2,7 +2,7 @@
 
 defaults:
   - /machine: default
-  - /model: mapanything
+  - /model: map-anything
   - /model/task: images_only
   # 使用一个肯定包含 dataset_str 的默认数据集
   - /dataset: seven_scenes_wai/test/default

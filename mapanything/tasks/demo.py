@@ -73,7 +73,7 @@ def run_demo(cfg: DictConfig):
         num_views=cfg.dataset.num_views,
         split="test",
         covisibility_thres=0.025,
-        ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes",
+        ROOT="/mnt/storage/xwh/map-anything-dataset/wai_data/7scenes",
         dataset_metadata_dir="/mnt/storage/xwh/map-anything/mapanything_dataset_metadata",
         sample_specific_scene=True,
         specific_scene_name='chess_test',

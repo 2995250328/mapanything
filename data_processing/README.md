@@ -140,7 +140,7 @@ cd <path to map-anything>
 # Arguments: <processed_root> <wai_output_dir> <conda_env>
 bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
           /mnt/storage/xwh/7Scenes \
-          /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
+          /mnt/storage/xwh/map-anything-dataset/wai_data/7scenes \
           wai_processing
 ```
 
@@ -155,7 +155,7 @@ python data_processing/wai_processing/download_scripts/download_7scenes.py \
 
 python -m wai_processing.scripts.conversion.seven_scenes \
           original_root=/mnt/storage/xwh/7Scenes \
-          root=/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes
+          root=/mnt/storage/xwh/map-anything-dataset/wai_data/7scenes
 ```
 
 ### Batch Processing using SLURM
@@ -198,7 +198,7 @@ For ease of visualizing WAI format data after conversion, we provide a simple Re
 
 ```bash
 cd <path to map-anything>
-conda activate mapanything # need to use the default mapanything env
+conda activate map-anything # need to use the default map-anything env
 python3 data_processing/viz_data.py -h
 ```
 

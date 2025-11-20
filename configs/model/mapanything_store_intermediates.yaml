@@ -1,5 +1,5 @@
 # MapAnything configuration that enables caching alternating-attention transformer features
-# during inference. Derived from the default mapanything config with storage toggles enabled.
+# during inference. Derived from the default map-anything config with storage toggles enabled.
 defaults:
   - default
   - encoder: dinov2_large
@@ -7,9 +7,9 @@ defaults:
   - pred_head: dpt_pose_scale
   - task: images_and_full_geometry
 
-model_str: "mapanything"
+model_str: "map-anything"
 model_config:
-  name: "mapanything"
+  name: "map-anything"
   encoder_config: ${model.encoder}
   info_sharing_config: ${model.info_sharing}
   pred_head_config: ${model.pred_head}

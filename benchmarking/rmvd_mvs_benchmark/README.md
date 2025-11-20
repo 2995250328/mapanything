@@ -37,9 +37,9 @@ python scripts/convert_hf_to_benchmark_checkpoint.py \
 
    ```python
    def get_model_settings(model: str, dataset: str):
-       if model == "mapanything":
+       if model == "map-anything":
            return {
-               "model": "mapanything",
+               "model": "map-anything",
                "model.pretrained": "/path/to/your/converted/checkpoint.pth",  # Update this path (can be any checkpoint from training or the above generated checkpoints)
                "evaluation_resolution": "\\${dataset.resolution_options.518_1_33_ar}"
                if dataset != "kitti"

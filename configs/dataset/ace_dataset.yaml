@@ -16,7 +16,7 @@ resolution_test_seven_scenes: ${dataset.resolution_options.518_1_33_ar}
 
 sample_specific_scene: True
 specific_scene_name: 'chess_train'
-sequential_view_mode: True
+sequential_view_mode: False
 
 # Training Set
 train_dataset:

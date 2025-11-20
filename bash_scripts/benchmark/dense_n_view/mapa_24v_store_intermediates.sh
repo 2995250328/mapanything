@@ -18,7 +18,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
 
     echo "Running $dataset with batch_size=$batch_size, num_views=$num_views (AA feature capture enabled)"
 
-    run_dir_cli='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_24v_store_intermediates'
+    run_dir_cli='${root_experiments_dir}/map-anything/benchmarking/dense_'"${num_views}"'_view/mapa_24v_store_intermediates'
 
     python3 \
         benchmarking/dense_n_view/benchmark.py \
