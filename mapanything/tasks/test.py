@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -13,18 +14,33 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from mapanything.datasets import SevenScenesWAI
 from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
-from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled_WithScale, ACEHead_Pointwise_FiLM, load_memory_features, move_view_to_device, load_regression_head
-from mapanything.tasks.train import (
-    _loss_fn,
-    _prepare_targets,
-    _resolve_intrinsics,
-    _resolve_pose,
+from mapanything.tasks.ace import (
+    ACEHead_Pointwise_Decoupled_WithScale,
+    ACEHead_Pointwise_FiLM,
+    load_memory_features,
+    load_regression_head,
+    move_view_to_device,
 )
+from mapanything.tasks.train import _prepare_targets
+
+def _build_head(cfg: DictConfig) -> torch.nn.Module:
+    head_type = getattr(cfg.head, "type", "film").lower()
+    if head_type == "decoupled":
+        return ACEHead_Pointwise_Decoupled_WithScale(
+            in_channels=cfg.head.in_channels,
+            token_dim=getattr(cfg.head, "token_dim", cfg.head.hidden_dim),
+            hidden_dim=cfg.head.hidden_dim,
+        )
+    return ACEHead_Pointwise_FiLM(
+        in_channels=cfg.head.in_channels,
+        hidden_dim=cfg.head.hidden_dim,
+    )
+
 
 def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
+    logger = _logger or logging.getLogger(__name__)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
@@ -33,7 +49,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    head = ACEHead_Pointwise_FiLM(in_channels=cfg.head.in_channels, hidden_dim=cfg.head.hidden_dim)
+    head = _build_head(cfg)
     head_ckpt = getattr(cfg.head, "checkpoint", None)
     if head_ckpt:
         report = load_regression_head(
@@ -44,13 +60,13 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             allowed_prefixes=("", "module.", "head.", "reg_head.", "ace_head."),
             rename_map=None,  # 如需兼容旧命名，传映射表
         )
-        _logger.info(
+        logger.info(
             "Loaded regression head from %s | used=%d, total_in_ckpt=%d, missing=%d, unexpected=%d, skipped_shape=%d",
             head_ckpt, report["used_from_ckpt"], report["total_in_ckpt"],
             len(report["missing"]), len(report["unexpected"]), len(report["skipped_shape"])
         )
         if report["skipped_shape"]:
-            _logger.debug("Skipped (shape mismatch): %s", report["skipped_shape"][:10])
+            logger.debug("Skipped (shape mismatch): %s", report["skipped_shape"][:10])
     head.eval().to(device)
 
     memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
@@ -63,22 +79,18 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     if dataset is None:
         raise ValueError("Dataset not initialized properly.")
 
-        # 创建顺序读取的 Dataloader
+    # 创建顺序读取的 Dataloader
     if cfg.dataset.sequential_view_mode:
         dataloader = DataLoader(
             dataset,
             batch_size=1,
             shuffle=False,  # 关键：顺序读取，不打乱
-            num_workers=4,  # 适当增加 worker 加速数据读取
-            collate_fn=dataset.collate_fn if hasattr(dataset, 'collate_fn') else None
+            num_workers=int(getattr(cfg.dataset, "num_workers", 4)),
+            collate_fn=dataset.collate_fn if hasattr(dataset, "collate_fn") else None,
         )
     else:
-        # 如果没有开启顺序模式，为了兼容下方循环，也创建一个临时的 loader
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=dataset.collate_fn)
+        dataloader = ForcedRandomDataLoader(dataset=dataset, batch_size=1)
 
-        # =========================================
-        # 2. 准备推理组件
-        # =========================================
     output_dir = Path(cfg.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,7 +104,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     metrics: List[Dict[str, float]] = []
     saved_metadata: List[Dict[str, Any]] = []
 
-    print(f"Starting inference on {len(dataset)} frames...")
+    logger.info("Starting inference on %d frames...", len(dataset))
 
     # =========================================
     # 3. 主推理循环
@@ -104,20 +116,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             break
 
         batch = batch_data
-        # 移除不必要的键
-        for view in batch:
-            if "idx" in view:
-                view["idx"] = view["idx"][2:]
-        # 转到 GPU（忽略无关键）
-        ignore_keys = {
-            "dataset", "label", "instance", "idx",
-            "true_shape", "rng", "data_norm_type",
-        }
-        for view in batch:
-            for name in list(view.keys()):
-                if name in ignore_keys:
-                    continue
-                view[name] = view[name].to(device, non_blocking=True)
+        batch = [move_view_to_device(view, device) for view in batch]
 
         # -------------------------------------------------
         # A. 模型推理 (Model + Head)
@@ -128,7 +127,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
                 query_view=batch,
                 device=str(device),
-                memory_feats=memory_feats,
+                memory_tokens_per_block=memory_feats,
                 additional_tokens=memory_token,
                 memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                 memory_efficient_inference=cfg.fusion.memory_efficient_inference,
@@ -142,29 +141,30 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         elif isinstance(preds, dict):
             scale = preds.get("scale", None)
             preds = preds["preds"]
-        # flatten BCHW 情况（通常你的缓冲区已是 [N,4]；这里容错）
-        if preds.dim() == 4:  # [B,4,H,W] -> [N,4]
-            B, C, H, W = preds.shape
-            preds = preds.permute(0, 2, 3, 1).reshape(-1, C)
-        coords_pred_in = preds[:, :3]  # 若带 scale，这是 XYZ_unit；否则是有尺度 XYZ
-        raw = preds[:, 3]  # 异方差 raw
-        # 如果提供了 scale，则这是 Decoupled 情况：先把无尺度坐标乘回尺度
+
+        if preds.dim() == 2:
+            preds = preds.view(preds.shape[0], preds.shape[1], 1, 1)
+
+        coords_raw = preds[:, :3]
+        conf_logits = preds[:, 3:4]
         if scale is not None:
-            scale = scale.to(device).view(-1)  # [N]
-            coords_unit = coords_pred_in  # for scale regularization('unit')
-            coords = coords_unit * scale.unsqueeze(-1)  # 有尺度坐标，进入主监督
+            scale = scale.to(device)
+            while scale.dim() < coords_raw.dim():
+                scale = scale.unsqueeze(-1)
+            pred_coords = coords_raw * scale
         else:
-            coords_unit = None
-            pred_coords = coords_pred_in  # FiLM 情况：已是有尺度
+            pred_coords = coords_raw
 
         view = batch[0]
         target_world, valid_mask = _prepare_targets(view, device)
+        valid_mask_bool = valid_mask.bool()
+        pred_coords = pred_coords.to(target_world.dtype)
 
         # 计算 L2 距离 (Euclidean Distance)
         diff = pred_coords - target_world
-        dist = torch.norm(diff, dim=-1)  # (H, W)
+        dist = torch.norm(diff, dim=1)  # (B, H, W)
         # 仅在有效区域计算
-        valid_dist = dist[valid_mask]
+        valid_dist = dist[valid_mask_bool]
 
         batch_metrics = {}
         if valid_dist.numel() > 0:
@@ -186,7 +186,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         # 压缩保存以节省空间
         torch.save({
             "coords_world": pred_coords.half().cpu(),  # 转半精度保存
-            "confidence": torch.sigmoid(preds[0, :, :, 3:4]).half().cpu(),
+            "confidence": torch.sigmoid(conf_logits).half().cpu(),
             "metrics": batch_metrics,
             "scene": scene_name
         }, save_path)
@@ -201,9 +201,9 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     if metrics:
         keys = metrics[0].keys()
         mean_metrics = {k: float(np.mean([m[k] for m in metrics])) for k in keys}
-        print("\nGlobal Metrics:")
+        logger.info("\nGlobal Metrics:")
         for k, v in mean_metrics.items():
-            print(f"  {k}: {v:.4f}")
+            logger.info("  %s: %.4f", k, v)
     else:
         mean_metrics = {}
 
