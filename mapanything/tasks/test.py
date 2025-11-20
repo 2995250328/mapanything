@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+import cv2
 import hydra
 import numpy as np
 import torch
@@ -14,6 +17,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+import dsacstar
 from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
 from mapanything.tasks.ace import (
@@ -23,7 +27,7 @@ from mapanything.tasks.ace import (
     load_regression_head,
     move_view_to_device,
 )
-from mapanything.tasks.train import _prepare_targets
+from mapanything.tasks.train import _prepare_targets, _resolve_pose
 
 def _build_head(cfg: DictConfig) -> torch.nn.Module:
     head_type = getattr(cfg.head, "type", "film").lower()
@@ -37,6 +41,13 @@ def _build_head(cfg: DictConfig) -> torch.nn.Module:
         in_channels=cfg.head.in_channels,
         hidden_dim=cfg.head.hidden_dim,
     )
+
+
+def _get_eval_attr(cfg: DictConfig, name: str, default: Any) -> Any:
+    eval_cfg = getattr(cfg, "eval", None)
+    if eval_cfg is not None and hasattr(eval_cfg, name):
+        return getattr(eval_cfg, name)
+    return getattr(cfg, name, default)
 
 
 def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
@@ -80,7 +91,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         raise ValueError("Dataset not initialized properly.")
 
     # 创建顺序读取的 Dataloader
-    if cfg.dataset.sequential_view_mode:
+    if bool(getattr(cfg.dataset, "sequential_view_mode", False)):
         dataloader = DataLoader(
             dataset,
             batch_size=1,
@@ -101,30 +112,31 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     model.eval()
     head.eval()
 
-    metrics: List[Dict[str, float]] = []
     saved_metadata: List[Dict[str, Any]] = []
+    rErrs: List[float] = []
+    tErrs_cm: List[float] = []
+    pct10_5 = pct5 = pct2 = pct1 = 0
+    total_time = 0.0
+    num_frames = 0
 
     logger.info("Starting inference on %d frames...", len(dataset))
 
-    # =========================================
-    # 3. 主推理循环
-    # =========================================
-    # 使用 dataloader 进行遍历
+    max_samples = _get_eval_attr(cfg, "max_samples", None)
+    hyps = int(_get_eval_attr(cfg, "hypotheses", 64))
+    threshold = float(_get_eval_attr(cfg, "threshold", 10.0))
+    inlieralpha = float(_get_eval_attr(cfg, "inlieralpha", 100.0))
+    maxpixelerror = float(_get_eval_attr(cfg, "maxpixelerror", 100.0))
+    output_subsample = int(getattr(head, "OUTPUT_SUBSAMPLE", 1))
+
     for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Evaluating")):
-        # 限制测试数量 (可选)
-        if cfg.eval.max_samples is not None and batch_idx >= cfg.eval.max_samples:
+        if max_samples is not None and batch_idx >= max_samples:
             break
 
-        batch = batch_data
-        batch = [move_view_to_device(view, device) for view in batch]
+        batch = [move_view_to_device(view, device) for view in batch_data]
 
-        # -------------------------------------------------
-        # A. 模型推理 (Model + Head)
-        # -------------------------------------------------
+        start_time = time.time()
         with torch.no_grad():
-            # 1. 提取特征
-            # 注意：query_view 通常期望是一个 list of dicts
-            fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
+            fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
                 query_view=batch,
                 device=str(device),
                 memory_tokens_per_block=memory_feats,
@@ -156,60 +168,128 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             pred_coords = coords_raw
 
         view = batch[0]
-        target_world, valid_mask = _prepare_targets(view, device)
-        valid_mask_bool = valid_mask.bool()
+        target_world, _ = _prepare_targets(view, device)
         pred_coords = pred_coords.to(target_world.dtype)
 
-        # 计算 L2 距离 (Euclidean Distance)
-        diff = pred_coords - target_world
-        dist = torch.norm(diff, dim=1)  # (B, H, W)
-        # 仅在有效区域计算
-        valid_dist = dist[valid_mask_bool]
+        # Run DSAC++ to recover pose from predicted scene coordinates
+        scene_coordinates = pred_coords[0].float().cpu()
+        out_pose = torch.zeros((4, 4))
 
-        batch_metrics = {}
-        if valid_dist.numel() > 0:
-            mae = valid_dist.mean().item()
+        intrinsics = torch.as_tensor(view["camera_intrinsics"], dtype=torch.float32)
+        if intrinsics.dim() == 3:
+            intrinsics = intrinsics[0]
+        focal_length = intrinsics[0, 0].item()
+        ppX = intrinsics[0, 2].item()
+        ppY = intrinsics[1, 2].item()
 
-            # 记录指标 (单位通常是米，取决于数据集)
-            batch_metrics = {
-                "MAE": mae,
-                "Acc_5cm": (valid_dist < 0.05).float().mean().item() * 100,
-                "Acc_10cm": (valid_dist < 0.10).float().mean().item() * 100,
-            }
-            metrics.append(batch_metrics)
+        inlier_count = dsacstar.forward_rgb(
+            scene_coordinates.unsqueeze(0),
+            out_pose,
+            hyps,
+            threshold,
+            focal_length,
+            ppX,
+            ppY,
+            inlieralpha,
+            maxpixelerror,
+            output_subsample,
+        )
 
-        # 保存预测的坐标云用于后续可视化或对齐
+        gt_pose = _resolve_pose(view, device=torch.device("cpu"))[0]
+        t_err_m = float(torch.norm(gt_pose[0:3, 3] - out_pose[0:3, 3]))
+
+        gt_R = gt_pose[0:3, 0:3].numpy()
+        out_R = out_pose[0:3, 0:3].numpy()
+        r_err_mat = np.matmul(out_R, np.transpose(gt_R))
+        r_err = cv2.Rodrigues(r_err_mat)[0]
+        r_err = np.linalg.norm(r_err) * 180 / math.pi
+
+        logger.info(
+            "Frame %d | Rotation Error: %.2fdeg, Translation Error: %.1fcm, Inliers: %d",
+            batch_idx,
+            r_err,
+            t_err_m * 100,
+            inlier_count,
+        )
+
+        rErrs.append(r_err)
+        t_err_cm = t_err_m * 100
+        tErrs_cm.append(t_err_cm)
+        num_frames += 1
+
+        if r_err < 5 and t_err_m < 0.1:
+            pct10_5 += 1
+        if r_err < 5 and t_err_m < 0.05:
+            pct5 += 1
+        if r_err < 2 and t_err_m < 0.02:
+            pct2 += 1
+        if r_err < 1 and t_err_m < 0.01:
+            pct1 += 1
+
+        elapsed = time.time() - start_time
+        total_time += elapsed
+
         scene_name = view.get("label") or view.get("scene_name") or f"scene_{batch_idx}"
-        file_name = Path(view.get("instance", f"{batch_idx}")).stem  # 获取原始文件名
+        file_name = Path(view.get("instance", f"{batch_idx}")).stem
         save_path = output_dir / f"{scene_name}_{file_name}_pred.pt"
 
-        # 压缩保存以节省空间
-        torch.save({
-            "coords_world": pred_coords.half().cpu(),  # 转半精度保存
-            "confidence": torch.sigmoid(conf_logits).half().cpu(),
-            "metrics": batch_metrics,
-            "scene": scene_name
-        }, save_path)
+        torch.save(
+            {
+                "coords_world": pred_coords.half().cpu(),
+                "confidence": torch.sigmoid(conf_logits).half().cpu(),
+                "scene": scene_name,
+                "rotation_error_deg": float(r_err),
+                "translation_error_cm": float(t_err_cm),
+                "inlier_count": int(inlier_count),
+            },
+            save_path,
+        )
 
-        saved_metadata.append({
-            "index": batch_idx,
-            "scene": scene_name,
-            "path": str(save_path),
-            **batch_metrics
-        })
+        saved_metadata.append(
+            {
+                "index": batch_idx,
+                "scene": scene_name,
+                "path": str(save_path),
+                "rotation_error_deg": float(r_err),
+                "translation_error_cm": float(t_err_cm),
+                "inlier_count": int(inlier_count),
+            }
+        )
 
-    if metrics:
-        keys = metrics[0].keys()
-        mean_metrics = {k: float(np.mean([m[k] for m in metrics])) for k in keys}
-        logger.info("\nGlobal Metrics:")
-        for k, v in mean_metrics.items():
-            logger.info("  %s: %.4f", k, v)
-    else:
-        mean_metrics = {}
+    assert len(rErrs) == num_frames
+    rErrs.sort()
+    tErrs_cm.sort()
+    median_idx = len(rErrs) // 2 if rErrs else 0
+    median_rErr = rErrs[median_idx] if rErrs else 0.0
+    median_tErr = tErrs_cm[median_idx] if tErrs_cm else 0.0
+
+    pct10_5 = pct10_5 / num_frames * 100 if num_frames else 0.0
+    pct5 = pct5 / num_frames * 100 if num_frames else 0.0
+    pct2 = pct2 / num_frames * 100 if num_frames else 0.0
+    pct1 = pct1 / num_frames * 100 if num_frames else 0.0
+    avg_time = total_time / num_frames if num_frames else 0.0
+
+    logger.info("===================================================")
+    logger.info("Test complete.")
+    logger.info("Accuracy:")
+    logger.info("\t10cm/5deg: %.1f%%", pct10_5)
+    logger.info("\t5cm/5deg: %.1f%%", pct5)
+    logger.info("\t2cm/2deg: %.1f%%", pct2)
+    logger.info("\t1cm/1deg: %.1f%%", pct1)
+    logger.info("Median Error: %.1fdeg, %.1fcm", median_rErr, median_tErr)
+    logger.info("Avg. processing time: %4.1fms", avg_time * 1000)
 
     summary = {
         "outputs": saved_metadata,
-        "global_metrics": mean_metrics,
+        "global_metrics": {
+            "median_rotation_error_deg": median_rErr,
+            "median_translation_error_cm": median_tErr,
+            "pct_10cm_5deg": pct10_5,
+            "pct_5cm_5deg": pct5,
+            "pct_2cm_2deg": pct2,
+            "pct_1cm_1deg": pct1,
+            "avg_time_ms": avg_time * 1000,
+        },
     }
 
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
