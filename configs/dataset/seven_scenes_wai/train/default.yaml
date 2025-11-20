@@ -2,7 +2,7 @@ dataset_str:
   "SevenScenesWAI(
     split='${dataset.seven_scenes_wai.train.split}',
     sample_specific_scene=${oc.select:dataset.sample_specific_scene, None},
-    specific_scene_name='${oc.select:dataset.specific_scene_name, None}',
+    specific_scene_name='${oc.select:dataset.specific_scene_name_train, None}',
     resolution=${dataset.seven_scenes_wai.train.dataset_resolution},
     principal_point_centered=${dataset.seven_scenes_wai.train.principal_point_centered},
     aug_crop=${dataset.seven_scenes_wai.train.aug_crop},

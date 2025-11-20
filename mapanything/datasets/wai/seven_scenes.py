@@ -28,7 +28,7 @@ class SevenScenesWAI(BaseDataset):
             overfit_num_sets=None,
             sample_specific_scene: bool = False,
             specific_scene_name: str = None,
-            sequential_view_mode: bool = False,  # 新增参数：是否开启顺序视图遍历模式
+            sequential_view_mode: bool = False,  # [修复] 显式添加参数，将其从 kwargs 中剥离
             **kwargs,
     ):
         """

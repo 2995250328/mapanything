@@ -831,11 +831,11 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
     if cfg.model.pretrained:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
+
     # 使用anyup进行特征图上采样
     hub_dir = torch.hub.get_dir()
     repo_dir_name = 'wimmerth_anyup_main'  # GitHub 仓库下载后的默认文件夹名
     local_cache_path = os.path.join(hub_dir, repo_dir_name)
-
     if os.path.exists(local_cache_path):
         print(f"Loading AnyUp from local cache: {local_cache_path}")
         # source='local' 时，第一个参数必须是本地的绝对路径
