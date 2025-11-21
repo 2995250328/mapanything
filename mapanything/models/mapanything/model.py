@@ -6,7 +6,7 @@
 """
 MapAnything model class defined using UniCeption modules.
 """
-
+import copy
 import warnings
 import dataclasses
 from datetime import datetime
@@ -1766,6 +1766,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 final_info_sharing_multi_view_feat,
                 intermediate_info_sharing_multi_view_feat,
             ) = self.info_sharing(info_sharing_input)
+        dpt_info_sharing_multi_view_feat = intermediate_info_sharing_multi_view_feat
 
         def _detach_clone_tree(x):
             """递归复制：Tensor -> detach().clone()；容器 -> 递归处理；其他 -> deepcopy。"""

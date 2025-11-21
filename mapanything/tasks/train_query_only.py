@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Mapping
 
 import hydra
 import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -25,7 +26,168 @@ from mapanything.tasks.train import (
     _resolve_intrinsics,
     _resolve_pose,
 )
+from mapanything.utils.debugprinter import DebugPrinter
+printer = DebugPrinter()
 
+def _sanity_check_buffer_reprojection(
+    buffer: FeatureReplayBuffer,
+    device: torch.device,
+    max_samples: int = 4096,
+    num_workers: int = 0,
+):
+    """
+    从 FeatureReplayBuffer 中随机抽一批样本：
+      - 使用 target_world (世界坐标), intrinsics, c2w
+        进行 world->cam->image 投影；
+      - 对比投影得到的 (û, ṽ) 与 buffer 中存的像素 (u', v') 的误差。
+    如果误差很大，说明特征与真值/像素坐标存在对齐问题。
+    """
+    from torch.utils.data import DataLoader
+
+    tmp_dataset = BufferDataset(buffer)
+    if len(tmp_dataset) == 0:
+        print("[SanityCheck] Buffer 为空，跳过重投影检查。")
+        return
+
+    batch_size = min(max_samples, len(tmp_dataset))
+    tmp_loader = DataLoader(
+        tmp_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
+
+    batch = next(iter(tmp_loader))
+
+    # 期望 BufferDataset __getitem__ 返回以下字段：
+    #   - batch["target_world"]: [N,3]
+    #   - batch["intrinsics"]:  [N,3,3]
+    #   - batch["c2w"]:         [N,4,4] 或 [N,3,4]
+    #   - batch["pixels"]:      [N,2]   (u', v')
+    target_world = batch["target_world"].to(device).to(torch.float64)  # (N,3)
+    intrinsics = batch["intrinsics"].to(device).to(torch.float64)     # (N,3,3)
+    c2w = batch["c2w"].to(device).to(torch.float64)                   # (N,*,*)
+    pixels = batch["pixels"].to(device).to(torch.float64)             # (N,2)
+
+    N = target_world.shape[0]
+
+    # ---- 世界坐标 -> 齐次坐标 ----
+    ones = torch.ones(N, 1, dtype=torch.float64, device=device)
+    pts_w_h = torch.cat([target_world, ones], dim=-1)   # (N,4)
+
+    # ---- 统一 c2w 为 (N,4,4)，再求 w2c ----
+    if c2w.shape[-2:] == (3, 4):
+        # pad 成 4x4
+        pad_row = torch.tensor([0, 0, 0, 1], dtype=torch.float64, device=device)
+        pad_row = pad_row.view(1, 1, 4).expand(N, 1, 4)  # (N,1,4)
+        c2w_4x4 = torch.cat([c2w, pad_row], dim=-2)      # (N,4,4)
+    elif c2w.shape[-2:] == (4, 4):
+        c2w_4x4 = c2w
+    else:
+        raise ValueError(f"[SanityCheck] Unexpected c2w shape: {c2w.shape}")
+
+    w2c = torch.inverse(c2w_4x4)                         # (N,4,4)
+
+    # ---- world -> cam ----
+    pts_c_h = torch.bmm(w2c, pts_w_h.unsqueeze(-1)).squeeze(-1)  # (N,4)
+    Xc = pts_c_h[:, 0]
+    Yc = pts_c_h[:, 1]
+    Zc = pts_c_h[:, 2]
+
+    # ---- 用 intrinsics 投影到像素 ----
+    fx = intrinsics[:, 0, 0]
+    fy = intrinsics[:, 1, 1]
+    cx = intrinsics[:, 0, 2]
+    cy = intrinsics[:, 1, 2]
+
+    Z_safe = Zc.clamp(min=1e-6)
+    u_proj = fx * (Xc / Z_safe) + cx
+    v_proj = fy * (Yc / Z_safe) + cy
+
+    # ---- 与 buffer 中的采样像素比较 ----
+    u_ref = pixels[:, 0]
+    v_ref = pixels[:, 1]
+
+    du = u_proj - u_ref
+    dv = v_proj - v_ref
+    err = torch.sqrt(du * du + dv * dv)  # 像素 L2 误差
+
+    mean_err = err.mean().item()
+    med_err = err.median().item()
+    q90_err = err.quantile(0.9).item()
+    max_err = err.max().item()
+
+    print("[SanityCheck] Buffer reprojection error (target_world -> cam -> image):")
+    print(f"  N samples    = {N}")
+    print(f"  mean  pix err = {mean_err:.4f}")
+    print(f"  median pix err = {med_err:.4f}")
+    print(f"  90%   pix err = {q90_err:.4f}")
+    print(f"  max    pix err = {max_err:.4f}")
+
+    # 你也可以在这里加一个简单的 guard，比如误差过大时直接报错：
+    # if mean_err > 3.0:
+    #     raise RuntimeError(f"[SanityCheck] Mean reprojection error {mean_err:.2f} > 3px, 对齐可能有问题。")
+
+def _eval_head_on_buffer_once(
+    head: nn.Module,
+    buffer: FeatureReplayBuffer,
+    repro_loss: ReproLoss,
+    loss_cfg: DictConfig,
+    device: torch.device,
+    global_step: int,
+    max_samples: int = 4096,
+    num_workers: int = 0,
+) -> Dict[str, float]:
+    """
+    从 FeatureReplayBuffer 中随机抽一批样本，在当前 head 上做一次前向：
+      - 使用 _loss_fn + ReproLoss 计算 loss 和 metrics
+      - metrics 中通常会包含 xyz/reproj 相关的误差（取决于 _loss_fn 的实现）
+    返回一个扁平化的 dict，key 带 'eval_' 前缀，方便和训练日志区分。
+    """
+    if buffer.size == 0:
+        print("[EvalOnBuffer] Buffer 为空，跳过评估。")
+        return {}
+
+    ds = BufferDataset(buffer)
+    batch_size = min(max_samples, len(ds))
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
+
+    batch = next(iter(loader))  # 抽一批样本
+
+    # 和训练时保持一致：features & scale_token 上 device，其余交给 _loss_fn 内部处理
+    features = batch["features"].to(device)
+    scale = batch["scale_token"].to(device)
+
+    head_was_training = head.training
+    head.eval()
+    with torch.no_grad():
+        preds = head(features, scale)
+        # 这里直接调用你原来的 _loss_fn，它会内部做 reprojection / xyz loss
+        loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, loss_cfg)
+
+    if head_was_training:
+        head.train()
+
+    # 整理成纯 float 的 dict，所有 key 加上 'eval_' 前缀
+    out: Dict[str, float] = {}
+    out["eval_total_loss"] = float(loss.item())
+    if isinstance(metrics, Mapping):
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().item()
+            try:
+                out[f"eval_{k}"] = float(v)
+            except Exception:
+                # 避免非标量（比如 list）的情况
+                pass
+
+    return out
 
 def _collect_buffer_query_only(
     cfg: DictConfig,
@@ -58,7 +220,10 @@ def _collect_buffer_query_only(
 
             with torch.no_grad():
                 memory_tokens = [None] * getattr(model.info_sharing, "depth", 24)
-                scale_token = model.scale_token.view(1, -1, 1).to(device)
+                scale_token = nn.Parameter(torch.zeros(model.encoder.enc_embed_dim))
+                torch.nn.init.trunc_normal_(scale_token, std=0.02)
+                scale_token = scale_token.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1).to(device)
+                # scale_token = model.scale_token.view(1, -1, 1).to(device)
                 fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
                     query_view=batch,
                     device=str(device),
@@ -133,6 +298,17 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
     dataloader = ForcedRandomDataLoader(dataset=dataset, batch_size=1)
 
     buffer, in_channels = _collect_buffer_query_only(cfg, model, upsampler, dataloader, device)
+    # ==== 在这里做一次重投影 sanity check ====
+    if getattr(cfg.training, "enable_reproj_sanity_check", True):
+        print("\n[SanityCheck] 开始对 FeatureReplayBuffer 做世界坐标重投影检查...")
+        _sanity_check_buffer_reprojection(
+            buffer=buffer,
+            device=device,
+            max_samples=getattr(cfg.training, "reproj_check_max_samples", 4096),
+            num_workers=0,
+        )
+        print("[SanityCheck] 完成。\n")
+    # ===========================================
     bufferloader = DataLoader(
         BufferDataset(buffer),
         batch_size=cfg.training.batch_size,
@@ -160,23 +336,39 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
             features = batch["features"].to(device)
             scale = batch["scale_token"].to(device)
             preds = head(features, scale)
-
             loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
-
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-
             global_step += 1
+
             if global_step % cfg.training.log_interval == 0:
-                print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
+                # 在 buffer 上做一次评估（GT vs 预测的 xyz / reprojection）
+                eval_metrics = _eval_head_on_buffer_once(
+                    head=head,
+                    buffer=buffer,
+                    repro_loss=repro_loss,
+                    loss_cfg=cfg.loss,
+                    device=device,
+                    global_step=global_step,
+                    max_samples=getattr(cfg.training, "eval_max_samples", 4096),
+                    num_workers=getattr(cfg.training, "num_workers", 0),
+                )
+
+                log_obj = {
+                    "epoch": epoch,
+                    "step": global_step,
+                    "train": metrics,  # 当前 batch 的训练 metrics
+                    "eval": eval_metrics,  # buffer 上整体评估 metrics（含 xyz/reproj 误差）
+                }
+                print(json.dumps(log_obj, ensure_ascii=False))
 
     try:
         task_name = HydraConfig.get().runtime.choices.get("model/task", "default")
     except Exception:
         task_name = "unknown"
     ckpt_name = (
-        f"ace_"
+        f"ace-queryonly_"
         f"task-{task_name}_"
         f"head-{cfg.model.head_mode}_"
         f"loss-{cfg.loss.mode}_"

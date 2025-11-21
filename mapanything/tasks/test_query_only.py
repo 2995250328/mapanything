@@ -16,6 +16,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from mapanything.utils.debugprinter import DebugPrinter
@@ -199,11 +200,15 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         start_time = time.time()
         with torch.no_grad():
             # 注意：这里假设 batch[0]["img"] 已经通过上面的循环被移动到了 device
+            memory_tokens = [None] * getattr(model.info_sharing, "depth", 24)
+            scale_token = nn.Parameter(torch.zeros(model.encoder.enc_embed_dim))
+            torch.nn.init.trunc_normal_(scale_token, std=0.02)
+            scale_token = scale_token.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1).to(device)
             fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
                 query_view=batch,
                 device=str(device),
-                memory_tokens_per_block=memory_tokens_per_block,
-                additional_tokens=memory_token,
+                memory_tokens_per_block=memory_tokens,
+                additional_tokens=scale_token,
                 memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                 memory_efficient_inference=cfg.fusion.memory_efficient_inference,
             )

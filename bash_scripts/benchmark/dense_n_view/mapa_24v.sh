@@ -19,7 +19,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 100 benchmark_518_eth3d_snpp_tav2"
 #)
 batch_sizes_and_views=(
-    "2 4 benchmark_518_eth3d_snpp_tav2"
+    "1 4 benchmark_518_seven_scenes"
 )
 
 # Loop through each combination
@@ -36,7 +36,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_workers=1 \
         dataset.num_views=$num_views \
         batch_size=$batch_size \
-        model=map-anything \
+        model=mapanything \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \
         model.pretrained='${root_pretrained_checkpoints_dir}/facebook_map-anything.pth' \

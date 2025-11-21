@@ -4,6 +4,11 @@ defaults:
 # Number of views parameter for the multi-view datasets
 num_views: 2
 
+sample_specific_scene: False
+specific_scene_name_train: "chess_train"
+specific_scene_name_test: "chess_test"
+sequential_view_mode: False
+
 # 7Scenes default evaluation resolution (640x480 -> 4:3 aspect ratio)
 resolution_test_seven_scenes: ${dataset.resolution_options.518_1_33_ar}
 

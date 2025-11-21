@@ -8,9 +8,12 @@
 import os
 import torch
 import numpy as np
+from PIL import Image
 
 from mapanything.datasets.base.base_dataset import BaseDataset, ForcedRandomDataLoader
+from mapanything.utils.debugprinter import DebugPrinter
 from mapanything.utils.wai.core import load_data, load_frame
+printer = DebugPrinter()
 
 
 class SevenScenesWAI(BaseDataset):
@@ -272,7 +275,7 @@ def get_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-rd", "--root_dir", default="/mnt/storage/xwh/map-anything-dataset/wai_data/7scenes", type=str)
+    parser.add_argument("-rd", "--root_dir", default="/data/xwh/mapanything-dataset/wai_data/7scenes", type=str)
     parser.add_argument(
         "-dmd",
         "--dataset_metadata_dir",
@@ -292,108 +295,325 @@ def get_parser():
 
     return parser
 
+def check_depth_and_pts3d_with_image(
+    depthmap,
+    pts3d_world_map,
+    intrinsics,
+    c2w,
+    num_samples=2048,
+    label="",
+):
+    """
+    depthmap:      (H, W) numpy 数组，深度 Z（在相机坐标系下）
+    pts3d_world_map: (H, W, 3) numpy 数组，每个像素的世界坐标
+    intrinsics:    (3, 3) 相机内参 K（与 depth / image 分辨率匹配）
+    c2w:           (4, 4) 或 (3, 4) 相机位姿，cam2world
+    num_samples:   随机采样的像素数量
+    label:         打印标记用
+    """
+
+    depthmap = depthmap.astype(np.float64)
+    pts3d_world_map = pts3d_world_map.astype(np.float64)
+    K = intrinsics.astype(np.float64)
+
+    H, W = depthmap.shape
+
+    # 1) 处理 c2w 形状，变成 4x4
+    if c2w.shape == (3, 4):
+        c2w_4 = np.eye(4, dtype=np.float64)
+        c2w_4[:3, :4] = c2w
+        c2w = c2w_4
+    elif c2w.shape == (4, 4):
+        c2w = c2w.astype(np.float64)
+    else:
+        raise ValueError(f"[{label}] Unsupported c2w shape: {c2w.shape}")
+
+    # world -> cam
+    w2c = np.linalg.inv(c2w)
+
+    # 2) 采样有效像素：depth > 0 且 pts3d 没有 NaN
+    valid_mask = (depthmap > 0) & np.isfinite(pts3d_world_map[..., 0]) & np.isfinite(pts3d_world_map[..., 1]) & np.isfinite(pts3d_world_map[..., 2])
+    ys, xs = np.where(valid_mask)
+    n_valid = len(xs)
+    if n_valid == 0:
+        print(f"[{label}] 没有有效像素（depth>0 且 pts3d 有效），跳过检查。")
+        return
+
+    n_sample = min(num_samples, n_valid)
+    idx = np.random.choice(n_valid, size=n_sample, replace=False)
+
+    u_int = xs[idx]  # 列坐标 x
+    v_int = ys[idx]  # 行坐标 y
+
+    # 3) 从 pts3d_world_map 取世界坐标
+    pts_world = pts3d_world_map[v_int, u_int, :]  # (N,3)
+
+    # 4) world -> cam
+    ones = np.ones((n_sample, 1), dtype=np.float64)
+    pts_world_h = np.concatenate([pts_world, ones], axis=-1)  # (N,4)
+    pts_cam_h = (w2c @ pts_world_h.T).T  # (N,4)
+    Xc = pts_cam_h[:, 0]
+    Yc = pts_cam_h[:, 1]
+    Zc = pts_cam_h[:, 2]
+
+    # 5) 深度一致性：Zc vs depthmap
+    depth_from_pts3d = Zc
+    depth_sampled = depthmap[v_int, u_int]
+    depth_err = depth_from_pts3d - depth_sampled
+
+    # 6) 像素投影一致性：Xc,Yc,Zc -> (u_proj, v_proj)
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+
+    Z_safe = Zc + 1e-8
+    u_proj = fx * (Xc / Z_safe) + cx
+    v_proj = fy * (Yc / Z_safe) + cy
+
+    u = u_int.astype(np.float64)
+    v = v_int.astype(np.float64)
+
+    du = u_proj - u
+    dv = v_proj - v
+    pix_err = np.sqrt(du ** 2 + dv ** 2)
+
+    print(f"[{label}] depth & pts3d_world 与 image 对齐检查:")
+    print(f"    有效像素总数: {n_valid}, 抽样: {n_sample}")
+    print(f"    像素误差 mean   = {pix_err.mean():.4f}")
+    print(f"    像素误差 median = {np.median(pix_err):.4f}")
+    print(f"    像素误差 90%%   = {np.quantile(pix_err, 0.9):.4f}")
+    print(f"    像素误差 max    = {pix_err.max():.4f}")
+    print(f"    深度误差 mean   = {depth_err.mean():.4f}")
+    print(f"    深度误差 median = {np.median(depth_err):.4f}")
+    print(f"    深度误差 90%%   = {np.quantile(depth_err, 0.9):.4f}")
+    print(f"    深度误差 max    = {np.max(np.abs(depth_err)):.4f}")
 
 if __name__ == "__main__":
     import numpy as np
     from tqdm import tqdm
     import cv2
     from pathlib import Path
-    import matplotlib.pyplot as plt
+    import torch
+    from torch.utils.data import DataLoader
+    from PIL import Image
 
-    from mapanything.datasets.base.base_dataset import view_name
-    from mapanything.utils.image import rgb
-    from mapanything.utils.viz import script_add_rerun_args
+    from mapanything.utils.wai.core import load_frame
 
     parser = get_parser()
-    script_add_rerun_args(parser)
     args = parser.parse_args()
 
-    # =========================================
-    # 配置
-    # =========================================
+    # ============ 配置 ============
     BATCH_SIZE = 1
-    # 如果开启顺序模式，我们通常不希望截断，或者设置为非常大的数
-    if args.sequential_mode:
-        print("Sequential mode enabled. Will iterate through dataset linearly.")
-        # 注意：ForcedRandomDataLoader 默认是随机的，如果是顺序模式，建议使用标准的 DataLoader 或
-        # 确保 ForcedRandomDataLoader 的实现不shuffle，或者我们在这里手动处理
-        # 但由于 SevenScenesWAI 继承自 BaseDataset，这里的 num_batches 是基于 len(dataset) 的
-        pass
-
-    SAVE_DIR = Path("/home/xwh/project/tmp/")
+    SAVE_DIR = Path("/home/xwh/project/tmp/7scenes_size_debug")
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    NUM_SAMPLES = 2  # 只看前几个 batch，方便调试
 
-    # =========================================
-    # 1. 初始化数据集
-    # 关键：确保 seed=None 或者不传，以允许随机性
-    # =========================================
-    try:
-        dataset = SevenScenesWAI(
-            num_views=args.num_of_views,
-            split=args.split,
-            covisibility_thres=0.025,
-            ROOT=args.root_dir,
-            dataset_metadata_dir=args.dataset_metadata_dir,
-            sample_specific_scene=True,
-            specific_scene_name='chess_test',
-            resolution=(518, 392),
-            transform="imgnorm",
-            data_norm_type="dinov2",
-            sequential_view_mode=args.sequential_mode,  # 传入参数
-            # seed=777,  <--- 务必注释掉或设为 None
-        )
-    except Exception as e:
-        print(f"Error initializing dataset: {e}")
-        exit()
+    # ============ 初始化数据集 ============
+    dataset = SevenScenesWAI(
+        num_views=args.num_of_views,
+        split=args.split,
+        covisibility_thres=0.025,
+        ROOT=args.root_dir,
+        dataset_metadata_dir=args.dataset_metadata_dir,
+        sample_specific_scene=True,
+        specific_scene_name="chess_test",
+        resolution=(518, 392),
+        transform="imgnorm",
+        data_norm_type="dinov2",
+        sequential_view_mode=True,  # 顺序模式
+    )
 
-    print(f"Dataset initialized. Length: {len(dataset)}")
+    print(f"Sequential Mode: Indexing frames from {len(dataset.scenes)} scenes...")
+    print(f"Sequential Mode: Found {len(dataset.flat_view_list)} total views.")
+    print(f"Dataset initialized. Length (num views): {len(dataset)}")
+    print(f"Scenes: {dataset.scenes}")
+    print(f"Sequential mode: {dataset.sequential_view_mode}")
 
-    # 如果是顺序模式，我们想要遍历整个数据集
-    num_batches_to_run = len(dataset) // BATCH_SIZE if args.sequential_mode else 1
+    num_to_process = min(NUM_SAMPLES, len(dataset))
+    print(f"Will process first {num_to_process} views (out of {len(dataset)}).")
+    print(f"Images will be saved to: {SAVE_DIR}")
 
-    print(f"Starting extraction of {num_batches_to_run} batches...")
-
-    # 注意：ForcedRandomDataLoader 设计初衷是随机采样。
-    # 如果要严格顺序，最好用 pytorch 标准 DataLoader (shuffle=False)。
-    # 但为了兼容现有代码结构，如果 BaseDataset 实现了 __getitem__ 为根据 index 访问，
-    # 我们可以用 torch.utils.data.DataLoader
-
-    if args.sequential_mode:
-        from torch.utils.data import DataLoader
-
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
-                                collate_fn=dataset.collate_fn if hasattr(dataset, 'collate_fn') else None)
-    else:
-        dataloader = ForcedRandomDataLoader(
-            dataset=dataset,
+    # ============ 构建 DataLoader ============
+    collate_fn = getattr(dataset, "collate_fn", None)
+    if collate_fn is not None:
+        dataloader = DataLoader(
+            dataset,
             batch_size=BATCH_SIZE,
-            num_batches=num_batches_to_run
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
         )
 
-    # =========================================
-    # 2. 循环构建 Batch
-    # =========================================
+    # 一些小工具函数
+    def _to_numpy(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def get_depthmap(sample):
+        """
+        sample['depthmap']: (1, H, W, 1) -> (H, W)
+        """
+        d = _to_numpy(sample["depthmap"])
+        # d: (1, H, W, 1)
+        return d[0, :, :, 0]
+
+    def get_pts3d_world(sample):
+        """
+        sample['pts3d']: (1, H, W, 3) -> (H, W, 3)
+        """
+        pw = _to_numpy(sample["pts3d"])  # (1, H, W, 3)
+        return pw[0]
+
+    def get_intrinsics(sample):
+        """
+        sample['camera_intrinsics']: (1, 3, 3) -> (3, 3)
+        """
+        K = _to_numpy(sample["camera_intrinsics"])
+        return K[0]
+
+    def get_pose_c2w(sample):
+        """
+        sample['camera_pose']: (1, 4, 4) -> (4, 4)
+        """
+        c2w = _to_numpy(sample["camera_pose"])
+        return c2w[0]
+
+    def check_pts3d_world_vs_depth_and_image(sample, label=""):
+        """
+        使用世界坐标系下的 pts3d 验证：
+          - world -> cam -> 像素 是否和像素网格对齐
+          - cam.z 是否和 depthmap 对齐
+        """
+        depth = get_depthmap(sample)          # (H, W)
+        pts_world = get_pts3d_world(sample)   # (H, W, 3)
+        K = get_intrinsics(sample)            # (3, 3)
+        c2w = get_pose_c2w(sample)            # (4, 4)
+
+        H, W = depth.shape
+
+        # world -> cam
+        w2c = np.linalg.inv(c2w)
+
+        # 只用有深度的像素
+        valid = depth > 0
+        ys, xs = np.where(valid)
+        n_valid = len(xs)
+        if n_valid == 0:
+            print(f"[{label}] 无有效深度像素，跳过。")
+            return
+
+        n_sample = min(2048, n_valid)
+        idxs = np.random.choice(n_valid, size=n_sample, replace=False)
+        v = ys[idxs]
+        u = xs[idxs]
+
+        depth_s = depth[v, u]            # (N,)
+        pts_w = pts_world[v, u, :]      # (N, 3)
+
+        # 世界坐标 -> 齐次 -> 相机坐标
+        ones = np.ones((n_sample, 1), dtype=np.float64)
+        pts_w_h = np.concatenate([pts_w.astype(np.float64), ones], axis=-1)  # (N, 4)
+        pts_c_h = (w2c @ pts_w_h.T).T                                        # (N, 4)
+        Xc = pts_c_h[:, 0]
+        Yc = pts_c_h[:, 1]
+        Zc = pts_c_h[:, 2]
+
+        # 深度一致性：Zc vs depthmap
+        depth_err = Zc - depth_s
+
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        Z_safe = Zc + 1e-8
+
+        u_proj = fx * Xc / Z_safe + cx
+        v_proj = fy * Yc / Z_safe + cy
+
+        u_f = u.astype(np.float64)
+        v_f = v.astype(np.float64)
+
+        du = u_proj - u_f
+        dv = v_proj - v_f
+        pix_err = np.sqrt(du ** 2 + dv ** 2)
+
+        print(f"[{label}] 世界坐标 pts3d 与 depth & image 对齐检查:")
+        print(f"    像素误差 mean   = {pix_err.mean():.4f}")
+        print(f"    像素误差 median = {np.median(pix_err):.4f}")
+        print(f"    像素误差 90%   = {np.quantile(pix_err, 0.9):.4f}")
+        print(f"    像素误差 max    = {pix_err.max():.4f}")
+        print(f"    深度误差 mean   = {depth_err.mean():.4f}")
+        print(f"    深度误差 median = {np.median(depth_err):.4f}")
+        print(f"    深度误差 90%   = {np.quantile(depth_err, 0.9):.4f}")
+        print(f"    深度误差 max    = {np.max(np.abs(depth_err)):.4f}")
+
+    # ============ 主循环：用 DataLoader 读取 ============
     for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Loading Data")):
-        if batch_idx >= num_batches_to_run:
+        if batch_idx >= num_to_process:
             break
 
-        # =========================================
-        # 3. 保存逻辑
-        # =========================================
+        # 你的 debug 已经证明：batch_data 是 list(len=1)
+        sample = batch_data[0]
+        print("[DEBUG] batch_data[0] keys:", list(sample.keys()))
 
-        # 简单的 collate 处理 (如果使用标准 DataLoader 且没自定义 collate，batch_data 结构可能不同)
-        # 这里假设 batch_data 结构兼容
+        # 1) dataloader 输出图像 (normalized)
+        img_tensor = sample["img"]  # (1, 3, H, W) = (1,3,392,518)
+        if not isinstance(img_tensor, torch.Tensor):
+            raise TypeError(f"sample['img'] is not Tensor, got {type(img_tensor)}")
 
-        # 兼容性处理：如果是列表（BaseDataset通常返回list of views），解包
-        if isinstance(batch_data, list):
-            # 如果 batch_size=1，batch_data 可能就是 [view1_dict, view2_dict...] 的 batched 版本
-            # 通常 BaseDataset 的 collate 会把 list of dicts 变成 dict of batched tensors
-            pass
+        if img_tensor.ndim == 4:
+            img_tensor = img_tensor[0]  # -> (3, H, W)
 
-        current_batch_size = BATCH_SIZE  # 简化假设
-        # 实际使用中需根据 batch_data 真实结构解析
+        C, H1, W1 = img_tensor.shape
+        print(f"[{batch_idx:04d}] dataloader 图像尺寸: C={C}, H={H1}, W={W1}")
 
-        # (此处省略具体的保存代码，保持原样或根据需要调整)
-        pass
+        # 反归一化（简单 min-max）后保存可视化图
+        img_np = img_tensor.detach().cpu().permute(1, 2, 0).numpy()
+        img_min, img_max = float(img_np.min()), float(img_np.max())
+        if img_max > img_min:
+            img_np = (img_np - img_min) / (img_max - img_min)
+        else:
+            img_np = np.zeros_like(img_np)
+        img_uint8 = (img_np * 255.0).clip(0, 255).astype(np.uint8)
 
-    print("Finished sampling.")
+        scene_name, frame_name = dataset.flat_view_list[batch_idx]
+        resized_path = SAVE_DIR / f"{scene_name}_{frame_name}_from_dataloader.jpg"
+        Image.fromarray(img_uint8).save(resized_path)
+
+        # 2) 用 load_frame 读取原始 480x640 图像
+        scene_root = os.path.join(dataset.ROOT, scene_name)
+        scene_meta = dataset.scene_meta_cache[scene_name]
+        raw_view = load_frame(
+            scene_root,
+            frame_name,
+            modalities=["image"],
+            scene_meta=scene_meta,
+        )
+        img_orig = raw_view["image"].permute(1, 2, 0).numpy()
+        img_orig = np.clip(img_orig * 255.0, 0, 255).astype(np.uint8)
+        H0, W0 = img_orig.shape[:2]
+        print(f"    原始图像大小: H={H0}, W={W0}")
+
+        orig_path = SAVE_DIR / f"{scene_name}_{frame_name}_orig.jpg"
+        Image.fromarray(img_orig).save(orig_path)
+
+        # 3) 世界坐标几何一致性检查
+        check_pts3d_world_vs_depth_and_image(
+            sample, label=f"{scene_name}_{frame_name}_world"
+        )
+
+        print(f"    原始图保存:   {orig_path}")
+        print(f"    Dataloader 图保存: {resized_path}")
+        print("-" * 60)
+
+    print("Finished sampling via DataLoader.")
+
+
+
