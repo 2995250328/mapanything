@@ -19,7 +19,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_views=$num_views \
         dataset.sequential_view_mode=True \
         batch_size=$batch_size \
-        device=cuda:2 \
+        device=cuda:1 \
         head.type="film"\
         model=mapanything_memory \
         model/task=images_only \

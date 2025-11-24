@@ -27,13 +27,13 @@ fusion:
 training:
   device: cuda
   output_dir: ${output_dir}/ace_regression
-  epochs: 24
+  epochs: 48
   log_interval: 10
   lr: 1e-4
   weight_decay: 1e-4
   batch_size: 5120
   num_workers: 2
-  buffer_size: 5120000
+  buffer_size: 8196000
   samples_per_view: 1024
   shuffle: true
   memory_efficient_inference: false

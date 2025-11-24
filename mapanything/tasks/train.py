@@ -476,6 +476,7 @@ def _collect_buffer(
     pbar = tqdm(total=capacity, desc="Filling training buffer", unit="sample", leave=False)
     try:
         for batch_id, views in enumerate(dataset):
+
             batch = views
             # 移除不必要的键
             for view in batch:
@@ -857,6 +858,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
     )
     # 从保存的中间特征文件中读取
     memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
+    printer.print(memory_token,'memory_token')
     aggregator = BlockwiseAggregator(
         num_blocks=24,
         tokens_per_block=256,  # 或者 [256,256,...] 按块自定义

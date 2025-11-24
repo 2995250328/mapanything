@@ -19,11 +19,11 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_workers=1 \
         dataset.num_views=$num_views \
         batch_size=$batch_size \
-        loss.mode=xyz \
-        loss.scale_reg.enabled=False \
-        loss.scale_reg.variant=match_to_gt\
-        model.head_mode="film" \
-        training.device=cuda:0 \
+        loss.mode=reproj \
+        loss.scale_reg.enabled=True \
+        loss.scale_reg.variant=unit\
+        model.head_mode="decouled" \
+        training.device=cuda:2 \
         model=mapanything_memory \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \

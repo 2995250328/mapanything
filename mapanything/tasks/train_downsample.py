@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Tuple, Mapping
 
@@ -13,6 +14,7 @@ import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
+from torch.backends import cudnn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -348,7 +350,7 @@ def _collect_buffer_query_only(
                 torch.nn.init.trunc_normal_(scale_token, std=0.02)
                 scale_token = scale_token.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1).to(device)
                 # scale_token = model.scale_token.view(1, -1, 1).to(device)
-                fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
+                fused_feature, fused_token, dense_out_feat, pose_out, scale_out = model.forward_with_memory_dense_feature(
                     query_view=batch,
                     device=str(device),
                     memory_tokens_per_block=memory_tokens,
@@ -356,10 +358,13 @@ def _collect_buffer_query_only(
                     memory_keep_ratio=1.0,
                     memory_efficient_inference=cfg.training.memory_efficient_inference,
                 )
-                # fused_feature, fused_token = model.forward_dense_feats(
-                #     batch,
-                #     cfg.training.memory_efficient_inference
-                # )
+                printer.print(fused_feature,'fused_feature')
+                printer.print(fused_token,'fused_token')
+                printer.print(dense_out_feat,'dense_out_feat')
+                printer.print(pose_out,'pose_out')
+                printer.print(scale_out,'scale_out')
+                import sys
+                sys.exit(0)
                 dense_feat_up = upsampler(batch[0]["img"], fused_feature)
 
             view = batch[0]
@@ -394,6 +399,21 @@ def _collect_buffer_query_only(
 
 def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
     device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+    cudnn.benchmark = not cfg.disable_cudnn_benchmark
+    # AMP 类型
+    if cfg.amp:
+        if cfg.amp_dtype == "fp16":
+            amp_dtype = torch.float16
+        elif cfg.amp_dtype == "bf16":
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+            else:
+                warnings.warn("bf16 is not supported on this device. Using fp16 instead.")
+                amp_dtype = torch.float16
+        elif cfg.amp_dtype == "fp32":
+            amp_dtype = torch.float32
+    else:
+        amp_dtype = torch.float32
 
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
@@ -463,8 +483,10 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
         for batch in bufferloader:
             features = batch["features"].to(device)
             scale = batch["scale_token"].to(device)
-            preds = head(features, scale)
-            loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
+            with torch.autocast("cuda", enabled=bool(cfg.amp), dtype=amp_dtype):
+                preds = head(features, scale)
+                with torch.autocast("cuda", enabled=False, ):
+                    loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()

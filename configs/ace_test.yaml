@@ -23,11 +23,11 @@ loss:
   confidence_weight: 1.0
 
 head:
-  type: "film"
+  type: "decoulped"
   hidden_dim: 256
   in_channels: 768
   token_dim: 768
-  checkpoint: "/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace-queryonly_task-images_only_head-film_loss-xyz_scale-off_var-match_to_gt_ep24_buf5120000.pt"
+  checkpoint: "/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/no_info_ace-queryonly_task-images_only_head-film_loss-reproj_scale-off_var-match_to_gt_ep48_buf8196000.pt"
 
 seed: 0
 # Disable CUDNN Benchmark (Disable for variable resolution & number of view training)

@@ -19,9 +19,9 @@ for combo in "${batch_sizes_and_views[@]}"; do
         dataset.num_views=$num_views \
         dataset.sequential_view_mode=True \
         batch_size=$batch_size \
-        device=cuda:2 \
-        head.type="film"\
-        head.checkpoint="/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace-queryonly_task-images_only_head-film_loss-xyz_scale-off_var-match_to_gt_ep24_buf5120000.pt" \
+        device=cuda:3 \
+        head.type="decouled"\
+        head.checkpoint="/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace-queryonly_task-images_only_head-film_loss-reproj_scale-off_var-match_to_gt_ep48_buf8196000.pt" \
         model=mapanything_memory \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \

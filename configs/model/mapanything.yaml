@@ -6,10 +6,10 @@ defaults:
   - task: images_only
 
 # String for model factory
-model_str: "map-anything"
+model_str: "mapanything"
 # Model config
 model_config:
-  name: "map-anything"
+  name: "mapanything"
   encoder_config: ${model.encoder}
   info_sharing_config: ${model.info_sharing}
   pred_head_config: ${model.pred_head}

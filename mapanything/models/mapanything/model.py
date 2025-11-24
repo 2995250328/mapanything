@@ -1765,7 +1765,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             (
                 final_info_sharing_multi_view_feat,
                 intermediate_info_sharing_multi_view_feat,
-            ) = self.info_sharing(info_sharing_input)
+            ) = self.info_sharing(info_sharing_input,True)
         dpt_info_sharing_multi_view_feat = intermediate_info_sharing_multi_view_feat
 
         def _detach_clone_tree(x):
@@ -1784,7 +1784,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         if self.store_info_sharing_intermediate_features and self.dpt_indices is not None:
             dpt_info_sharing_multi_view_feat = [
-                _detach_clone_tree(intermediate_info_sharing_multi_view_feat[i])
+                _detach_clone_tree(intermediate_info_sharing_multi_view_feat[i+1])
                 for i in self.dpt_indices
             ]
         final_info_sharing_feat = _detach_clone_tree(final_info_sharing_multi_view_feat)
@@ -2165,6 +2165,159 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return res
 
+    def forward_dense_feats(self, views, memory_efficient_inference=False):
+        """
+        Forward pass performing the following operations:
+        1. Encodes the N input views (images).
+        2. Encodes the optional geometric inputs (ray directions, depths, camera rotations, camera translations).
+        3. Fuses the encoded features from the N input views and the optional geometric inputs using addition and normalization.
+        4. Information sharing across the encoded features and a scale token using a multi-view attention transformer.
+        5. Passes the final features from transformer through the prediction heads.
+        6. Returns the processed final outputs for N views.
+
+        Assumption:
+        - All the input views and dense geometric inputs have the same image shape.
+
+        Args:
+            views (List[dict]): List of dictionaries containing the input views' images and instance information.
+                                Each dictionary should contain the following keys:
+                                    "img" (tensor): Image tensor of shape (B, C, H, W). Input images must be normalized based on the data norm type of image encoder.
+                                    "data_norm_type" (list): [model.encoder.data_norm_type]
+                                Optionally, each dictionary can also contain the following keys for the respective optional geometric inputs:
+                                    "ray_directions_cam" (tensor): Ray directions in the local camera frame. Tensor of shape (B, H, W, 3).
+                                    "depth_along_ray" (tensor): Depth along the ray. Tensor of shape (B, H, W, 1).
+                                    "camera_pose_quats" (tensor): Camera pose quaternions. Tensor of shape (B, 4). Camera pose is opencv (RDF) cam2world transformation.
+                                    "camera_pose_trans" (tensor): Camera pose translations. Tensor of shape (B, 3). Camera pose is opencv (RDF) cam2world transformation.
+                                    "is_metric_scale" (tensor): Boolean tensor indicating whether the geometric inputs are in metric scale or not. Tensor of shape (B, 1).
+            memory_efficient_inference (bool): Whether to use memory efficient inference or not. This runs the dense prediction head (the memory bottleneck) in a memory efficient manner. Default is False.
+
+        Returns:
+            List[dict]: A list containing the final outputs for all N views.
+
+        Notes:
+            When ``store_info_sharing_intermediate_features`` is enabled, the final and
+            intermediate multi-view transformer features from this forward pass can be
+            retrieved using :meth:`get_info_sharing_intermediate_features`.
+        """
+        # Get input shape of the images, number of views, and batch size per view
+        batch_size_per_view, _, height, width = views[0]["img"].shape
+        img_shape = (int(height), int(width))
+        num_views = len(views)
+
+        # Run the image encoder on all the input views
+        all_encoder_features_across_views = self._encode_n_views(views)
+
+        # Encode the optional geometric inputs and fuse with the encoded features from the N input views
+        # Use high precision to prevent NaN values after layer norm in dense representation encoder (due to high variance in last dim of features)
+        with torch.autocast("cuda", enabled=False):
+            all_encoder_features_across_views = (
+                self._encode_and_fuse_optional_geometric_inputs(
+                    views, all_encoder_features_across_views
+                )
+            )
+        all_encoder_features_across_views_proj = self.info_sharing.proj_embed(all_encoder_features_across_views[0].permute(0,2,3,1).reshape(batch_size_per_view,-1,1024))
+        all_encoder_features_across_views_proj = all_encoder_features_across_views_proj.permute(0,2,1).reshape(batch_size_per_view,-1,28,37)
+        # Expand the scale token to match the batch size
+        input_scale_token = (
+            self.scale_token.unsqueeze(0)
+            .unsqueeze(-1)
+            .repeat(batch_size_per_view, 1, 1)
+        )  # (B, C, 1)
+
+        # Combine all images into view-centric representation
+        # Output is a list containing the encoded features for all N views after information sharing.
+        info_sharing_input = MultiViewTransformerInput(
+            features=all_encoder_features_across_views,
+            additional_input_tokens=input_scale_token,
+        )
+        intermediate_info_sharing_multi_view_feat: Optional[
+            List[MultiViewTransformerOutput]
+        ] = None
+        if self.info_sharing_return_type == "no_intermediate_features":
+            final_info_sharing_multi_view_feat = self.info_sharing(info_sharing_input)
+        elif self.info_sharing_return_type == "intermediate_features":
+            (
+                final_info_sharing_multi_view_feat,
+                intermediate_info_sharing_multi_view_feat,
+            ) = self.info_sharing(info_sharing_input)
+        dpt_info_sharing_multi_view_feat = intermediate_info_sharing_multi_view_feat
+        fused_query_feature = final_info_sharing_multi_view_feat.features[0]
+        fused_scale_token = final_info_sharing_multi_view_feat.additional_token_features
+
+        # if self.pred_head_type == "linear":
+        #     # Stack the features for all views
+        #     dense_head_inputs = torch.cat(
+        #         final_info_sharing_multi_view_feat.features, dim=0
+        #     )
+        # elif self.pred_head_type in ["dpt", "dpt+pose"]:
+        #     # Get the list of features for all views
+        #     dense_head_inputs_list = []
+        #     if self.use_encoder_features_for_dpt:
+        #         # Stack all the image encoder features for all views
+        #         stacked_encoder_features = torch.cat(
+        #             all_encoder_features_across_views, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_encoder_features)
+        #         # Stack the first intermediate features for all views
+        #         stacked_intermediate_features_1 = torch.cat(
+        #             dpt_info_sharing_multi_view_feat[0].features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_intermediate_features_1)
+        #         # Stack the second intermediate features for all views
+        #         stacked_intermediate_features_2 = torch.cat(
+        #             dpt_info_sharing_multi_view_feat[1].features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_intermediate_features_2)
+        #         # Stack the last layer features for all views
+        #         stacked_final_features = torch.cat(
+        #             final_info_sharing_multi_view_feat.features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_final_features)
+        #     else:
+        #         # Stack the first intermediate features for all views
+        #         stacked_intermediate_features_1 = torch.cat(
+        #             dpt_info_sharing_multi_view_feat[0].features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_intermediate_features_1)
+        #         # Stack the second intermediate features for all views
+        #         stacked_intermediate_features_2 = torch.cat(
+        #             dpt_info_sharing_multi_view_feat[1].features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_intermediate_features_2)
+        #         # Stack the third intermediate features for all views
+        #         stacked_intermediate_features_3 = torch.cat(
+        #             dpt_info_sharing_multi_view_feat[2].features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_intermediate_features_3)
+        #         # Stack the last layer
+        #         stacked_final_features = torch.cat(
+        #             final_info_sharing_multi_view_feat.features, dim=0
+        #         )
+        #         dense_head_inputs_list.append(stacked_final_features)
+        # else:
+        #     raise ValueError(
+        #         f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+        #     )
+        #
+        # with torch.autocast("cuda", enabled=False):
+        #     if self.pred_head_type == "linear":
+        #         dense_head_inputs = dense_head_inputs
+        #     elif self.pred_head_type in ["dpt", "dpt+pose"]:
+        #         dense_head_inputs = dense_head_inputs_list
+        #     scale_head_inputs = (
+        #         final_info_sharing_multi_view_feat.additional_token_features
+        #     )
+        #     dense_out_feat, pose_out, scale_out = self.downstream_head_feat(
+        #         dense_head_inputs=dense_head_inputs,
+        #         scale_head_inputs=scale_head_inputs,
+        #         img_shape=img_shape,
+        #         memory_efficient_inference=memory_efficient_inference,
+        #     )
+
+        # return fused_query_feature, fused_scale_token, dense_out_feat, pose_out, scale_out
+        return all_encoder_features_across_views_proj, fused_scale_token
+
+
     def forward_with_memory(
             self,
             query_view,  # 单视图输入 {"img":(B,C,H,W), 以及可选几何输入}
@@ -2181,6 +2334,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         4. 返回与 forward() 相同格式的 dense predictions
         memory_features: 来自外部存储的 IFR output.features（单视图）
         """
+        batch_size_per_view, _, height, width = query_view[0]["img"].shape
         all_encoder_features_across_views = self._encode_n_views(query_view)
         # Optional geometric fusion（depth, rays, pose…）保持一致
         with torch.autocast("cuda", enabled=False):
@@ -2190,13 +2344,18 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 )
             )
         # B,C,H,W
+        input_scale_token =(
+            self.scale_token.unsqueeze(0)
+            .unsqueeze(-1)
+            .repeat(1,1,1)
+        )
         query_feat = all_encoder_features_across_views[0]
         B = query_feat.shape[0]
         scale_token = additional_tokens.to(query_feat.dtype)
         final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
             query_feat=query_feat,
             memory_feats=memory_feats,
-            additional_tokens=scale_token,
+            additional_tokens=input_scale_token,
             memory_keep_ratio=1.0,
         )
         # final_feat: MultiViewTransformerOutput
