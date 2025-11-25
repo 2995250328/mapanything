@@ -6,6 +6,8 @@
 """7Scenes Dataset using WAI format data."""
 
 import os
+from pathlib import Path
+
 import torch
 import numpy as np
 from PIL import Image
