@@ -39,6 +39,62 @@ import torch.nn.functional as F
 
 printer = DebugPrinter()
 
+def debug_check_layernorm_like_seq(seq: torch.Tensor, name: str = "seq"):
+    """
+    seq: (B, L, C) 或 (L, C)
+    按 IFR/LayerNorm 的使用方式检查每个 token 的 channel 统计量：
+      - 对每个 token（长度 C 向量）算 mean/std
+      - 再看 mean/std 在所有 token 之间的分布是否很“集中”
+      - 若非常集中 -> 很像 LN 输出；若变化很大 -> 更像 raw 特征
+    """
+    if seq.ndim == 2:
+        seq = seq.unsqueeze(0)   # (L,C) -> (1,L,C)
+    assert seq.ndim == 3, f"{name} must be (B,L,C) or (L,C), got {seq.shape}"
+
+    B, L, C = seq.shape
+    tokens = seq.reshape(-1, C)  # (B*L, C)
+
+    mean_c = tokens.mean(dim=1)            # 每个 token 的 channel 均值
+    std_c  = tokens.std(dim=1, unbiased=False)  # 每个 token 的 channel std
+
+    mean_mean = mean_c.mean().item()
+    mean_std  = std_c.mean().item()
+
+    print(f"[{name}] token-wise channel mean stats:")
+    print(f"  mean(mean_c) = {mean_mean:.6f}")
+    print(f"  min(mean_c)  = {mean_c.min().item():.6f}")
+    print(f"  max(mean_c)  = {mean_c.max().item():.6f}")
+    print(f"  max |mean_c - mean(mean_c)| = {(mean_c - mean_mean).abs().max().item():.6f}")
+
+    print(f"[{name}] token-wise channel std stats:")
+    print(f"  mean(std_c) = {mean_std:.6f}")
+    print(f"  min(std_c)  = {std_c.min().item():.6f}")
+    print(f"  max(std_c)  = {std_c.max().item():.6f}")
+    print(f"  max |std_c - mean(std_c)| = {(std_c - mean_std).abs().max().item():.6f}")
+def debug_check_memory_layer_seq(memory_feats, layer_idx: int, name_prefix: str = "mem_layer"):
+    """
+    memory_feats: list[len = 1 + depth]
+      memory_feats[layer_idx]: list[len = V]
+        memory_feats[layer_idx][v]: (B, C, H, W)
+
+    将某一层的所有 view stack 成 (B, V*H*W, C)，
+    再用 sequence 版 LN-like 检查。
+    """
+    feats_per_view = memory_feats[layer_idx]
+    assert isinstance(feats_per_view, (list, tuple)) and len(feats_per_view) > 0
+
+    B, C, H, W = feats_per_view[0].shape
+    V = len(feats_per_view)
+
+    # (B, V, C, H, W)
+    stacked = torch.stack(feats_per_view, dim=1)
+    # -> (B, V, H, W, C)
+    stacked = stacked.permute(0, 1, 3, 4, 2).contiguous()
+    # -> (B, V*H*W, C)
+    seq = stacked.reshape(B, V * H * W, C)
+
+    debug_check_layernorm_like_seq(seq, f"{name_prefix}{layer_idx}_allviews")
+
 def get_all_info_for_metric_computation(batch, preds, norm_mode="avg_dis"):
     """
     提取并归一化用于指标计算的所有信息。
@@ -405,15 +461,16 @@ def run_demo(cfg: DictConfig):
     # 3. 加载记忆特征 (Memory)
     print(f"[Demo] Loading AA memory from: {cfg.fusion.stored_feature_file}")
     memory_feats, memory_scale_token = load_memory_features(cfg.fusion.stored_feature_file, device)
+    printer.print(memory_feats,'memory_feats')
 
     # 4. 初始化数据集（这里示例 num_views=4，可按需在 cfg 里配置）
     print(f"[Demo] Initializing Dataset with num_views=4 ...")
     dataset = SevenScenesWAI(
         num_views=1,
         split="train",
-        covisibility_thres=0.025,
+        covisibility_thres=0,
         ROOT="/data/xwh/mapanything-dataset/wai_data/7scenes",
-        dataset_metadata_dir="/data/xwh/mapanything-dataset/mapanything_dataset_metadata",
+        dataset_metadata_dir="",
         sample_specific_scene=True,
         specific_scene_name="chess_train",
         resolution=(518, 392),
@@ -459,6 +516,16 @@ def run_demo(cfg: DictConfig):
         if isinstance(ds_name, torch.Tensor):
             ds_name = ds_name.item() if ds_name.ndim == 0 else str(ds_name)
         scene_name = batch[0].get("label", ["unknown"])[0]
+        print(f"\n[Debug] Processing Batch: Dataset={ds_name}, Scene={scene_name}, Views={n_views}")
+        for i, view in enumerate(batch):
+            # 获取 instance 字段，它通常包含文件名或相对路径
+            file_path = view.get("instance", ["unknown"])
+
+            # DataLoader 可能会把字符串打包成列表 (例如 ['path/to/img.jpg'])，这里解包取第一个
+            if isinstance(file_path, (list, tuple)):
+                file_path = file_path[0]
+
+            print(f"  View {i}: {file_path}")
         if isinstance(scene_name, torch.Tensor):
             scene_name = scene_name.item() if scene_name.ndim == 0 else str(scene_name)
 
@@ -483,12 +550,11 @@ def run_demo(cfg: DictConfig):
 
         # 模型推理（支持多视图输入）
         with torch.autocast("cuda", enabled=bool(cfg.amp), dtype=amp_dtype):
-            memory_tokens = [None] * getattr(model.info_sharing, "depth", 24)
             # preds = model(batch, cfg.memory_efficient_inference, save_filename=current_save_filename)
             preds = model.forward_with_memory(
             query_view=batch,
             device=device,
-            memory_feats=memory_tokens,
+            memory_feats=memory_feats,
             additional_tokens=memory_scale_token,
             memory_efficient_inference=cfg.memory_efficient_inference,
             )

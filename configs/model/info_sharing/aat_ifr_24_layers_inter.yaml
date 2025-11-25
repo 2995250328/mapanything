@@ -13,7 +13,7 @@ module_args:
   # Indices of the intermediate features to be shared (indices start from 0)
   indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
   # Normalize intermediate features
-  norm_intermediate: True
+  norm_intermediate: False
   # Size string
   size: "24_layers"
   # Depth

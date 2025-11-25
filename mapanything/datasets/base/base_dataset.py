@@ -706,20 +706,32 @@ from torch.utils.data._utils.collate import default_collate
 
 class ForcedRandomDataLoader:
     """
-    一个模拟 DataLoader 行为的迭代器。
+    一个模拟 DataLoader 行为的迭代器，支持“无限”迭代。
+
     - 若 num_batches 指定：产生固定批次数
     - 若 num_batches=None：无限迭代（适合训练需要“无限数据”的情况）
+    - 若 repeat_index is None：每个 batch 随机采样 dataset 的索引
+    - 若 repeat_index 是 int：每个 batch 都使用同一个索引（保留原 MapAnything 用法）
     """
 
-    def __init__(self, dataset, batch_size: int, num_batches: int = None,
-                 repeat_index: int = 0, collate_fn=None):
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        num_batches: int | None = None,
+        repeat_index: int | None = None,
+        collate_fn=None,
+        seed: int | None = None,
+    ):
         """
         Args:
-            dataset: PyTorch 数据集（建议让其 __getitem__() 内部具有随机性）
+            dataset: PyTorch Dataset 实例
             batch_size: 每批的数据量
             num_batches: 迭代次数；若为 None，则无限迭代
-            repeat_index: 每次从 dataset 的固定索引读取数据（常用于单场景随机增强）
+            repeat_index: 若为 int，则每次从 dataset 的该索引读取数据
+                          若为 None，则每个 batch 随机采样索引
             collate_fn: 自定义 batch 拼接函数
+            seed: 控制 DataLoader 内部采样索引的随机种子（可选）
         """
         self.dataset = dataset
         self.batch_size = batch_size
@@ -727,39 +739,75 @@ class ForcedRandomDataLoader:
         self.repeat_index = repeat_index
         self.collate_fn = collate_fn if collate_fn is not None else default_collate
 
+        # 一个持久化的 RNG，用于整个 DataLoader 生命周期
+        self._rng = np.random.default_rng(seed)
+
     def __len__(self):
         """
-        如果 num_batches 为 None，无法定义长度。
-        推荐返回一个很大的数字，以保持 tqdm 正常工作。
+        如果 num_batches 为 None，无法定义真实长度。
+        返回一个很大的数字，使得 tqdm 等工具可以正常工作。
         """
         if self.num_batches is None:
-            return 10**12  # 等效“无限”，但 tqdm 可以跑
+            return 10**12
         return self.num_batches
 
+    # ---------------------- 内部工具：采样索引 ---------------------- #
+    def _sample_indices(self):
+        """
+        返回当前 batch 应该使用的 dataset 索引列表。
+        """
+        n = len(self.dataset)
+        if n == 0:
+            raise ValueError("ForcedRandomDataLoader: dataset 为空。")
+
+        # 固定索引模式：兼容旧用法
+        if self.repeat_index is not None:
+            if not (0 <= self.repeat_index < n):
+                raise IndexError(
+                    f"repeat_index={self.repeat_index} 越界，dataset 长度为 {n}。"
+                )
+            return [self.repeat_index] * self.batch_size
+
+        # 随机索引模式：每个 batch 随机抽取样本
+        if self.batch_size >= n:
+            # 样本不够时，允许重复抽取
+            return self._rng.integers(0, n, size=self.batch_size).tolist()
+        else:
+            # 样本够，用 without replacement，类似 shuffle+batch
+            return self._rng.choice(n, size=self.batch_size, replace=False).tolist()
+
+    # ---------------------- 迭代逻辑 ---------------------- #
     def __iter__(self):
         """
-        num_batches 指定 → 限定次数
+        num_batches 指定 → 限制次数
         num_batches=None → 无限循环
         """
         if self.num_batches is None:
             # ===== 无限迭代 =====
             while True:
-                samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
+                idxs = self._sample_indices()
+                samples = [self.dataset[i] for i in idxs]
 
-                # ✅ 防止 default_collate 再多包一层
                 batch = self.collate_fn(samples)
-                # 如果 batch 是单个样本的 list（例如 [[dict]]），就 flatten 一层
-                if isinstance(batch, (list, tuple)) and len(batch) == 1 and isinstance(batch[0], (list, tuple)):
+                # 防止 default_collate 多包一层 [[dict]] 的情况
+                if (
+                    isinstance(batch, (list, tuple))
+                    and len(batch) == 1
+                    and isinstance(batch[0], (list, tuple))
+                ):
                     batch = batch[0]
-
                 yield batch
         else:
             # ===== 有限制的迭代 =====
             for _ in range(self.num_batches):
-                samples = [self.dataset[self.repeat_index] for _ in range(self.batch_size)]
+                idxs = self._sample_indices()
+                samples = [self.dataset[i] for i in idxs]
 
                 batch = self.collate_fn(samples)
-                if isinstance(batch, (list, tuple)) and len(batch) == 1 and isinstance(batch[0], (list, tuple)):
+                if (
+                    isinstance(batch, (list, tuple))
+                    and len(batch) == 1
+                    and isinstance(batch[0], (list, tuple))
+                ):
                     batch = batch[0]
-
                 yield batch

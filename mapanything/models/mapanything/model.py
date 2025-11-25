@@ -1753,47 +1753,148 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         # Combine all images into view-centric representation
         # Output is a list containing the encoded features for all N views after information sharing.
         info_sharing_input = MultiViewTransformerInput(
-            features=all_encoder_features_across_views,
-            additional_input_tokens=input_scale_token,
+            features=all_encoder_features_across_views,  # List[Tensor(B, C, H, W)]，每个 view 一个
+            additional_input_tokens=input_scale_token,  # (B, C, 1)
         )
+
+        # 允许两种返回模式：
+        #   - "no_intermediate_features": 只要 final
+        #   - "intermediate_features":    final + 中间层
         intermediate_info_sharing_multi_view_feat: Optional[
             List[MultiViewTransformerOutput]
         ] = None
+
         if self.info_sharing_return_type == "no_intermediate_features":
-            final_info_sharing_multi_view_feat = self.info_sharing(info_sharing_input)
+            # MultiViewAlternatingAttentionTransformer 正常 forward
+            final_info_sharing_multi_view_feat: MultiViewTransformerOutput = \
+                self.info_sharing(info_sharing_input)
         elif self.info_sharing_return_type == "intermediate_features":
             (
                 final_info_sharing_multi_view_feat,
                 intermediate_info_sharing_multi_view_feat,
-            ) = self.info_sharing(info_sharing_input,True)
-        dpt_info_sharing_multi_view_feat = intermediate_info_sharing_multi_view_feat
-
+            ) = self.info_sharing(
+                info_sharing_input,
+                True,  # return_input_as_first_intermediate=True
+            )
+        else:
+            raise ValueError(
+                f"Unsupported info_sharing_return_type={self.info_sharing_return_type}"
+            )
+        # ==================== 小工具：深拷贝/断梯度 ====================
         def _detach_clone_tree(x):
             """递归复制：Tensor -> detach().clone()；容器 -> 递归处理；其他 -> deepcopy。"""
             if isinstance(x, torch.Tensor):
-                return x.detach().clone()  # 新内存，并断开 autograd
+                return x.detach().clone()
             if isinstance(x, dict):
                 return {k: _detach_clone_tree(v) for k, v in x.items()}
             if isinstance(x, (list, tuple)):
                 out = [_detach_clone_tree(v) for v in x]
                 return type(x)(out) if isinstance(x, tuple) else out
             if dataclasses.is_dataclass(x):
-                return type(x)(**{f.name: _detach_clone_tree(getattr(x, f.name))
-                                  for f in dataclasses.fields(x)})
-            return copy.deepcopy(x)  # 兜底
+                return type(x)(
+                    **{
+                        f.name: _detach_clone_tree(getattr(x, f.name))
+                        for f in dataclasses.fields(x)
+                    }
+                )
+            return copy.deepcopy(x)
 
-        if self.store_info_sharing_intermediate_features and self.dpt_indices is not None:
-            dpt_info_sharing_multi_view_feat = [
-                _detach_clone_tree(intermediate_info_sharing_multi_view_feat[i+1])
-                for i in self.dpt_indices
-            ]
+        # ====================构造给 DPT 头用的中间特征 ====================
+        # 目标：
+        #   - 如果 norm_intermediate=True：IFR 里已经做过 self.info_sharing.norm，直接用
+        #   - 如果 norm_intermediate=False：这里用 self.info_sharing.norm 再做一次 LN
+        #   - 注意：这里是给 DPT / 回归头用的路径，不要断梯度
+        dpt_info_sharing_multi_view_feat: Optional[
+            List[MultiViewTransformerOutput]
+        ] = None
+
+        # 既要有中间特征，又要配置了 dpt_indices，才需要准备 DPT 中间特征
+        if intermediate_info_sharing_multi_view_feat is not None and self.dpt_indices is not None:
+            # 直接从 info_sharing 模块上读取 norm_intermediate（构造时已写进去）
+            norm_intermediate_flag: bool = getattr(self.info_sharing, "norm_intermediate", True)
+            dpt_info_sharing_multi_view_feat = []
+            ln = self.info_sharing.norm  # 训练好的 LayerNorm(nn.LayerNorm(self.info_sharing.dim))
+            for dpt_idx in self.dpt_indices:
+                # 注意：IFR 把“block0 输入”放在了 index=0，
+                #      原来配置的 dpt_idx 对应的是 block 输出，所以这里统一 +1
+                src_idx = dpt_idx + 1
+                mvt_out = intermediate_info_sharing_multi_view_feat[src_idx]
+                if norm_intermediate_flag:
+                    # 中间层在 info_sharing 里已经做过 LN，只需 clone 一份，避免和原始对象共享存储
+                    new_feats = [feat.clone() for feat in mvt_out.features]
+                    if mvt_out.additional_token_features is not None:
+                        new_add = mvt_out.additional_token_features.clone()
+                    else:
+                        new_add = None
+                    dpt_info_sharing_multi_view_feat.append(
+                        MultiViewTransformerOutput(
+                            features=new_feats,
+                            additional_token_features=new_add,
+                        )
+                    )
+                else:
+                    # 这里的 mvt_out 还是 raw feature，需要按 IFR 的方式补一次 self.info_sharing.norm
+                    feats_per_view = mvt_out.features  # List[V]，每个 (B,C,H,W)
+                    B, C, H, W = feats_per_view[0].shape
+                    V = len(feats_per_view)
+                    # (B,V,C,H,W) -> (B,V*H*W,C)
+                    stacked = (
+                        torch.stack(feats_per_view, dim=1)      # (B,V,C,H,W)
+                        .permute(0, 1, 3, 4, 2)                 # (B,V,H,W,C)
+                        .reshape(B, V * H * W, C)               # (B,L_view,C)
+                        .contiguous()
+                    )
+                    add = mvt_out.additional_token_features  # (B,C,T) or None
+                    if add is not None:
+                        add_seq = add.permute(0, 2, 1).contiguous()  # (B,T,C)
+                        seq = torch.cat([stacked, add_seq], dim=1)   # (B,L_view+T,C)
+                    else:
+                        seq = stacked
+                    # 用训练好的 LN 做归一化（与最终输出分支保持一致）
+                    seq_norm = ln(seq)  # (B,L,C)
+                    # 拆回 view tokens + 额外 token
+                    if add is not None:
+                        L_view = V * H * W
+                        seq_view_norm = seq_norm[:, :L_view, :]
+                        seq_add_norm = seq_norm[:, L_view:, :]
+                        add_norm = seq_add_norm.permute(0, 2, 1).contiguous()  # (B,C,T)
+                    else:
+                        seq_view_norm = seq_norm
+                        add_norm = None
+                    view_tokens = (
+                        seq_view_norm
+                        .reshape(B, V, H, W, C)
+                        .permute(0, 1, 4, 2, 3)
+                        .contiguous()
+                    )  # (B,V,C,H,W)
+
+                    # 构造新的特征列表，并 clone，保证和原始中间特征不共享内存
+                    view_list = [view_tokens[:, i].clone() for i in range(V)]
+                    if add_norm is not None:
+                        add_norm = add_norm.clone()
+                    dpt_info_sharing_multi_view_feat.append(
+                        MultiViewTransformerOutput(
+                            features=view_list,
+                            additional_token_features=add_norm,
+                        )
+                    )
+        else:
+            dpt_info_sharing_multi_view_feat = None
+        # final 特征：IFR 内部已经做过 self.info_sharing.norm，这里只 detach 一份用于后续（可选）
         final_info_sharing_feat = _detach_clone_tree(final_info_sharing_multi_view_feat)
-
         if self.store_info_sharing_intermediate_features:
+            # 注意：写盘用的是「原始中间特征」的 detach 副本：
+            #   - 如果 norm_intermediate=True：就是 LN 后的版本
+            #   - 如果 norm_intermediate=False：就是 raw，没有任何额外 LN
+            raw_intermediate_for_store = (
+                _detach_clone_tree(intermediate_info_sharing_multi_view_feat)
+                if intermediate_info_sharing_multi_view_feat is not None
+                else None
+            )
             self._stored_info_sharing_features = self._capture_info_sharing_features(
-                final_info_sharing_multi_view_feat,
-                intermediate_info_sharing_multi_view_feat,
-                filename=save_filename
+                final_output=final_info_sharing_multi_view_feat,
+                intermediate_outputs=raw_intermediate_for_store,
+                filename=save_filename,
             )
         else:
             self._stored_info_sharing_features = None
@@ -1852,7 +1953,6 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             raise ValueError(
                 f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
             )
-
         with torch.autocast("cuda", enabled=False):
             # Prepare inputs for the downstream heads
             if self.pred_head_type == "linear":
@@ -2354,7 +2454,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         scale_token = additional_tokens.to(query_feat.dtype)
         final_feat, intermediate_feats = self.info_sharing.forward_query_with_memory(
             query_feat=query_feat,
-            memory_feats=memory_feats,
+            memory_tokens_per_block=memory_feats,
             additional_tokens=input_scale_token,
             memory_keep_ratio=1.0,
         )
