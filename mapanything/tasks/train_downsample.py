@@ -1,436 +1,897 @@
-"""Query-only ACE training entry that skips intermediate feature fusion."""
+"""ACE 风格的回归头训练入口。"""
+
 from __future__ import annotations
 
 import json
 import os
-import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Mapping
+from typing import Any, Dict, List, Tuple, Union, Optional
 
 import hydra
-import imageio
-import numpy as np
+import math
 import torch
+import torch.nn.functional as F
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
-from torch.backends import cudnn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from mapanything.datasets import SevenScenesWAI
 from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
-from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled_WithScale, ACEHead_Pointwise_FiLM, ReproLoss
-from mapanything.tasks.train import (
-    BufferDataset,
-    FeatureReplayBuffer,
-    _loss_fn,
-    _prepare_targets,
-    _resolve_intrinsics,
-    _resolve_pose,
-)
+from mapanything.tasks.ace import ACEHead_Pointwise_Decoupled_WithScale, ACEHead_Pointwise_FiLM, load_memory_features, ReproLoss
 from mapanything.utils.debugprinter import DebugPrinter
+from mapanything.utils.geometry import quaternion_to_rotation_matrix
+
+
 printer = DebugPrinter()
-
-def _sanity_check_buffer_reprojection(
-    buffer: FeatureReplayBuffer,
-    device: torch.device,
-    max_samples: int = 4096,
-    num_workers: int = 0,
-):
+# -----------------------------
+# 1) 轻量 k-means：把大量 token 聚成 K 个中心（作为 memory token）
+# -----------------------------
+@torch.no_grad()
+def kmeans_merge(x: torch.Tensor, k: int, iters: int = 6, metric: str = "cosine"):
     """
-    从 FeatureReplayBuffer 中随机抽一批样本：
-      - 使用 target_world (世界坐标), intrinsics, c2w
-        进行 world->cam->image 投影；
-      - 对比投影得到的 (û, ṽ) 与 buffer 中存的像素 (u', v') 的误差。
-    如果误差很大，说明特征与真值/像素坐标存在对齐问题。
+    x: [N, C]  (已加过位置编码的 token 序列)
+    返回:
+      centers: [k, C]
+      assign_weights: [k, 1] 每个簇的权重 (sqrt(count))，可用于后续加权
     """
-    from torch.utils.data import DataLoader
+    assert x.dim() == 2
+    n, c = x.shape
+    k = min(k, n)
+    if k == n:
+        return x.clone(), torch.ones(k, 1, device=x.device, dtype=x.dtype)
 
-    tmp_dataset = BufferDataset(buffer)
-    if len(tmp_dataset) == 0:
-        print("[SanityCheck] Buffer 为空，跳过重投影检查。")
-        return
-
-    batch_size = min(max_samples, len(tmp_dataset))
-    tmp_loader = DataLoader(
-        tmp_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-    )
-
-    batch = next(iter(tmp_loader))
-
-    # 期望 BufferDataset __getitem__ 返回以下字段：
-    #   - batch["target_world"]: [N,3]
-    #   - batch["intrinsics"]:  [N,3,3]
-    #   - batch["c2w"]:         [N,4,4] 或 [N,3,4]
-    #   - batch["pixels"]:      [N,2]   (u', v')
-    target_world = batch["target_world"].to(device).to(torch.float64)  # (N,3)
-    intrinsics = batch["intrinsics"].to(device).to(torch.float64)     # (N,3,3)
-    c2w = batch["c2w"].to(device).to(torch.float64)                   # (N,*,*)
-    pixels = batch["pixels"].to(device).to(torch.float64)             # (N,2)
-
-    N = target_world.shape[0]
-
-    # ---- 世界坐标 -> 齐次坐标 ----
-    ones = torch.ones(N, 1, dtype=torch.float64, device=device)
-    pts_w_h = torch.cat([target_world, ones], dim=-1)   # (N,4)
-
-    # ---- 统一 c2w 为 (N,4,4)，再求 w2c ----
-    if c2w.shape[-2:] == (3, 4):
-        # pad 成 4x4
-        pad_row = torch.tensor([0, 0, 0, 1], dtype=torch.float64, device=device)
-        pad_row = pad_row.view(1, 1, 4).expand(N, 1, 4)  # (N,1,4)
-        c2w_4x4 = torch.cat([c2w, pad_row], dim=-2)      # (N,4,4)
-    elif c2w.shape[-2:] == (4, 4):
-        c2w_4x4 = c2w
+    # 归一化对齐 cosine 距离
+    if metric == "cosine":
+        x_norm = F.normalize(x, dim=-1)
     else:
-        raise ValueError(f"[SanityCheck] Unexpected c2w shape: {c2w.shape}")
+        x_norm = x
 
-    w2c = torch.inverse(c2w_4x4)                         # (N,4,4)
+    # 初始化：随机选 k 个点
+    idx = torch.randperm(n, device=x.device)[:k]
+    centers = x_norm[idx].clone()  # 用于分配
+    true_centers = x[idx].clone()  # 用于输出（不丢失原值缩放）
 
-    # ---- world -> cam ----
-    pts_c_h = torch.bmm(w2c, pts_w_h.unsqueeze(-1)).squeeze(-1)  # (N,4)
-    Xc = pts_c_h[:, 0]
-    Yc = pts_c_h[:, 1]
-    Zc = pts_c_h[:, 2]
-
-    # ---- 用 intrinsics 投影到像素 ----
-    fx = intrinsics[:, 0, 0]
-    fy = intrinsics[:, 1, 1]
-    cx = intrinsics[:, 0, 2]
-    cy = intrinsics[:, 1, 2]
-
-    Z_safe = Zc.clamp(min=1e-6)
-    u_proj = fx * (Xc / Z_safe) + cx
-    v_proj = fy * (Yc / Z_safe) + cy
-
-    # ---- 与 buffer 中的采样像素比较 ----
-    u_ref = pixels[:, 0]
-    v_ref = pixels[:, 1]
-
-    du = u_proj - u_ref
-    dv = v_proj - v_ref
-    err = torch.sqrt(du * du + dv * dv)  # 像素 L2 误差
-
-    mean_err = err.mean().item()
-    med_err = err.median().item()
-    q90_err = err.quantile(0.9).item()
-    max_err = err.max().item()
-
-    print("[SanityCheck] Buffer reprojection error (target_world -> cam -> image):")
-    print(f"  N samples    = {N}")
-    print(f"  mean  pix err = {mean_err:.4f}")
-    print(f"  median pix err = {med_err:.4f}")
-    print(f"  90%   pix err = {q90_err:.4f}")
-    print(f"  max    pix err = {max_err:.4f}")
-
-    # 你也可以在这里加一个简单的 guard，比如误差过大时直接报错：
-    # if mean_err > 3.0:
-    #     raise RuntimeError(f"[SanityCheck] Mean reprojection error {mean_err:.2f} > 3px, 对齐可能有问题。")
-
-from typing import Mapping
-
-def _eval_head_on_buffer_once(
-    head: nn.Module,
-    buffer: FeatureReplayBuffer,
-    repro_loss: ReproLoss,
-    loss_cfg: DictConfig,
-    device: torch.device,
-    global_step: int,
-    max_samples: int = 4096,
-    num_workers: int = 0,
-) -> Dict[str, float]:
-    """
-    从 FeatureReplayBuffer 中随机抽一批样本，在当前 head 上做一次前向：
-      1. 用 _loss_fn + ReproLoss 计算 loss 和 xyz 误差（err_mean_m 等）
-      2. 额外从 head 的输出中抽出 pred_world（世界坐标）,
-         结合 intrinsics + c2w 计算重投影误差（像素）
-    返回一个扁平化的 dict，key 带 'eval_' 前缀。
-    """
-    if buffer.size == 0:
-        print("[EvalOnBuffer] Buffer 为空，跳过评估。")
-        return {}
-
-    ds = BufferDataset(buffer)
-    batch_size = min(max_samples, len(ds))
-
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-    )
-
-    batch = next(iter(loader))  # 抽一批样本
-
-    # 和训练时保持一致
-    features = batch["features"].to(device)
-    scale = batch["scale_token"].to(device)
-
-    head_was_training = head.training
-    head.eval()
-    with torch.no_grad():
-        preds = head(features, scale)
-        # 先让原来的 _loss_fn 做一遍，拿到 xyz 相关的 metrics
-        loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, loss_cfg)
-
-        # ====== 额外计算：pred_world 的重投影误差 ======
-        # 1) 解包出 pred_world (N,3)
-        if isinstance(preds, torch.Tensor):
-            # 兼容 FiLM / Decoupled: 假设前3维是 xyz
-            pred_world = preds[..., :3]
-        elif isinstance(preds, (list, tuple)):
-            # (preds, scale) 这种形式
-            main_pred = preds[0]
-            pred_world = main_pred[..., :3]
-        elif isinstance(preds, dict):
-            main_pred = preds.get("preds", None)
-            if main_pred is None:
-                raise ValueError("[EvalOnBuffer] preds 是 dict 但不含 'preds' 键，无法解析 pred_world")
-            pred_world = main_pred[..., :3]
+    for _ in range(iters):
+        # 计算距离并分配
+        if metric == "cosine":
+            # 最大相似度 -> 最近中心
+            sim = torch.matmul(x_norm, centers.T)  # [N, k]
+            labels = sim.argmax(dim=1)
         else:
-            raise TypeError(f"[EvalOnBuffer] Unsupported preds type: {type(preds)}")
+            dist = torch.cdist(x_norm, centers, p=2)  # [N, k]
+            labels = dist.argmin(dim=1)
 
-        # 2) 拿到 GT 像素坐标 & 内参 & 位姿
-        #    期望 BufferDataset __getitem__ 已经返回这些字段
-        device_d = device
-        pixels = batch.get("pixels", None)
-        if pixels is None:
-            raise KeyError("[EvalOnBuffer] batch 中没有 'pixels' 字段，无法计算重投影误差。")
-        pixels = pixels.to(device_d).to(torch.float64)           # (N,2)
+        # 聚合得到新中心（用原始 x 求均值，避免累积归一化误差）
+        counts = torch.bincount(labels, minlength=k).clamp_(min=1).to(x.dtype)  # [k]
+        sums = torch.zeros(k, c, device=x.device, dtype=x.dtype)
+        sums.index_add_(0, labels, x)
+        new_centers = sums / counts.unsqueeze(1)  # [k, C]
 
-        intrinsics = batch.get("intrinsics", None)
-        if intrinsics is None:
-            intrinsics = batch.get("camera_intrinsics", None)
-        if intrinsics is None:
-            raise KeyError("[EvalOnBuffer] batch 中没有 'intrinsics' / 'camera_intrinsics' 字段。")
-        intrinsics = intrinsics.to(device_d).to(torch.float64)   # (N,3,3)
+        # 收敛性检查（可选）
+        shift = (new_centers - true_centers).pow(2).mean()
+        true_centers = new_centers
+        if shift < 1e-6:
+            break
 
-        c2w = batch.get("c2w", None)
-        if c2w is None:
-            c2w = batch.get("camera_pose", None)
-        if c2w is None:
-            raise KeyError("[EvalOnBuffer] batch 中没有 'c2w' / 'camera_pose' 字段。")
-        c2w = c2w.to(device_d).to(torch.float64)                 # (N,4,4) or (N,3,4)
+        # 用于下一轮分配的“归一化中心”
+        centers = F.normalize(true_centers, dim=-1) if metric == "cosine" else true_centers
 
-        # 3) 世界坐标 -> 像素
-        N = pred_world.shape[0]
-        pred_world = pred_world.to(device_d, dtype=torch.float64)  # (N,3)
+    assign_weights = torch.sqrt(counts).unsqueeze(1)  # [k, 1]，权重 = sqrt(簇大小)
+    return true_centers, assign_weights
 
-        ones = torch.ones(N, 1, dtype=torch.float64, device=device_d)
-        pts_w_h = torch.cat([pred_world, ones], dim=-1)            # (N,4)
-
-        # 统一 c2w 为 (N,4,4)，再求 w2c
-        if c2w.shape[-2:] == (3, 4):
-            pad_row = torch.tensor([0, 0, 0, 1], dtype=torch.float64, device=device_d)
-            pad_row = pad_row.view(1, 1, 4).expand(N, 1, 4)        # (N,1,4)
-            c2w_4x4 = torch.cat([c2w, pad_row], dim=-2)            # (N,4,4)
-        elif c2w.shape[-2:] == (4, 4):
-            c2w_4x4 = c2w
+# -----------------------------
+# 2) 按块聚合器：对 24 个块分别把 N 视图的 token 聚成 K_b 个记忆 token
+# -----------------------------
+class BlockwiseAggregator(nn.Module):
+    def __init__(
+        self,
+        num_blocks: int = 24,
+        tokens_per_block: Union[int, List[int]] = 256,
+        kmeans_iters: int = 6,
+        metric: str = "cosine",
+        pre_cap: Optional[int] = 8192,
+        weight_scale: bool = True,
+    ):
+        super().__init__()
+        self.num_blocks = num_blocks
+        if isinstance(tokens_per_block, int):
+            self.tokens_per_block = [tokens_per_block] * num_blocks
         else:
-            raise ValueError(f"[EvalOnBuffer] Unexpected c2w shape: {c2w.shape}")
+            assert len(tokens_per_block) == num_blocks
+            self.tokens_per_block = tokens_per_block
+        self.kmeans_iters = kmeans_iters
+        self.metric = metric
+        self.pre_cap = pre_cap
+        self.weight_scale = weight_scale
 
-        w2c = torch.inverse(c2w_4x4)                               # (N,4,4)
+    @staticmethod
+    def _to_tokens(feat: torch.Tensor) -> torch.Tensor:
+        if feat.dim() == 2:
+            return feat.contiguous()
+        elif feat.dim() == 3:
+            C, H, W = feat.shape
+            return feat.permute(1, 2, 0).reshape(H * W, C).contiguous()
+        elif feat.dim() == 4:
+            B, C, H, W = feat.shape
+            return feat.permute(0, 2, 3, 1).reshape(B * H * W, C).contiguous()
+        else:
+            raise ValueError(f"Unsupported feat dim={feat.dim()}, expected 2/3/4.")
+    @torch.no_grad()
+    def forward(self, memory_feats: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+        assert len(memory_feats) == self.num_blocks, \
+            f"期望 {self.num_blocks} 个块，收到 {len(memory_feats)}"
 
-        # world -> cam
-        pts_c_h = torch.bmm(w2c, pts_w_h.unsqueeze(-1)).squeeze(-1)  # (N,4)
-        Xc = pts_c_h[:, 0]
-        Yc = pts_c_h[:, 1]
-        Zc = pts_c_h[:, 2]
+        memory_tokens_per_block: List[torch.Tensor] = []
 
-        fx = intrinsics[:, 0, 0]
-        fy = intrinsics[:, 1, 1]
-        cx = intrinsics[:, 0, 2]
-        cy = intrinsics[:, 1, 2]
+        for b in range(self.num_blocks):
+            views = memory_feats[b]
+            assert len(views) > 0, f"block {b} 为空"
+            first_valid = None
+            for t in views:
+                if t is not None:
+                    first_valid = t
+                    break
+            if first_valid is None:
+                raise ValueError(f"block {b} 全为 None")
 
-        Z_safe = Zc.clamp(min=1e-6)
-        u_proj = fx * (Xc / Z_safe) + cx
-        v_proj = fy * (Yc / Z_safe) + cy
+            dev = first_valid.device
+            dtype = first_valid.dtype
 
-        u_ref = pixels[:, 0]
-        v_ref = pixels[:, 1]
+            tokens_b = []
+            for v, feat in enumerate(views):
+                if feat is None:
+                    continue
+                if feat.device != dev:
+                    feat = feat.to(dev, non_blocking=True)
+                tb = self._to_tokens(feat)  # [T_vb, C]
+                assert tb.dim() == 2, f"block {b}, view {v} 转换失败，得到维度 {tb.dim()}"
+                tokens_b.append(tb)
 
-        du = u_proj - u_ref
-        dv = v_proj - v_ref
-        reproj_err = torch.sqrt(du * du + dv * dv)  # (N,)
+            if len(tokens_b) == 0:
+                memory_tokens_per_block.append(
+                    torch.empty(0, first_valid.shape[-3] if first_valid.dim() >= 3 else first_valid.shape[-1],
+                                device=dev, dtype=dtype)
+                )
+                continue
 
-        reproj_mean = reproj_err.mean().item()
-        reproj_med = reproj_err.median().item()
-        reproj_q90 = reproj_err.quantile(0.9).item()
-        reproj_max = reproj_err.max().item()
+            x = torch.cat(tokens_b, dim=0)  # [T_total_b, C]
+            if self.pre_cap is not None and x.shape[0] > self.pre_cap:
+                idx = torch.randperm(x.shape[0], device=dev)[: self.pre_cap]
+                x = x.index_select(0, idx)
 
-    if head_was_training:
-        head.train()
+            Kb = int(self.tokens_per_block[b])
+            centers, weights = kmeans_merge(x, k=Kb, iters=self.kmeans_iters, metric=self.metric)  # [Kb,C], [Kb,1]
+            if self.weight_scale:
+                centers = centers * weights  # 频次加权
 
-    # ====== 汇总所有 eval 指标 ======
-    out: Dict[str, float] = {}
-    out["eval_total_loss"] = float(loss.item())
-    if isinstance(metrics, Mapping):
-        for k, v in metrics.items():
-            if isinstance(v, torch.Tensor):
-                v = v.detach().cpu().item()
-            try:
-                out[f"eval_{k}"] = float(v)
-            except Exception:
-                pass
+            memory_tokens_per_block.append(centers.to(device=dev, dtype=dtype))
 
-    # 追加重投影相关指标（像素单位）
-    out["eval_reproj_err_px_mean"] = reproj_mean
-    out["eval_reproj_err_px_median"] = reproj_med
-    out["eval_reproj_err_px_q90"] = reproj_q90
-    out["eval_reproj_err_px_max"] = reproj_max
+        return memory_tokens_per_block
 
-    return out
+# ---------------------------------------------------------------------------
+# 数据结构
+# ---------------------------------------------------------------------------
+@dataclass
+class BufferTensors:
+    features: torch.Tensor
+    scale_token: torch.Tensor
+    target_world: torch.Tensor
+    pixels: torch.Tensor
+    intrinsics: torch.Tensor
+    c2w: torch.Tensor
 
-def _collect_buffer_query_only(
-    cfg: DictConfig,
-    model,
-    upsampler,
-    dataset,
-    device: torch.device,
+class FeatureReplayBuffer:
+    """仿照 ACE，把随机采样的像素特征/位姿放入固定大小的缓冲区。"""
+
+    def __init__(self, buffer_size: int, feat_dim: int, device: torch.device):
+        self.buffer_size = buffer_size
+        self.device = device
+        self.size = 0
+        self.storage = BufferTensors(
+            features=torch.empty((buffer_size, feat_dim), device=device, dtype=torch.float32),
+            scale_token=torch.empty((buffer_size,feat_dim), device=device, dtype=torch.float32),
+            target_world=torch.empty((buffer_size, 3), device=device, dtype=torch.float32),
+            pixels=torch.empty((buffer_size, 2), device=device, dtype=torch.float32),
+            intrinsics=torch.empty((buffer_size, 3, 3), device=device, dtype=torch.float32),
+            c2w=torch.empty((buffer_size, 4, 4), device=device, dtype=torch.float32),
+        )
+
+    @property
+    def is_full(self) -> bool:
+        return self.size >= self.buffer_size
+
+    def _remaining(self) -> int:
+        return max(0, self.buffer_size - self.size)
+
+    def add_view(
+            self,
+            fused_feature: torch.Tensor,  # [1,C,H,W] 或 [C,H,W]
+            scale_token: torch.Tensor,
+            target_world: torch.Tensor,  # [H,W,3]
+            valid_mask: torch.Tensor,  # [H,W]
+            intrinsics: torch.Tensor,  # [3,3]
+            c2w: torch.Tensor,  # [4,4]
+            max_per_view: int,
+            pixel_grid: Optional[torch.Tensor] = None, # [H, W, 2] 新增参数，用于直接传入下采样后的中心坐标
+    ) -> int:
+        """从特征图随机采样 max_per_view 个有效像素，写入缓冲区（不超过剩余容量）。"""
+        if self.is_full:
+            return 0
+        # -------- 形状归一：features -> [C,H,W] --------
+        if fused_feature.dim() == 4:
+            b, c, h, w = fused_feature.shape
+            assert b == 1, f"add_view expects single-view tensor, got batch={b}"
+            feat_CHW = fused_feature[0]
+        elif fused_feature.dim() == 3:
+            c, h, w = fused_feature.shape
+            feat_CHW = fused_feature
+        else:
+            raise ValueError(f"Unexpected fused_feature shape: {tuple(fused_feature.shape)}")
+        # -------- 形状归一：scale_token -> [C]（本视角共享一个 token）--------
+        st = scale_token
+        if st.dim() == 1:
+            scale_vec = st
+        elif st.dim() == 2 and 1 in st.shape:
+            scale_vec = st.view(-1)
+        elif st.dim() == 3 and (st.shape[-1] == 1 or st.shape[-2] == 1):
+            scale_vec = st.view(-1)
+        elif st.dim() == 4 and st.shape[0] == 1 and st.shape[-2:] == (1, 1):
+            scale_vec = st.view(-1)
+        else:
+            raise ValueError(f"Unexpected scale_token shape for a per-view token: {tuple(st.shape)}")
+        if scale_vec.numel() != c:
+            raise ValueError(
+                f"Scale token length ({scale_vec.numel()}) != feature dim ({c}). "
+                f"Make sure your token size matches channel dim."
+            )
+        scale_vec = scale_vec.to(feat_CHW.device).contiguous()  # [C]
+
+        # -------- target_world -> [H,W,3] --------
+        if target_world.dim() == 4:  # [1,3,H,W]
+            assert target_world.shape[0] == 1
+            tw = target_world[0]
+            if tw.shape[0] == 3:
+                tw_HWC = tw.permute(1, 2, 0).contiguous()
+            else:
+                raise ValueError(f"Unexpected target_world shape: {tuple(target_world.shape)}")
+        elif target_world.dim() == 3:
+            if target_world.shape[0] == 3:  # [3,H,W]
+                tw_HWC = target_world.permute(1, 2, 0).contiguous()
+            elif target_world.shape[2] == 3:  # [H,W,3]
+                tw_HWC = target_world.contiguous()
+            else:
+                raise ValueError(f"Unexpected target_world shape: {tuple(target_world.shape)}")
+        else:
+            raise ValueError(f"Unexpected target_world shape: {tuple(target_world.shape)}")
+
+        # -------- valid_mask -> [H,W] (bool) --------
+        if valid_mask is None:
+            vm_HW = torch.ones((h, w), dtype=torch.bool, device=feat_CHW.device)
+        else:
+            if valid_mask.dim() == 4:  # [1,1,H,W]
+                vm_HW = valid_mask[0, 0].to(torch.bool)
+            elif valid_mask.dim() == 3:  # [1,H,W]
+                vm_HW = valid_mask[0].to(torch.bool)
+            elif valid_mask.dim() == 2:  # [H,W]
+                vm_HW = valid_mask.to(torch.bool)
+            else:
+                raise ValueError(f"Unexpected valid_mask shape: {tuple(valid_mask.shape)}")
+
+        # -------- 尺寸检查 --------
+        assert tw_HWC.shape[0] == h and tw_HWC.shape[1] == w, \
+            f"Size mismatch: features ({h},{w}) vs target_world {tuple(tw_HWC.shape[:2])}"
+        assert vm_HW.shape[0] == h and vm_HW.shape[1] == w, \
+            f"Size mismatch: features ({h},{w}) vs valid_mask {tuple(vm_HW.shape)}"
+
+        # -------- 展平并构建像素坐标 --------
+        feats_flat = feat_CHW.view(c, -1).t()  # [N,C]
+        targets_flat = tw_HWC.view(-1, 3)  # [N,3]
+        mask_flat = vm_HW.view(-1)  # [N]
+        if not mask_flat.any().item():
+            return 0
+
+        # [修改] 使用传入的 pixel_grid 或 默认 meshgrid
+        if pixel_grid is not None:
+            # pixel_grid: [H, W, 2]
+            assert pixel_grid.shape[0] == h and pixel_grid.shape[1] == w
+            pixels_flat = pixel_grid.to(feat_CHW.device).view(-1, 2)
+        else:
+            ys, xs = torch.meshgrid(
+                torch.arange(h, device=feat_CHW.device),
+                torch.arange(w, device=feat_CHW.device),
+                indexing="ij"
+            )
+            pixels_flat = torch.stack([xs, ys], dim=-1).view(-1, 2)  # [N,2]  (u,v)
+
+        # -------- 采样（仅有效，且不超过剩余容量）--------
+        valid_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+        if valid_idx.numel() == 0:
+            return 0
+        remaining = self._remaining() if hasattr(self, "_remaining") else (self.capacity - self.size)
+        if remaining <= 0:
+            return 0
+        num_to_take = min(max_per_view, valid_idx.numel(), remaining)
+        perm = torch.randperm(valid_idx.numel(), device=feat_CHW.device)
+        chosen = valid_idx[perm[:num_to_take]]
+        if chosen.numel() == 0:
+            return 0
+
+        # -------- 写入缓冲区 --------
+        slot = slice(self.size, self.size + chosen.numel())
+        self.storage.features[slot] = feats_flat[chosen].to(self.device)
+        self.storage.target_world[slot] = targets_flat[chosen].to(self.device)
+        self.storage.pixels[slot] = pixels_flat[chosen].to(self.device)  # (u,v)
+        # 视角常量：intrinsics / c2w
+        self.storage.intrinsics[slot] = intrinsics.to(self.device)
+        self.storage.c2w[slot] = c2w.to(self.device)
+        # 每个采样都使用同一个 per-view scale token（广播）
+        self.storage.scale_token[slot] = scale_vec.unsqueeze(0).expand(chosen.numel(), -1).to(self.device)
+        self.size += chosen.numel()
+
+        return int(chosen.numel())
+
+class BufferDataset(Dataset):
+    """薄包装，直接从缓冲区张量读取样本。"""
+
+    def __init__(self, buffer: FeatureReplayBuffer):
+        self.buffer = buffer
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return self.buffer.size
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:  # pragma: no cover - thin wrapper
+        return {
+            "features": self.buffer.storage.features[idx],
+            "scale_token": self.buffer.storage.scale_token[idx],
+            "target_world": self.buffer.storage.target_world[idx],
+            "pixels": self.buffer.storage.pixels[idx],
+            "intrinsics": self.buffer.storage.intrinsics[idx],
+            "c2w": self.buffer.storage.c2w[idx],
+        }
+
+# ---------------------------------------------------------------------------
+# 基础几何工具
+# ---------------------------------------------------------------------------
+def _project_world_points(
+    points_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    c2w: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """稠密投影版本，兼容 Bx3xHxW 的输入。"""
+
+    batch, _, height, width = points_world.shape
+    if intrinsics.dim() == 2:
+        intrinsics = intrinsics.unsqueeze(0)
+    if intrinsics.size(0) == 1 and batch > 1:
+        intrinsics = intrinsics.expand(batch, -1, -1)
+    if c2w.dim() == 2:
+        c2w = c2w.unsqueeze(0)
+    if c2w.size(0) == 1 and batch > 1:
+        c2w = c2w.expand(batch, -1, -1)
+
+    points_flat = points_world.view(batch, 3, -1)
+    rotation = c2w[:, :3, :3]
+    translation = c2w[:, :3, 3:4]
+    cam_points = torch.bmm(rotation.transpose(1, 2), points_flat - translation)
+
+    z = cam_points[:, 2:3, :]
+    valid = z > 1e-6
+    pixels = torch.bmm(intrinsics, cam_points)
+    pixels = pixels[:, :2, :] / z.clamp(min=1e-6)
+    return pixels.view(batch, 2, height, width), valid.view(batch, 1, height, width)
+
+
+def _resolve_intrinsics(view: Dict[str, Any], device: torch.device) -> torch.Tensor:
+    if "camera_intrinsics" in view:
+        intr = torch.as_tensor(view["camera_intrinsics"], device=device, dtype=torch.float32)
+    elif "intrinsics" in view:
+        intr = torch.as_tensor(view["intrinsics"], device=device, dtype=torch.float32)
+    else:
+        raise KeyError("Camera intrinsics not available in view dictionary.")
+
+    # 统一到 [B, 3, 3]
+    if intr.dim() == 2:  # [3, 3]
+        intr = intr.unsqueeze(0)
+    return intr
+
+
+def _resolve_pose(view: Dict[str, Any], device: torch.device) -> torch.Tensor:
+    if "camera_pose" in view:
+        pose = torch.as_tensor(view["camera_pose"], device=device, dtype=torch.float32)
+    elif "camera_pose_quats" in view and "camera_pose_trans" in view:
+        # 合成 pose
+        quats = torch.as_tensor(view["camera_pose_quats"], device=device, dtype=torch.float32)
+        trans = torch.as_tensor(view["camera_pose_trans"], device=device, dtype=torch.float32)
+        # 注意：这里假设 quaternion_to_rotation_matrix 支持 batch
+        # 如果不支持，可能需要 reshape
+        rot = quaternion_to_rotation_matrix(quats)  # [B, 3, 3] or [3, 3]
+        if rot.dim() == 2: rot = rot.unsqueeze(0)
+        if trans.dim() == 1: trans = trans.unsqueeze(0)
+
+        B = rot.shape[0]
+        pose = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
+        pose[:, :3, :3] = rot
+        pose[:, :3, 3] = trans.view(B, 3)
+    else:
+        raise KeyError("Camera pose not available in view dictionary.")
+
+    # 统一到 [B, 4, 4]
+    if pose.dim() == 2:
+        pose = pose.unsqueeze(0)
+
+    return pose
+
+def _prepare_targets(view: Dict[str, Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load and preprocess ground truth 3D points and valid mask.
+    Handles inputs with or without batch dimension.
+    Returns:
+        pts3d: [B, 3, H, W]
+        valid_mask: [B, 1, H, W]
+    """
+    if "pts3d" not in view:
+        # 尝试从 'depth' 或 'depthmap' 恢复，或者报错
+        # 这里假设必须有 pts3d (ACE 训练通常需要世界坐标)
+        raise KeyError("View is missing dense world coordinates (pts3d).")
+
+    pts3d = torch.as_tensor(view["pts3d"], device=device, dtype=torch.float32)
+
+    # 统一维度到 [B, 3, H, W]
+    # Case A: [H, W, 3] -> [1, 3, H, W]
+    if pts3d.dim() == 3 and pts3d.shape[-1] == 3:
+        pts3d = pts3d.permute(2, 0, 1).unsqueeze(0)
+    # Case B: [B, H, W, 3] -> [B, 3, H, W]  (DataLoader batch_size=1 常见情况)
+    elif pts3d.dim() == 4 and pts3d.shape[-1] == 3:
+        pts3d = pts3d.permute(0, 3, 1, 2)
+    # Case C: [B, 3, H, W] -> 保持不变
+    elif pts3d.dim() == 4 and pts3d.shape[1] == 3:
+        pass
+    else:
+        raise ValueError(f"Unsupported pts3d shape: {pts3d.shape}")
+
+    # 处理 Mask
+    if "valid_mask" in view:
+        mask = torch.as_tensor(view["valid_mask"], device=device, dtype=torch.float32)
+        # Case A: [H, W] -> [1, 1, H, W]
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        # Case B: [B, H, W] -> [B, 1, H, W]
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        # Case C: [B, H, W, 1] -> [B, 1, H, W]
+        elif mask.dim() == 4 and mask.shape[-1] == 1:
+            mask = mask.permute(0, 3, 1, 2)
+        valid_mask = mask
+    else:
+        # 默认全有效
+        valid_mask = torch.ones((pts3d.shape[0], 1, pts3d.shape[2], pts3d.shape[3]),
+                                device=device, dtype=torch.float32)
+
+    return pts3d, valid_mask
+
+# ---------------------------------------------------------------------------
+# 缓冲区构建与损失
+# ---------------------------------------------------------------------------
+def _collect_buffer(
+        cfg: DictConfig,
+        model,
+        upsampler,  # 这里的 upsampler 可以是 None
+        dataset,
+        memory_feats,  # 这里的 memory_feats 即使传进来，我们也可以选择不用
+        memory_token,
+        device: torch.device,
 ) -> Tuple[FeatureReplayBuffer, int]:
-    """Fill the replay buffer using only query features (no memory fusion)."""
     buffer: FeatureReplayBuffer | None = None
-    # 兼容两种命名：buffer_size / buffer_capacity
-    capacity = int(getattr(cfg.training, "buffer_size",
-                    getattr(cfg.training, "buffer_capacity", 0)))
-    if capacity <= 0:
-        raise ValueError("training.buffer_size / training.buffer_capacity 未正确设置为正整数。")
 
-    # === Debug: 只保存前 N 个 batch 的视图图像，用于检查是否重复 ===
-    debug_save_first_n = 5
-    debug_dir = Path("/home/xwh/project/tmp")
-    debug_dir.mkdir(parents=True, exist_ok=True)
     capacity = int(getattr(cfg.training, "buffer_size", getattr(cfg.training, "buffer_capacity", 0)))
     if capacity <= 0:
-        raise ValueError("training.buffer_size / training.buffer_capacity 未正确设置为正整数。")
+        raise ValueError("training.buffer_size 未正确设置。")
 
     pbar = tqdm(total=capacity, desc="Filling training buffer", unit="sample", leave=False)
+
+    # 构造一个空的 Memory 列表，用于强制模型进入单视图模式
+    # 假设模型有 24 层 block，我们传入 24 个 None
+    # 这样 forward_query_with_memory 会跳过所有 Cross-Attention
+    num_blocks = getattr(model.info_sharing, "depth", 24)
+    empty_memory = [None] * num_blocks
+
     try:
         for batch_id, views in enumerate(dataset):
-            if batch_id < debug_save_first_n:
-                view0 = views[0]
-                img = view0["img"]  # 可能是 [1,3,H,W] 或 [3,H,W]
-
-                # 先搬到 CPU，再做后处理
-                img = img.detach().cpu()
-
-                # 如果是 [1,3,H,W]，去掉 batch 维
-                if img.dim() == 4:
-                    img = img[0]  # [3,H,W]
-
-                # [3,H,W] -> [H,W,3]
-                img_np = img.permute(1, 2, 0).numpy()
-
-                # 如果你的图像是 0~1 浮点，这样处理；如果是别的范围也没关系，你只是想看“是否相同”
-                img_np = np.clip(img_np, 0.0, 1.0)
-                img_uint8 = (img_np * 255.0).astype(np.uint8)
-
-                out_path = debug_dir / f"view_batch{batch_id:03d}_view0.png"
-                imageio.imwrite(out_path, img_uint8)
             batch = views
             for view in batch:
-                if "idx" in view:
-                    view["idx"] = view["idx"][2:]
+                if "idx" in view: view["idx"] = view["idx"][2:]
 
+            # 转到 GPU
             ignore_keys = {"dataset", "label", "instance", "idx", "true_shape", "rng", "data_norm_type"}
             for view in batch:
                 for name in list(view.keys()):
-                    if name in ignore_keys:
-                        continue
+                    if name in ignore_keys: continue
                     view[name] = view[name].to(device, non_blocking=True)
 
             with torch.no_grad():
-                memory_tokens = [None] * getattr(model.info_sharing, "depth", 24)
-                scale_token = nn.Parameter(torch.zeros(model.encoder.enc_embed_dim))
-                torch.nn.init.trunc_normal_(scale_token, std=0.02)
-                scale_token = scale_token.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1).to(device)
-                # scale_token = model.scale_token.view(1, -1, 1).to(device)
-                fused_feature, fused_token, dense_out_feat, pose_out, scale_out = model.forward_with_memory_dense_feature(
+                # [关键修改]：传入 empty_memory 而不是 memory_feats
+                # 这样模型只提取 Query 自身的特征，不做 Memory 融合
+                fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
                     query_view=batch,
                     device=str(device),
-                    memory_tokens_per_block=memory_tokens,
-                    additional_tokens=scale_token,
-                    memory_keep_ratio=1.0,
+                    memory_tokens_per_block=empty_memory,  # <--- 强制不用 Memory
+                    additional_tokens=memory_token,
+                    memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                     memory_efficient_inference=cfg.training.memory_efficient_inference,
                 )
-                printer.print(fused_feature,'fused_feature')
-                printer.print(fused_token,'fused_token')
-                printer.print(dense_out_feat,'dense_out_feat')
-                printer.print(pose_out,'pose_out')
-                printer.print(scale_out,'scale_out')
-                import sys
-                sys.exit(0)
-                dense_feat_up = upsampler(batch[0]["img"], fused_feature)
+
+                # [关键修改]：直接使用下采样的特征 (28x37)，不进行上采样
+                # fused_feature shape: [1, C, 28, 37]
+                feat_down = fused_feature
 
             view = batch[0]
-            target_world, valid_mask = _prepare_targets(view, device)
+            # 获取全分辨率的 GT (392x518)
+            target_world_full, valid_mask_full = _prepare_targets(view, device)
+
+            # --- 2D-3D 对齐逻辑：Patch 中心采样 ---
+            H0, W0 = target_world_full.shape[-2:]  # 原图尺寸
+            Hf, Wf = feat_down.shape[-2:]  # 特征尺寸
+
+            # 1. 构建特征网格索引
+            i = torch.arange(Hf, device=device)
+            j = torch.arange(Wf, device=device)
+            yy, xx = torch.meshgrid(i, j, indexing="ij")  # yy: [Hf, Wf], xx: [Hf, Wf]
+
+            # 2. 计算 Patch 大小
+            patch_h = H0 / Hf
+            patch_w = W0 / Wf
+
+            # 3. 计算 Patch 中心在原图中的精确像素坐标
+            u_c = (xx + 0.5) * patch_w  # [Hf, Wf]
+            v_c = (yy + 0.5) * patch_h  # [Hf, Wf]
+
+            # 4. 归一化到 [-1, 1] 用于 grid_sample (align_corners=True)
+            x_norm = (u_c / (W0 - 1)) * 2 - 1
+            y_norm = (v_c / (H0 - 1)) * 2 - 1
+            grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)  # [1, Hf, Wf, 2]
+
+            # 5. 采样 GT 3D 坐标
+            # target_world_full: [1, 3, H0, W0] -> [1, 3, Hf, Wf]
+            target_world_down = F.grid_sample(target_world_full, grid, mode='bilinear', align_corners=True)
+            target_world_for_buffer = target_world_down.squeeze(0).permute(1, 2, 0)  # [Hf, Wf, 3]
+
+            # 6. 采样 Mask (使用 nearest 避免无效值扩散)
+            valid_mask_down = F.grid_sample(valid_mask_full.float(), grid, mode='nearest', align_corners=True)
+            valid_mask_for_buffer = valid_mask_down.squeeze(0).squeeze(0).bool()  # [Hf, Wf]
+
+            # 7. 准备 Buffer 用的像素坐标 (用于 Loss 重投影)
+            # 必须使用精确计算的 u_c, v_c，而不是整数索引
+            pixel_grid_for_buffer = torch.stack([u_c, v_c], dim=-1)  # [Hf, Wf, 2]
+
             intrinsics = _resolve_intrinsics(view, device).to(torch.float32)
             c2w = _resolve_pose(view, device).to(torch.float32)
 
             if buffer is None:
-                in_channels = int(dense_feat_up.shape[1])
+                in_channels = int(feat_down.shape[1])
                 buffer = FeatureReplayBuffer(capacity, in_channels, device=torch.device("cpu"))
 
+            # 8. 写入 Buffer
             added = buffer.add_view(
-                dense_feat_up.squeeze(0).detach(),
-                fused_token.squeeze(0).detach(),
-                target_world.squeeze(0).detach(),
-                valid_mask.squeeze(0).detach(),
-                intrinsics.squeeze(0).detach(),
-                c2w.squeeze(0).detach(),
+                feat_down.squeeze(0).detach(),  # [C, 28, 37]
+                fused_token.squeeze(0).detach(),  # [C]
+                target_world_for_buffer.detach(),  # [28, 37, 3]
+                valid_mask_for_buffer.detach(),  # [28, 37]
+                intrinsics.squeeze(0).detach(),  # [3, 3]
+                c2w.squeeze(0).detach(),  # [4, 4]
                 cfg.training.samples_per_view,
+                pixel_grid=pixel_grid_for_buffer.detach()  # [28, 37, 2] 传入精确坐标
             )
+
             if added > 0:
                 pbar.update(added)
             if buffer.is_full:
                 break
 
         if buffer is None or buffer.size == 0:
-            raise RuntimeError("No training samples were collected. Check dataset or configuration.")
+            raise RuntimeError("Buffer empty.")
         return buffer, buffer.storage.features.shape[1]
+
     finally:
         pbar.close()
 
-
-def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
-    device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
-    cudnn.benchmark = not cfg.disable_cudnn_benchmark
-    # AMP 类型
-    if cfg.amp:
-        if cfg.amp_dtype == "fp16":
-            amp_dtype = torch.float16
-        elif cfg.amp_dtype == "bf16":
-            if torch.cuda.is_bf16_supported():
-                amp_dtype = torch.bfloat16
-            else:
-                warnings.warn("bf16 is not supported on this device. Using fp16 instead.")
-                amp_dtype = torch.float16
-        elif cfg.amp_dtype == "fp32":
-            amp_dtype = torch.float32
+def _invert_c2w_to_w2c(c2w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    c2w: [N,3,4] or [N,4,4]
+    return Rcw^T, -Rcw^T * tcw   (world->cam: Xc = Rwc * Xw + twc)
+    """
+    if c2w.shape[-2:] == (4, 4):
+        w2c = torch.inverse(c2w)  # [N,4,4]
+        R = w2c[:, :3, :3]
+        t = w2c[:, :3, 3:4]
+        return R, t
+    elif c2w.shape[-2:] == (3, 4):
+        Rcw = c2w[:, :3, :3]                  # cam->world
+        tcw = c2w[:, :3, 3:4]
+        R = Rcw.transpose(-1, -2)             # world->cam
+        t = -R @ tcw
+        return R, t
     else:
-        amp_dtype = torch.float32
+        raise ValueError(f"Unexpected c2w shape: {tuple(c2w.shape)}")
 
+def _project_world_points_sparse(
+    Xw_N3: torch.Tensor,
+    K_N33: torch.Tensor,
+    c2w_N: torch.Tensor,
+    depth_min: float = 1e-4
+) -> torch.Tensor:
+    """
+    Xw_N3 -> pixels_N2  (batched, no mask; z clamped to depth_min)
+    """
+    R, t = _invert_c2w_to_w2c(c2w_N)                      # [N,3,3], [N,3,1]
+    Xw = Xw_N3.unsqueeze(-1)                              # [N,3,1]
+    Xc = R @ Xw + t                                       # [N,3,1]
+    Xc_z = Xc[:, 2:3, :]                                  # [N,1,1]
+    Xc_z = Xc_z.clamp(min=depth_min)
+    uvd = K_N33 @ Xc                                      # [N,3,1]
+    uv = uvd[:, :2, :] / Xc_z                             # [N,2,1]
+    return uv.squeeze(-1)                                 # [N,2]
+
+# 尺度正则默认关闭，需在 loss.scale_reg.enabled=true 才会生效。
+# match_to_gt：需要 batch 中提供 target_world 与 c2w。
+# unit：用于无尺度预测（解耦方案），把中位数拉向 1。
+# prior：无 GT 时让深度中位数靠近 depth_prior。
+# 正则权重建议从 1e-4 ~ 1e-3 起步，防止盖过主监督信号。
+def _loss_fn(
+    preds,                           # Tensor [N,4] 或 (Tensor[N,4], scale[N]) 或 {"preds":..., "scale":...}
+    batch: DictConfig | dict,
+    repro_loss,
+    global_step,
+    loss_cfg: DictConfig,
+):
+    """
+    兼容两种回归头：
+      - FiLM: preds = Tensor[N,4]  (已是有尺度 XYZ + raw)
+      - Decoupled+Scale: preds = (Tensor[N,4], scale[N]) 或 dict{"preds":Tensor[N,4], "scale":Tensor[N]}
+
+    Required in batch:
+      - intrinsics: [N,3,3]
+      - c2w: [N,3,4] or [N,4,4]
+      - pixels: [N,2]       (if mode='reproj')
+      - target_world: [N,3] (if mode='xyz' 或 scale_reg.match_to_gt)
+
+    loss_cfg keys:
+      - mode: 'reproj' | 'xyz'                      (default 'reproj')
+      - conf_mode: 'log_sigma' | 'confidence'       (default 'log_sigma')
+      - sigma_min/sigma_max/depth_min/depth_max/eps
+      - repro_loss_hard_clamp, depth_target
+      - scale_reg: {enabled, variant: 'match_to_gt'|'unit'|'prior', weight, depth_prior}
+    """
+    # ---------- unpack two head cases ----------
+    scale = None
+    if isinstance(preds, (tuple, list)):
+        preds, scale = preds
+    elif isinstance(preds, dict):
+        scale = preds.get("scale", None)
+        preds = preds["preds"]
+
+    device     = preds.device
+    mode       = getattr(loss_cfg, "mode", "reproj")
+    conf_mode  = getattr(loss_cfg, "conf_mode", "log_sigma")
+    sigma_min  = float(getattr(loss_cfg, "sigma_min", 1e-4))
+    sigma_max  = float(getattr(loss_cfg, "sigma_max", 10.0))
+    depth_min  = float(getattr(loss_cfg, "depth_min", 1e-4))
+    depth_max  = float(getattr(loss_cfg, "depth_max", 50.0))
+    eps        = float(getattr(loss_cfg, "eps", 1e-8))
+    sqrt2      = math.sqrt(2.0)
+
+    # flatten BCHW 情况（通常你的缓冲区已是 [N,4]；这里容错）
+    if preds.dim() == 4:  # [B,4,H,W] -> [N,4]
+        B, C, H, W = preds.shape
+        preds = preds.permute(0, 2, 3, 1).reshape(-1, C)
+
+    coords_pred_in = preds[:, :3]  # 若带 scale，这是 XYZ_unit；否则是有尺度 XYZ
+    raw            = preds[:, 3]   # 异方差 raw
+
+    # -------- map raw -> sigma (>0) --------
+    if conf_mode == "confidence":
+        p = torch.sigmoid(raw)
+        sigma = (1.0 - p) * sigma_max + p * sigma_min
+    else:  # 'log_sigma'
+        sigma = F.softplus(raw) + eps
+        sigma = torch.clamp(sigma, min=sigma_min, max=sigma_max)
+    log_sigma = torch.log(sigma)
+
+    # 如果提供了 scale，则这是 Decoupled 情况：先把无尺度坐标乘回尺度
+    if scale is not None:
+        scale = scale.to(device).view(-1)                   # [N]
+        coords_unit = coords_pred_in                        # for scale regularization('unit')
+        coords      = coords_unit * scale.unsqueeze(-1)     # 有尺度坐标，进入主监督
+    else:
+        coords_unit = None
+        coords      = coords_pred_in                        # FiLM 情况：已是有尺度
+
+    # =============== helpers ===============
+    def _invert_c2w_to_w2c(c2w: torch.Tensor):
+        if c2w.shape[-2:] == (4, 4):
+            w2c = torch.inverse(c2w)
+            R, t = w2c[:, :3, :3], w2c[:, :3, 3:4]
+        else:
+            Rcw, tcw = c2w[:, :3, :3], c2w[:, :3, 3:4]
+            R = Rcw.transpose(-1, -2)
+            t = -R @ tcw
+        return R, t
+
+    def _scale_reg_add(total_loss, z_flat: torch.Tensor,
+                       *, variant: str, weight: float,
+                       c2w=None, target_world=None, depth_prior=None):
+        """对 z 的中位数做轻微尺度正则；返回 total_loss+reg, reg_value"""
+        if weight <= 0:
+            return total_loss, 0.0
+        med_pred = torch.median(z_flat)
+
+        if variant == "match_to_gt":
+            if target_world is None or c2w is None:
+                return total_loss, 0.0
+            R, t = _invert_c2w_to_w2c(c2w.to(z_flat.device))
+            Xw_gt = target_world.to(z_flat.device).unsqueeze(-1)  # [N,3,1]
+            Zg = (R @ Xw_gt + t)[:, 2, 0].clamp_min(depth_min)
+            med_gt = torch.median(Zg)
+            reg = weight * torch.abs(torch.log((med_pred + eps) / (med_gt + eps)))
+
+        elif variant == "unit":
+            # 让 median(z_unit) ≈ 1
+            reg = weight * torch.abs(torch.log(med_pred + eps))
+
+        elif variant == "prior":
+            if depth_prior is None:
+                return total_loss, 0.0
+            reg = weight * torch.abs(torch.log((med_pred + eps) / (float(depth_prior) + eps)))
+        else:
+            return total_loss, 0.0
+
+        return total_loss + reg, float(reg.detach().cpu())
+
+    # =============== main branches ===============
+    if mode == "xyz":
+        target_world = batch["target_world"].to(device)  # [N,3]
+        diff = coords - target_world                     # [N,3]
+        err  = torch.norm(diff, dim=1, p=2)              # [N]
+        loss_vec = log_sigma + sqrt2 * (err / sigma)
+        total = loss_vec.mean()
+
+        # ---------- scale regularization (optional) ----------
+        sr = getattr(loss_cfg, "scale_reg", None)
+        scale_reg_val = 0.0
+        if sr and getattr(sr, "enabled", False) and "c2w" in batch:
+            c2w = batch["c2w"].to(device)
+            R, t = _invert_c2w_to_w2c(c2w)
+
+            if getattr(sr, "variant", "match_to_gt") == "unit" and (coords_unit is not None):
+                # 解耦场景：对无尺度深度做 unit 正则
+                Xw_u = coords_unit.unsqueeze(-1)                     # [N,3,1]
+                Zu   = (R @ Xw_u + t)[:, 2, 0].clamp_min(depth_min)  # [N]
+                total, scale_reg_val = _scale_reg_add(
+                    total, Zu, variant="unit", weight=float(getattr(sr, "weight", 1e-3))
+                )
+            else:
+                # 其他：对有尺度深度做 match_to_gt/prior
+                Xw_p = coords.unsqueeze(-1)
+                Zp   = (R @ Xw_p + t)[:, 2, 0].clamp_min(depth_min)
+                variant = getattr(sr, "variant", "match_to_gt")
+                if variant == "match_to_gt":
+                    total, scale_reg_val = _scale_reg_add(
+                        total, Zp, variant="match_to_gt",
+                        weight=float(getattr(sr, "weight", 1e-3)),
+                        c2w=c2w, target_world=target_world
+                    )
+                elif variant == "prior":
+                    total, scale_reg_val = _scale_reg_add(
+                        total, Zp, variant="prior",
+                        weight=float(getattr(sr, "weight", 1e-3)),
+                        depth_prior=getattr(sr, "depth_prior", 1.0)
+                    )
+
+        metrics = {
+            "err_mean_m": float(err.mean().detach().cpu()),
+            "sigma_mean": float(sigma.mean().detach().cpu()),
+            "loss":       float(total.detach().cpu()),
+            "mode":       "xyz-sparse",
+        }
+        if sr and getattr(sr, "enabled", False):
+            metrics["scale_reg"] = scale_reg_val
+        return total, metrics
+
+    else:  # 'reproj'
+        K   = batch["intrinsics"].to(device)  # [N,3,3]
+        c2w = batch["c2w"].to(device)         # [N,3,4] or [N,4,4]
+        px  = batch["pixels"].to(device)      # [N,2]
+
+        R, t = _invert_c2w_to_w2c(c2w)
+        Xw   = coords.unsqueeze(-1)           # [N,3,1]
+        Xc   = R @ Xw + t                     # [N,3,1]
+
+        z         = Xc[:, 2:3, :]
+        z_clamped = z.clamp_min(depth_min)
+        z_flat    = z_clamped[:, 0, 0]
+
+        uvh = K @ Xc
+        uv  = (uvh[:, :2, :] / z_clamped).squeeze(-1)  # [N,2]
+
+        repro_err = (uv - px).abs().sum(dim=1)         # L1, [N]
+
+        invalid_min_depth = (z.squeeze(-1).squeeze(-1) < depth_min)
+        invalid_repro     = (repro_err > float(getattr(loss_cfg, "repro_loss_hard_clamp", 100.0)))
+        invalid_max_depth = (z.squeeze(-1).squeeze(-1) > depth_max)
+        invalid_mask = invalid_min_depth | invalid_repro | invalid_max_depth
+        valid_mask   = ~invalid_mask
+
+        if valid_mask.any():
+            loss_valid = repro_loss.compute(repro_err[valid_mask], global_step)
+        else:
+            loss_valid = coords.sum() * 0.0
+
+        if invalid_mask.any():
+            if "intrinsics_inv" in batch:
+                invK = batch["intrinsics_inv"].to(device)
+            else:
+                invK = torch.inverse(K)
+            uv1    = torch.cat([px, torch.ones_like(px[:, :1])], dim=1).unsqueeze(-1)
+            Xc_tgt = float(getattr(loss_cfg, "depth_target", 2.0)) * (invK @ uv1)
+            loss_invalid = (Xc_tgt - Xc).abs()[invalid_mask].sum()
+        else:
+            loss_invalid = coords.sum() * 0.0
+
+        total = (loss_valid + loss_invalid) / coords.shape[0]
+
+        # ---------- scale regularization ----------
+        sr = getattr(loss_cfg, "scale_reg", None)
+        scale_reg_val = 0.0
+        if sr and getattr(sr, "enabled", False):
+            variant = getattr(sr, "variant", "prior")
+            weight  = float(getattr(sr, "weight", 1e-3))
+            if variant == "match_to_gt" and ("target_world" in batch):
+                target_world = batch["target_world"].to(device)
+                total, scale_reg_val = _scale_reg_add(
+                    total, z_flat, variant="match_to_gt", weight=weight,
+                    c2w=c2w, target_world=target_world
+                )
+            elif variant == "unit" and (coords_unit is not None):
+                # 解耦：对无尺度深度做 unit 正则更合理
+                Xw_u = coords_unit.unsqueeze(-1)
+                Zu   = (R @ Xw_u + t)[:, 2, 0].clamp_min(depth_min)
+                total, scale_reg_val = _scale_reg_add(
+                    total, Zu, variant="unit", weight=weight
+                )
+            else:
+                depth_prior = getattr(sr, "depth_prior", 1.0)
+                total, scale_reg_val = _scale_reg_add(
+                    total, z_flat, variant="prior", weight=weight, depth_prior=depth_prior
+                )
+
+        metrics = {
+            "err_mean_px": float(repro_err.mean().detach().cpu()),
+            "sigma_mean":  float(sigma.mean().detach().cpu()),
+            "loss":        float(total.detach().cpu()),
+            "mode":        "reproj-sparse",
+        }
+        if sr and getattr(sr, "enabled", False):
+            metrics["scale_reg"] = scale_reg_val
+        return total, metrics
+# ---------------------------------------------------------------------------
+# 训练入口
+# ---------------------------------------------------------------------------
+def run_training(cfg: DictConfig) -> Dict[str, str]:
+    device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+
+    # 1. 加载模型
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
     if cfg.model.pretrained:
+        print(f"Loading pretrained backbone: {cfg.model.pretrained}")
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    hub_dir = torch.hub.get_dir()
-    repo_dir_name = "wimmerth_anyup_main"
-    local_cache_path = os.path.join(hub_dir, repo_dir_name)
-    if os.path.exists(local_cache_path):
-        print(f"Loading AnyUp from local cache: {local_cache_path}")
-        upsampler = torch.hub.load(local_cache_path, "anyup", source="local", trust_repo=True)
-    else:
-        print("Downloading AnyUp from GitHub...")
-        upsampler = torch.hub.load("wimmerth/anyup", "anyup", trust_repo=True)
-    upsampler.to(device).eval()
+    # 2. 这里的 upsampler 设为 None，因为我们改用特征原分辨率
+    upsampler = None
 
     iterations = cfg.training.epochs * (cfg.training.buffer_size // cfg.training.batch_size)
     repro_loss = ReproLoss(
@@ -438,25 +899,26 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
         soft_clamp=cfg.loss.repro_loss_soft_clamp,
         soft_clamp_min=cfg.loss.repro_loss_soft_clamp_min,
         type=cfg.loss.repro_loss_type,
-        circle_schedule=(cfg.loss.repro_loss_schedule == "circle"),
+        circle_schedule=(cfg.loss.repro_loss_schedule == 'circle')
     )
 
+    # 3. 加载 Memory (虽然加载了，但我们选择不用)
+    # 这部分代码保留是为了兼容你的文件路径配置，防止报错
+    memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
+
+    # 注意：这里我们甚至不需要 aggregator 了，因为我们不打算用 memory_feats
+    # 但为了保持代码结构，我们还是定义一下，或者直接忽略
+    # memory_tokens_per_block = ... (skipped)
+
+    # 4. 创建 Dataset
     if isinstance(cfg.dataset.train_dataset, str):
         dataset = eval(cfg.dataset.train_dataset)
     dataloader = ForcedRandomDataLoader(dataset=dataset, batch_size=1)
 
-    buffer, in_channels = _collect_buffer_query_only(cfg, model, upsampler, dataloader, device)
-    # ==== 在这里做一次重投影 sanity check ====
-    if getattr(cfg.training, "enable_reproj_sanity_check", True):
-        print("\n[SanityCheck] 开始对 FeatureReplayBuffer 做世界坐标重投影检查...")
-        _sanity_check_buffer_reprojection(
-            buffer=buffer,
-            device=device,
-            max_samples=getattr(cfg.training, "reproj_check_max_samples", 4096),
-            num_workers=0,
-        )
-        print("[SanityCheck] 完成。\n")
-    # ===========================================
+    # 5. 构建 Buffer (核心逻辑在 _collect_buffer 中)
+    # 注意：memory_feats 传进去但不会被使用
+    buffer, in_channels = _collect_buffer(cfg, model, upsampler, dataloader, memory_feats, memory_token, device)
+
     bufferloader = DataLoader(
         BufferDataset(buffer),
         batch_size=cfg.training.batch_size,
@@ -464,75 +926,48 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
         num_workers=cfg.training.num_workers,
     )
 
+    # 6. 初始化 Head
+    print(f"Initializing Regression Head with input dim: {in_channels}")
     if cfg.model.head_mode == "film":
         head = ACEHead_Pointwise_FiLM(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
     else:
-        head = ACEHead_Pointwise_Decoupled_WithScale(
-            in_channels=in_channels,
-            hidden_dim=cfg.head.hidden_dim,
-            token_dim=in_channels,
-        ).to(device)
+        head = ACEHead_Pointwise_Decoupled_WithScale(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim,
+                                                     token_dim=in_channels).to(device)
+
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     output_dir = Path(cfg.training.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 7. 训练循环
     global_step = 0
     for epoch in range(cfg.training.epochs):
         head.train()
         for batch in bufferloader:
             features = batch["features"].to(device)
             scale = batch["scale_token"].to(device)
-            with torch.autocast("cuda", enabled=bool(cfg.amp), dtype=amp_dtype):
-                preds = head(features, scale)
-                with torch.autocast("cuda", enabled=False, ):
-                    loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
+            preds = head(features, scale)
+
+            loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+
             global_step += 1
-
             if global_step % cfg.training.log_interval == 0:
-                # 在 buffer 上做一次评估（GT vs 预测的 xyz / reprojection）
-                if global_step % (cfg.training.log_interval * 20) == 0:
-                    eval_metrics = _eval_head_on_buffer_once(
-                        head=head,
-                        buffer=buffer,
-                        repro_loss=repro_loss,
-                        loss_cfg=cfg.loss,
-                        device=device,
-                        global_step=global_step,
-                        max_samples=getattr(cfg.training, "eval_max_samples", 4096),
-                        num_workers=getattr(cfg.training, "num_workers", 0),
-                    )
-                    log_obj = {
-                        "epoch": epoch,
-                        "step": global_step,
-                        "train": metrics,  # 当前 batch 的训练 metrics
-                        "eval": eval_metrics,  # buffer 上整体评估 metrics（含 xyz/reproj 误差）
-                    }
-                else:
-                    log_obj = {
-                        "epoch": epoch,
-                        "step": global_step,
-                        "train": metrics,  # 当前 batch 的训练 metrics
-                    }
-                print(json.dumps(log_obj, ensure_ascii=False))
+                print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
 
+    # 8. 保存
     try:
         task_name = HydraConfig.get().runtime.choices.get("model/task", "default")
     except Exception:
         task_name = "unknown"
+
     ckpt_name = (
-        f"ace-queryonly_"
-        f"task-{task_name}_"
-        f"head-{cfg.model.head_mode}_"
-        f"loss-{cfg.loss.mode}_"
+        f"ace-downsample_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
         f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"
-        f"var-{cfg.loss.scale_reg.variant}_"
-        f"ep{cfg.training.epochs}_"
-        f"buf{cfg.training.buffer_size}"
-        ".pt"
+        f"ep{cfg.training.epochs}_buf{cfg.training.buffer_size}.pt"
     )
     ckpt_path = output_dir / ckpt_name
     torch.save({"state_dict": head.state_dict(), "in_channels": in_channels}, ckpt_path)
@@ -542,9 +977,9 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
 @hydra.main(version_base=None, config_path="../../configs", config_name="ace_train")
 def main(cfg: DictConfig):
     cfg = OmegaConf.structured(OmegaConf.to_yaml(cfg))
-    info = run_training_query_only(cfg)
+    info = run_training(cfg)
     print(json.dumps(info, indent=2, ensure_ascii=False))
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

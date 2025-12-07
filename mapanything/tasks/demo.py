@@ -468,7 +468,7 @@ def run_demo(cfg: DictConfig):
     dataset = SevenScenesWAI(
         num_views=1,
         split="train",
-        covisibility_thres=0,
+        covisibility_thres=0.00025,
         ROOT="/data/xwh/mapanything-dataset/wai_data/7scenes",
         dataset_metadata_dir="",
         sample_specific_scene=True,
@@ -477,7 +477,7 @@ def run_demo(cfg: DictConfig):
         transform="imgnorm",
         data_norm_type="dinov2",
         sequential_view_mode=False,
-        seed=777
+        seed=73,
     )
     data_loader = ForcedRandomDataLoader(dataset=dataset, batch_size=1)
 
@@ -550,11 +550,12 @@ def run_demo(cfg: DictConfig):
 
         # 模型推理（支持多视图输入）
         with torch.autocast("cuda", enabled=bool(cfg.amp), dtype=amp_dtype):
+            memory_tokens = [None] * getattr(model.info_sharing, "depth", 24)
             # preds = model(batch, cfg.memory_efficient_inference, save_filename=current_save_filename)
             preds = model.forward_with_memory(
             query_view=batch,
             device=device,
-            memory_feats=memory_feats,
+            memory_feats=memory_tokens,
             additional_tokens=memory_scale_token,
             memory_efficient_inference=cfg.memory_efficient_inference,
             )

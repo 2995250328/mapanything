@@ -348,18 +348,18 @@ def _collect_buffer_query_only(
                 torch.nn.init.trunc_normal_(scale_token, std=0.02)
                 scale_token = scale_token.unsqueeze(0).unsqueeze(-1).repeat(1, 1, 1).to(device)
                 # scale_token = model.scale_token.view(1, -1, 1).to(device)
-                fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
-                    query_view=batch,
-                    device=str(device),
-                    memory_tokens_per_block=memory_tokens,
-                    additional_tokens=scale_token,
-                    memory_keep_ratio=1.0,
-                    memory_efficient_inference=cfg.training.memory_efficient_inference,
-                )
-                # fused_feature, fused_token = model.forward_dense_feats(
-                #     batch,
-                #     cfg.training.memory_efficient_inference
+                # fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
+                #     query_view=batch,
+                #     device=str(device),
+                #     memory_tokens_per_block=memory_tokens,
+                #     additional_tokens=scale_token,
+                #     memory_keep_ratio=1.0,
+                #     memory_efficient_inference=cfg.training.memory_efficient_inference,
                 # )
+                fused_feature, fused_token = model.forward_dense_feats(
+                    batch,
+                    cfg.training.memory_efficient_inference
+                )
                 dense_feat_up = upsampler(batch[0]["img"], fused_feature)
 
             view = batch[0]
@@ -502,7 +502,7 @@ def run_training_query_only(cfg: DictConfig) -> Dict[str, str]:
     except Exception:
         task_name = "unknown"
     ckpt_name = (
-        f"ace-queryonly_"
+        f"ace-noninfo-queryonly_"
         f"task-{task_name}_"
         f"head-{cfg.model.head_mode}_"
         f"loss-{cfg.loss.mode}_"
