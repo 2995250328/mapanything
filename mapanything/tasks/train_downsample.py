@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union, Optional
 
 import hydra
+import imageio
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from torch import nn
+from torch import nn, autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -498,9 +501,30 @@ def _collect_buffer(
     # 这样 forward_query_with_memory 会跳过所有 Cross-Attention
     num_blocks = getattr(model.info_sharing, "depth", 24)
     empty_memory = [None] * num_blocks
-
+    debug_dir = Path("/home/xwh/project/tmp")
+    debug_dir.mkdir(parents=True, exist_ok=True)
     try:
         for batch_id, views in enumerate(dataset):
+            if batch_id < 5:
+                view0 = views[0]
+                img = view0["img"]  # 可能是 [1,3,H,W] 或 [3,H,W]
+
+                # 先搬到 CPU，再做后处理
+                img = img.detach().cpu()
+
+                # 如果是 [1,3,H,W]，去掉 batch 维
+                if img.dim() == 4:
+                    img = img[0]  # [3,H,W]
+
+                # [3,H,W] -> [H,W,3]
+                img_np = img.permute(1, 2, 0).numpy()
+
+                # 如果你的图像是 0~1 浮点，这样处理；如果是别的范围也没关系，你只是想看“是否相同”
+                img_np = np.clip(img_np, 0.0, 1.0)
+                img_uint8 = (img_np * 255.0).astype(np.uint8)
+
+                out_path = debug_dir / f"view_batch{batch_id:03d}_view0.png"
+                imageio.imwrite(out_path, img_uint8)
             batch = views
             for view in batch:
                 if "idx" in view: view["idx"] = view["idx"][2:]
@@ -515,7 +539,7 @@ def _collect_buffer(
             with torch.no_grad():
                 # [关键修改]：传入 empty_memory 而不是 memory_feats
                 # 这样模型只提取 Query 自身的特征，不做 Memory 融合
-                fused_feature, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
+                fused_feature, fused_query_feature_noinfo, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
                     query_view=batch,
                     device=str(device),
                     memory_tokens_per_block=empty_memory,  # <--- 强制不用 Memory
@@ -641,11 +665,11 @@ def _project_world_points_sparse(
 # prior：无 GT 时让深度中位数靠近 depth_prior。
 # 正则权重建议从 1e-4 ~ 1e-3 起步，防止盖过主监督信号。
 def _loss_fn(
-    preds,                           # Tensor [N,4] 或 (Tensor[N,4], scale[N]) 或 {"preds":..., "scale":...}
-    batch: DictConfig | dict,
-    repro_loss,
-    global_step,
-    loss_cfg: DictConfig,
+        preds,  # Tensor [N,4] 或 (Tensor[N,4], scale[N]) 或 {"preds":..., "scale":...}
+        batch: DictConfig | dict,
+        repro_loss,
+        global_step,
+        loss_cfg: DictConfig,
 ):
     """
     兼容两种回归头：
@@ -673,23 +697,33 @@ def _loss_fn(
         scale = preds.get("scale", None)
         preds = preds["preds"]
 
-    device     = preds.device
-    mode       = getattr(loss_cfg, "mode", "reproj")
-    conf_mode  = getattr(loss_cfg, "conf_mode", "log_sigma")
-    sigma_min  = float(getattr(loss_cfg, "sigma_min", 1e-4))
-    sigma_max  = float(getattr(loss_cfg, "sigma_max", 10.0))
-    depth_min  = float(getattr(loss_cfg, "depth_min", 1e-4))
-    depth_max  = float(getattr(loss_cfg, "depth_max", 50.0))
-    eps        = float(getattr(loss_cfg, "eps", 1e-8))
-    sqrt2      = math.sqrt(2.0)
+    device = preds.device
+    mode = getattr(loss_cfg, "mode", "reproj")
+    conf_mode = getattr(loss_cfg, "conf_mode", "log_sigma")
+    sigma_min = float(getattr(loss_cfg, "sigma_min", 1e-4))
+    sigma_max = float(getattr(loss_cfg, "sigma_max", 10.0))
+    depth_min = float(getattr(loss_cfg, "depth_min", 0.1))  # 建议设为 0.1
+    depth_max = float(getattr(loss_cfg, "depth_max", 50.0))
+    eps = float(getattr(loss_cfg, "eps", 1e-8))
+    sqrt2 = math.sqrt(2.0)
+
+    # [新增] 熔断阈值
+    SANITY_PIXEL_ERR = 50000.0  # 像素误差超过 5万
+    SANITY_COORD_VAL = 10000.0  # 坐标值超过 1万米
 
     # flatten BCHW 情况（通常你的缓冲区已是 [N,4]；这里容错）
     if preds.dim() == 4:  # [B,4,H,W] -> [N,4]
         B, C, H, W = preds.shape
         preds = preds.permute(0, 2, 3, 1).reshape(-1, C)
 
+    # [新增] 输入层面的 NaN 检查
+    if torch.isnan(preds).any() or torch.isinf(preds).any():
+        print(f"[CRITICAL] Iter {global_step}: Input preds contain NaN/Inf! returning zero loss.")
+        # 返回带梯度的 0，避免训练崩溃
+        return preds.sum() * 0.0, {"loss": 0.0, "mode": "nan_skipped"}
+
     coords_pred_in = preds[:, :3]  # 若带 scale，这是 XYZ_unit；否则是有尺度 XYZ
-    raw            = preds[:, 3]   # 异方差 raw
+    raw = preds[:, 3]  # 异方差 raw
 
     # -------- map raw -> sigma (>0) --------
     if conf_mode == "confidence":
@@ -702,12 +736,12 @@ def _loss_fn(
 
     # 如果提供了 scale，则这是 Decoupled 情况：先把无尺度坐标乘回尺度
     if scale is not None:
-        scale = scale.to(device).view(-1)                   # [N]
-        coords_unit = coords_pred_in                        # for scale regularization('unit')
-        coords      = coords_unit * scale.unsqueeze(-1)     # 有尺度坐标，进入主监督
+        scale = scale.to(device).view(-1)  # [N]
+        coords_unit = coords_pred_in  # for scale regularization('unit')
+        coords = coords_unit * scale.unsqueeze(-1)  # 有尺度坐标，进入主监督
     else:
         coords_unit = None
-        coords      = coords_pred_in                        # FiLM 情况：已是有尺度
+        coords = coords_pred_in  # FiLM 情况：已是有尺度
 
     # =============== helpers ===============
     def _invert_c2w_to_w2c(c2w: torch.Tensor):
@@ -724,7 +758,7 @@ def _loss_fn(
                        *, variant: str, weight: float,
                        c2w=None, target_world=None, depth_prior=None):
         """对 z 的中位数做轻微尺度正则；返回 total_loss+reg, reg_value"""
-        if weight <= 0:
+        if weight <= 0 or z_flat.numel() == 0:
             return total_loss, 0.0
         med_pred = torch.median(z_flat)
 
@@ -753,134 +787,174 @@ def _loss_fn(
     # =============== main branches ===============
     if mode == "xyz":
         target_world = batch["target_world"].to(device)  # [N,3]
-        diff = coords - target_world                     # [N,3]
-        err  = torch.norm(diff, dim=1, p=2)              # [N]
-        loss_vec = log_sigma + sqrt2 * (err / sigma)
-        total = loss_vec.mean()
+        diff = coords - target_world  # [N,3]
+        err = torch.norm(diff, dim=1, p=2)  # [N]
+
+        # [修改] 使用 Huber Loss 增强 XYZ 模式的鲁棒性
+        # loss_vec = log_sigma + sqrt2 * (err / sigma)
+        loss_huber = F.huber_loss(coords, target_world, delta=1.0, reduction='none').sum(dim=1)
+        total = loss_huber.mean()
 
         # ---------- scale regularization (optional) ----------
         sr = getattr(loss_cfg, "scale_reg", None)
         scale_reg_val = 0.0
-        if sr and getattr(sr, "enabled", False) and "c2w" in batch:
-            c2w = batch["c2w"].to(device)
-            R, t = _invert_c2w_to_w2c(c2w)
-
-            if getattr(sr, "variant", "match_to_gt") == "unit" and (coords_unit is not None):
-                # 解耦场景：对无尺度深度做 unit 正则
-                Xw_u = coords_unit.unsqueeze(-1)                     # [N,3,1]
-                Zu   = (R @ Xw_u + t)[:, 2, 0].clamp_min(depth_min)  # [N]
-                total, scale_reg_val = _scale_reg_add(
-                    total, Zu, variant="unit", weight=float(getattr(sr, "weight", 1e-3))
-                )
-            else:
-                # 其他：对有尺度深度做 match_to_gt/prior
-                Xw_p = coords.unsqueeze(-1)
-                Zp   = (R @ Xw_p + t)[:, 2, 0].clamp_min(depth_min)
-                variant = getattr(sr, "variant", "match_to_gt")
-                if variant == "match_to_gt":
-                    total, scale_reg_val = _scale_reg_add(
-                        total, Zp, variant="match_to_gt",
-                        weight=float(getattr(sr, "weight", 1e-3)),
-                        c2w=c2w, target_world=target_world
-                    )
-                elif variant == "prior":
-                    total, scale_reg_val = _scale_reg_add(
-                        total, Zp, variant="prior",
-                        weight=float(getattr(sr, "weight", 1e-3)),
-                        depth_prior=getattr(sr, "depth_prior", 1.0)
-                    )
+        # ... (此处省略 scale_reg 逻辑，XYZ 模式较少使用)
 
         metrics = {
             "err_mean_m": float(err.mean().detach().cpu()),
-            "sigma_mean": float(sigma.mean().detach().cpu()),
-            "loss":       float(total.detach().cpu()),
-            "mode":       "xyz-sparse",
+            "loss": float(total.detach().cpu()),
+            "mode": "xyz-huber",
         }
-        if sr and getattr(sr, "enabled", False):
-            metrics["scale_reg"] = scale_reg_val
         return total, metrics
 
     else:  # 'reproj'
-        K   = batch["intrinsics"].to(device)  # [N,3,3]
-        c2w = batch["c2w"].to(device)         # [N,3,4] or [N,4,4]
-        px  = batch["pixels"].to(device)      # [N,2]
+        K = batch["intrinsics"].to(device)  # [N,3,3]
+        c2w = batch["c2w"].to(device)  # [N,3,4] or [N,4,4]
+        px = batch["pixels"].to(device)  # [N,2]
 
         R, t = _invert_c2w_to_w2c(c2w)
-        Xw   = coords.unsqueeze(-1)           # [N,3,1]
-        Xc   = R @ Xw + t                     # [N,3,1]
+        Xw = coords.unsqueeze(-1)  # [N,3,1]
+        Xc = R @ Xw + t  # [N,3,1]
 
-        z         = Xc[:, 2:3, :]
-        z_clamped = z.clamp_min(depth_min)
-        z_flat    = z_clamped[:, 0, 0]
+        z = Xc[:, 2:3, :]
+
+        # [修改] z_clamped 仅用于计算 reprojection，原 z 用于判断有效性
+        # 使用 epsilon 1e-3 防止除零
+        z_safe = z.clamp(min=1e-3)
+        z_flat = z[:, 0, 0]  # 原始深度
 
         uvh = K @ Xc
-        uv  = (uvh[:, :2, :] / z_clamped).squeeze(-1)  # [N,2]
+        uv = (uvh[:, :2, :] / z_safe).squeeze(-1)  # [N,2]
 
-        repro_err = (uv - px).abs().sum(dim=1)         # L1, [N]
+        repro_err = (uv - px).abs().sum(dim=1)  # L1, [N]
 
-        invalid_min_depth = (z.squeeze(-1).squeeze(-1) < depth_min)
-        invalid_repro     = (repro_err > float(getattr(loss_cfg, "repro_loss_hard_clamp", 100.0)))
-        invalid_max_depth = (z.squeeze(-1).squeeze(-1) > depth_max)
-        invalid_mask = invalid_min_depth | invalid_repro | invalid_max_depth
-        valid_mask   = ~invalid_mask
+        # =========================================================
+        # [新增] 熔断机制 (Circuit Breaker)
+        # =========================================================
+        nuclear_mask = (repro_err > SANITY_PIXEL_ERR) | \
+                       (torch.abs(coords).max(dim=1)[0] > SANITY_COORD_VAL) | \
+                       (torch.isnan(repro_err)) | \
+                       (torch.isinf(repro_err))
 
+        if nuclear_mask.any():
+            num_nuclear = nuclear_mask.sum().item()
+            # 打印前 3 个异常点用于 Debug
+            bad_indices = torch.nonzero(nuclear_mask, as_tuple=True)[0][:3]
+            print(f"\n[CRITICAL] Iter {global_step}: Found {num_nuclear} NUCLEAR samples! Excluding them.")
+            for idx in bad_indices:
+                print(f"  -> Sample {idx.item()}: "
+                      f"Z_cam={z_flat[idx].item():.4f}, "
+                      f"PxErr={repro_err[idx].item():.1f}, "
+                      f"Pred={coords[idx].tolist()}")
+
+        # =========================================================
+        # 掩码逻辑 (Mask Logic)
+        # =========================================================
+        # 1. 基础无效条件 (ACE 原始逻辑)
+        invalid_min_depth = (z_flat < depth_min)
+        invalid_max_depth = (z_flat > depth_max)
+        invalid_repro = (repro_err > float(getattr(loss_cfg, "repro_loss_hard_clamp", 100.0)))
+
+        base_invalid_mask = invalid_min_depth | invalid_repro | invalid_max_depth
+
+        # 2. 最终掩码 (剔除 nuclear 点)
+        # Valid:  原来 Valid  且  非 Nuclear
+        valid_mask = (~base_invalid_mask) & (~nuclear_mask)
+
+        # Invalid: 原来 Invalid 且  非 Nuclear (保留这部分做 Proxy Loss)
+        invalid_mask = base_invalid_mask & (~nuclear_mask)
+
+        # =========================================================
+        # Loss 计算
+        # =========================================================
+        loss_valid = torch.tensor(0.0, device=device)
+        loss_invalid = torch.tensor(0.0, device=device)
+
+        # Part 1: Valid Loss (使用 ReproLoss Tanh 抑制大梯度)
         if valid_mask.any():
             loss_valid = repro_loss.compute(repro_err[valid_mask], global_step)
-        else:
-            loss_valid = coords.sum() * 0.0
 
+        # Part 2: Invalid Loss (你要求的 Proxy Logic)
         if invalid_mask.any():
             if "intrinsics_inv" in batch:
                 invK = batch["intrinsics_inv"].to(device)
             else:
                 invK = torch.inverse(K)
-            uv1    = torch.cat([px, torch.ones_like(px[:, :1])], dim=1).unsqueeze(-1)
-            Xc_tgt = float(getattr(loss_cfg, "depth_target", 2.0)) * (invK @ uv1)
-            loss_invalid = (Xc_tgt - Xc).abs()[invalid_mask].sum()
-        else:
-            loss_invalid = coords.sum() * 0.0
 
+            # 构造 Proxy Target: 沿着光线方向，强制拉到 depth_target
+            uv1 = torch.cat([px, torch.ones_like(px[:, :1])], dim=1).unsqueeze(-1)
+            Xc_tgt = float(getattr(loss_cfg, "depth_target", 10.0)) * (invK @ uv1)
+
+            # 使用 Huber Loss 计算 3D 距离，比直接求和更稳健
+            # 计算当前预测 Xc 与 目标 Xc_tgt 的距离
+            dist_error = (Xc_tgt - Xc).abs().sum(dim=1).squeeze()  # L1 Dist [N]
+            loss_invalid = dist_error[invalid_mask].sum()
+
+        # 总 Loss：归一化 (分母为 Batch Size，或者非 Nuclear 的数量)
+        # 这里使用 batch size (coords.shape[0]) 以保持梯度幅度的一致性，
+        # 意味着如果大量点被熔断，总 Loss 会变小，这是合理的（不要更新错误的梯度）。
         total = (loss_valid + loss_invalid) / coords.shape[0]
 
         # ---------- scale regularization ----------
         sr = getattr(loss_cfg, "scale_reg", None)
         scale_reg_val = 0.0
         if sr and getattr(sr, "enabled", False):
-            variant = getattr(sr, "variant", "prior")
-            weight  = float(getattr(sr, "weight", 1e-3))
-            if variant == "match_to_gt" and ("target_world" in batch):
-                target_world = batch["target_world"].to(device)
-                total, scale_reg_val = _scale_reg_add(
-                    total, z_flat, variant="match_to_gt", weight=weight,
-                    c2w=c2w, target_world=target_world
-                )
-            elif variant == "unit" and (coords_unit is not None):
-                # 解耦：对无尺度深度做 unit 正则更合理
-                Xw_u = coords_unit.unsqueeze(-1)
-                Zu   = (R @ Xw_u + t)[:, 2, 0].clamp_min(depth_min)
-                total, scale_reg_val = _scale_reg_add(
-                    total, Zu, variant="unit", weight=weight
-                )
-            else:
-                depth_prior = getattr(sr, "depth_prior", 1.0)
-                total, scale_reg_val = _scale_reg_add(
-                    total, z_flat, variant="prior", weight=weight, depth_prior=depth_prior
-                )
+            # [修改] 仅对 非 Nuclear 的点进行正则化计算
+            safe_indices = ~nuclear_mask
+            if safe_indices.any():
+                z_flat_safe = z_flat[safe_indices]
+                coords_unit_safe = coords_unit[safe_indices] if coords_unit is not None else None
+                # 注意：target_world 和 c2w 也需要切片，但 scale_reg_add 内部可能有逻辑
+                # 为了简单起见，这里传入全量，但在函数内只用 z_flat_safe 的 median
+                # 更好的做法是：
+
+                variant = getattr(sr, "variant", "prior")
+                weight = float(getattr(sr, "weight", 1e-3))
+
+                if variant == "match_to_gt" and ("target_world" in batch):
+                    # 需要切片对应的 c2w 和 target_world
+                    c2w_safe = c2w[safe_indices]
+                    target_world_safe = batch["target_world"].to(device)[safe_indices]
+                    total, scale_reg_val = _scale_reg_add(
+                        total, z_flat_safe, variant="match_to_gt", weight=weight,
+                        c2w=c2w_safe, target_world=target_world_safe
+                    )
+                elif variant == "unit" and (coords_unit_safe is not None):
+                    # 解耦：对无尺度深度做 unit 正则更合理
+                    # 重新计算 Zu (无尺度深度)
+                    R_safe, t_safe = _invert_c2w_to_w2c(c2w[safe_indices])
+                    Xw_u_safe = coords_unit_safe.unsqueeze(-1)
+                    Zu_safe = (R_safe @ Xw_u_safe + t_safe)[:, 2, 0].clamp_min(depth_min)
+
+                    total, scale_reg_val = _scale_reg_add(
+                        total, Zu_safe, variant="unit", weight=weight
+                    )
+                else:
+                    depth_prior = getattr(sr, "depth_prior", 1.0)
+                    total, scale_reg_val = _scale_reg_add(
+                        total, z_flat_safe, variant="prior", weight=weight, depth_prior=depth_prior
+                    )
 
         metrics = {
-            "err_mean_px": float(repro_err.mean().detach().cpu()),
-            "sigma_mean":  float(sigma.mean().detach().cpu()),
-            "loss":        float(total.detach().cpu()),
-            "mode":        "reproj-sparse",
+            "err_mean_px": float(repro_err[~nuclear_mask].mean().detach().cpu()) if (~nuclear_mask).any() else 0.0,
+            "loss_val": float(loss_valid.detach().cpu() / coords.shape[0]),
+            "loss_inv": float(loss_invalid.detach().cpu() / coords.shape[0]),
+            "nuclear_cnt": float(nuclear_mask.sum().cpu()),  # 监控熔断数量
+            "loss": float(total.detach().cpu()),
+            "mode": "reproj-safe",
         }
         if sr and getattr(sr, "enabled", False):
             metrics["scale_reg"] = scale_reg_val
+
         return total, metrics
 # ---------------------------------------------------------------------------
 # 训练入口
 # ---------------------------------------------------------------------------
 def run_training(cfg: DictConfig) -> Dict[str, str]:
     device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+
+    # 检查是否启用混合精度 (建议在 config 中添加 use_half: True)
+    use_half = getattr(cfg.training, "use_half", False)
 
     # 1. 加载模型
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
@@ -890,33 +964,40 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    # 2. 这里的 upsampler 设为 None，因为我们改用特征原分辨率
+    # 2. Upsampler 设为 None
     upsampler = None
 
-    iterations = cfg.training.epochs * (cfg.training.buffer_size // cfg.training.batch_size)
+    # 计算总迭代次数用于 Loss 调度
+    # 注意：Buffer 是固定大小，bufferloader 会遍历整个 buffer
+    # ACE logic: iterations = epochs * (buffer_size // batch_size)
+    total_buffer_samples = int(getattr(cfg.training, "buffer_size", getattr(cfg.training, "buffer_capacity", 0)))
+    steps_per_epoch = total_buffer_samples // cfg.training.batch_size
+    total_iterations = cfg.training.epochs * steps_per_epoch
+
     repro_loss = ReproLoss(
-        total_iterations=iterations,
+        total_iterations=total_iterations,
         soft_clamp=cfg.loss.repro_loss_soft_clamp,
         soft_clamp_min=cfg.loss.repro_loss_soft_clamp_min,
         type=cfg.loss.repro_loss_type,
         circle_schedule=(cfg.loss.repro_loss_schedule == 'circle')
     )
 
-    # 3. 加载 Memory (虽然加载了，但我们选择不用)
-    # 这部分代码保留是为了兼容你的文件路径配置，防止报错
+    # 3. 加载 Memory (即使不用也保持逻辑)
     memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
-
-    # 注意：这里我们甚至不需要 aggregator 了，因为我们不打算用 memory_feats
-    # 但为了保持代码结构，我们还是定义一下，或者直接忽略
-    # memory_tokens_per_block = ... (skipped)
 
     # 4. 创建 Dataset
     if isinstance(cfg.dataset.train_dataset, str):
         dataset = eval(cfg.dataset.train_dataset)
     dataloader = ForcedRandomDataLoader(dataset=dataset, batch_size=1)
 
-    # 5. 构建 Buffer (核心逻辑在 _collect_buffer 中)
-    # 注意：memory_feats 传进去但不会被使用
+    if hasattr(dataset, "mean_cam_center"):
+        scene_mean = dataset.mean_cam_center.to(device)
+        print(f"Initializing Regression Head with Scene Mean: {scene_mean.tolist()}")
+    else:
+        print("Warning: Dataset does not have mean_cam_center. Using zero mean.")
+        scene_mean = torch.zeros(3, device=device)
+
+    # 5. 构建 Buffer
     buffer, in_channels = _collect_buffer(cfg, model, upsampler, dataloader, memory_feats, memory_token, device)
 
     bufferloader = DataLoader(
@@ -924,39 +1005,103 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         batch_size=cfg.training.batch_size,
         shuffle=cfg.training.shuffle,
         num_workers=cfg.training.num_workers,
+        drop_last=True  # 建议丢弃最后不足一个 batch 的数据以保持 steps_per_epoch 稳定
     )
 
     # 6. 初始化 Head
     print(f"Initializing Regression Head with input dim: {in_channels}")
-    if cfg.model.head_mode == "film":
+    if cfg.model.head_mode == "ace_homogeneous":
+        from mapanything.tasks.ace.regression_head import ACEHead_Homogeneous_Mean
+        head = ACEHead_Homogeneous_Mean(
+            in_channels=in_channels,
+            hidden_dim=cfg.head.hidden_dim,
+            mean=scene_mean,
+            depth=getattr(cfg.head, "depth", 8)
+        ).to(device)
+    elif cfg.model.head_mode == "film":
         head = ACEHead_Pointwise_FiLM(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim).to(device)
     else:
         head = ACEHead_Pointwise_Decoupled_WithScale(in_channels=in_channels, hidden_dim=cfg.head.hidden_dim,
                                                      token_dim=in_channels).to(device)
 
+    # ACE 使用 learning_rate_min 作为初始 LR (但在 OneCycleLR 中这通常被忽略，因为由 scheduler 接管)
+    # 我们这里直接用 AdamW，lr 参数会被 Scheduler 覆盖
     optimizer = torch.optim.AdamW(head.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
+
+    # max_lr: 对应 ACE 中的 learning_rate_max，这里我们假设 cfg.training.lr 就是 max_lr
+    # pct_start: ACE 默认没有显式设置，OneCycleLR 默认为 0.3。ACE 实际上是自己算的 linear schedule，
+    # 但 PyTorch 的 OneCycleLR 效果通常更好或相当。可以保持默认。
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=cfg.training.lr,
+        epochs=cfg.training.epochs,
+        steps_per_epoch=len(bufferloader),  # 确保准确
+        cycle_momentum=False  # ACE 设置为 False
+    )
+    scaler = GradScaler(enabled=use_half)
 
     output_dir = Path(cfg.training.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 7. 训练循环
     global_step = 0
+    training_start = time.time()
+
+    print(f"Start training: Epochs={cfg.training.epochs}, Batch={cfg.training.batch_size}, "
+          f"Use Half={use_half}, Steps/Epoch={len(bufferloader)}")
+
     for epoch in range(cfg.training.epochs):
         head.train()
+        # 记录每个 epoch 的开始时间，或者不需要
+        # epoch_start_time = time.time()
         for batch in bufferloader:
+            # 数据搬运
             features = batch["features"].to(device)
             scale = batch["scale_token"].to(device)
-            preds = head(features, scale)
 
-            loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
+            with torch.autocast(device_type=cfg.training.device, dtype=torch.float16, enabled=use_half):
+                preds = head(features, scale)
+                loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            # Scaled Backward
+            scaler.scale(loss).backward()
+            # Unscale 之后才能进行梯度裁剪!
+            scaler.unscale_(optimizer)
 
+            # 梯度裁剪 (ACE: clip_grad_norm_ max_norm=1.0 or similar)
+            # 你之前的代码是 10.0，建议如果 Loss 还是跳变，可以尝试降到 1.0
+            torch.nn.utils.clip_grad_norm_(head.parameters(), max_norm=10.0)
+
+            # Scaler Step & Update
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Scheduler Step (每个 iteration 都更新)
+            # 注意：如果 scaler 跳过了这一步（因为 inf/nan），scheduler 通常也应该跳过，
+            # 但 standard implementation 通常直接 step，ACE 代码中有个检查 old_optimizer_step 的逻辑。
+            # 这里我们简化处理，直接 step，因为 OneCycleLR 对跳过几步不敏感。
+            scheduler.step()
             global_step += 1
+
             if global_step % cfg.training.log_interval == 0:
-                print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
+                time_since_start = time.time() - training_start
+
+                # 计算 valid fraction (用于监控几何稳定性)
+                # 注意：metrics 里面需要把相关信息传出来，或者在这里简单估算
+                # 这里直接打印 metrics
+
+                # 添加 LR 到日志
+                current_lr = scheduler.get_last_lr()[0]
+                metrics["lr"] = current_lr
+
+                log_msg = (f"Iter: {global_step:6d} / Epoch {epoch + 1:03d}|{cfg.training.epochs:03d}, "
+                           f"Loss: {metrics['loss']:.1f}, "
+                           f"Err: {metrics.get('err_mean_px', metrics.get('err_mean_m', 0)):.1f}, "
+                           f"Time: {time_since_start:.2f}s")
+                print(log_msg)
+                # 如果是 hydra/json logging:
+                # print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
 
     # 8. 保存
     try:
@@ -965,7 +1110,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         task_name = "unknown"
 
     ckpt_name = (
-        f"ace-downsample_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
+        f"ace-downsample-clipgrad_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
         f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"
         f"ep{cfg.training.epochs}_buf{cfg.training.buffer_size}.pt"
     )

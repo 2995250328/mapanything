@@ -18,6 +18,10 @@ model:
   head_prefixes: ["", "module.", "head.", "reg_head.", "ace_head."]  # 可覆盖
 head:
   hidden_dim: 256
+  depth: 8
+  # ACE Homogeneous specific params
+  homogeneous_min_scale: 0.01
+  homogeneous_max_scale: 4.0
 
 fusion:
   stored_feature_file: ???

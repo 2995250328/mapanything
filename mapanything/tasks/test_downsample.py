@@ -9,6 +9,7 @@ import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+from mapanything.datasets import SevenScenesWAI
 
 import cv2
 import hydra
@@ -24,6 +25,7 @@ import dsacstar
 from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 from mapanything.models import init_model
 from mapanything.tasks.ace import (
+    ACEHead_Homogeneous_Mean,
     ACEHead_Pointwise_Decoupled_WithScale,
     ACEHead_Pointwise_FiLM,
     load_memory_features,
@@ -49,18 +51,38 @@ class NumpyEncoder(json.JSONEncoder):
 
 printer = DebugPrinter()
 
-def _build_head(cfg: DictConfig) -> torch.nn.Module:
-    head_type = getattr(cfg.head, "type", "film").lower()
-    if head_type == "decoupled":
+
+def _build_head(cfg: DictConfig, in_channels: int, scene_mean: torch.Tensor = None) -> torch.nn.Module:
+    # 优先读取 cfg.model.head_mode，如果不存在则回退到 cfg.head.type
+    head_mode = getattr(cfg.model, "head_mode", getattr(cfg.head, "type", "film")).lower()
+
+    print(f"Building Regression Head: Mode={head_mode}, In-Channels={in_channels}")
+
+    if head_mode == "ace_homogeneous":
+        if scene_mean is None:
+            # 如果没有均值，通常回退到 0，或者抛出错误
+            print("Warning: ACEHead_Homogeneous_Mean requested but scene_mean is None. Using zeros.")
+            scene_mean = torch.zeros(3)
+
+        return ACEHead_Homogeneous_Mean(
+            in_channels=in_channels,
+            hidden_dim=cfg.head.hidden_dim,
+            mean=scene_mean,  # 传入场景均值
+            depth=getattr(cfg.head, "depth", 8)
+        )
+
+    elif head_mode == "decoupled":
         return ACEHead_Pointwise_Decoupled_WithScale(
-            in_channels=cfg.head.in_channels,
-            token_dim=getattr(cfg.head, "token_dim", cfg.head.in_channels),
+            in_channels=in_channels,
+            token_dim=getattr(cfg.head, "token_dim", in_channels),
             hidden_dim=cfg.head.hidden_dim,
         )
-    return ACEHead_Pointwise_FiLM(
-        in_channels=cfg.head.in_channels,
-        hidden_dim=cfg.head.hidden_dim,
-    )
+
+    else:  # Default to FiLM
+        return ACEHead_Pointwise_FiLM(
+            in_channels=in_channels,
+            hidden_dim=cfg.head.hidden_dim,
+        )
 
 def _get_eval_attr(cfg: DictConfig, name: str, default: Any) -> Any:
     eval_cfg = getattr(cfg, "eval", None)
@@ -72,6 +94,21 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     logger = _logger or logging.getLogger(__name__)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
+    dataset = None
+    if isinstance(cfg.dataset.test_dataset, str):
+        dataset = eval(cfg.dataset.test_dataset)
+    if dataset is None:
+        raise ValueError("Dataset not initialized properly.")
+
+    # 获取场景均值 (Homogeneous Head 需要)
+    scene_mean = None
+    if hasattr(dataset, "mean_cam_center"):
+        scene_mean = dataset.mean_cam_center.to(device)
+        print(f"Loaded Scene Mean from Dataset: {scene_mean.tolist()}")
+    else:
+        print("Warning: Dataset does not provide mean_cam_center. Using Zero Mean.")
+        scene_mean = torch.zeros(3, device=device)
+
     # 1. 初始化模型
     model = init_model(cfg.model.model_str, cfg.model.model_config, torch_hub_force_reload=False)
     model.to(device).eval()
@@ -80,32 +117,45 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    # 2. 初始化 Head
-    head = _build_head(cfg)
-    head_ckpt = getattr(cfg.head, "checkpoint", None)
-    if head_ckpt:
-        # 使用你之前的 load_regression_head 逻辑
+    head_ckpt_path = getattr(cfg.head, "checkpoint", None)
+    in_channels = cfg.head.in_channels  # 默认从 config 读取
+
+    if head_ckpt_path and os.path.exists(head_ckpt_path):
+        try:
+            # 仅加载元数据，不加载权重
+            payload = torch.load(head_ckpt_path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict) and "in_channels" in payload:
+                ckpt_channels = int(payload["in_channels"])
+                print(f"Override: Found 'in_channels' in checkpoint: {ckpt_channels}")
+                in_channels = ckpt_channels
+        except Exception as e:
+            print(f"Warning: Could not probe checkpoint for metadata: {e}")
+    head = _build_head(cfg, in_channels, scene_mean)
+
+    if head_ckpt_path:
+        print(f"Loading regression head weights from {head_ckpt_path}...")
+        # 使用你提供的 load_regression_head 逻辑
         report = load_regression_head(
             head,
-            head_ckpt,
-            device="cpu",
+            head_ckpt_path,
+            device=str(device),  # 建议在 CPU 或指定 Device 加载
             strict=False,
+            # ace_homogeneous 有时会被包装在 ace_head 下，增加前缀容错
             allowed_prefixes=("", "module.", "head.", "reg_head.", "ace_head."),
             rename_map=None,
+            verbose=True
         )
-        logger.info(
-            "Loaded regression head from %s | used=%d, missing=%d",
-            head_ckpt, report["used_from_ckpt"], len(report["missing"])
-        )
+        # 打印加载报告
+        print(f"Head Loaded | used={report['used_from_ckpt']}, missing={len(report['missing'])}, "
+              f"unexpected={len(report['unexpected'])}, shape_skip={len(report['skipped_shape'])}")
+
     head.eval().to(device)
 
-    # 3. 加载 Memory 并聚合 (适配 25 层或其他层数)
     # 即使训练时没用 Memory，推理时如果想用，可以在这里加载；
     # 如果想复刻训练时的“单视图模式”，可以将 memory_tokens_per_block 设为 [None]*24
     if cfg.fusion.stored_feature_file and os.path.exists(cfg.fusion.stored_feature_file):
         logger.info(f"Loading memory features from {cfg.fusion.stored_feature_file}")
         memory_feats, memory_token = load_memory_features(cfg.fusion.stored_feature_file, device)
-
         # 自动适配层数
         num_blocks = len(memory_feats)
         aggregator = BlockwiseAggregator(
@@ -124,13 +174,6 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         num_blocks = getattr(model.info_sharing, "depth", 24)
         memory_tokens_per_block = [None] * num_blocks
         memory_token = None
-
-    # 4. 创建 Dataset
-    dataset = None
-    if isinstance(cfg.dataset.test_dataset, str):
-        dataset = eval(cfg.dataset.test_dataset)
-    if dataset is None:
-        raise ValueError("Dataset not initialized properly.")
 
     if bool(getattr(cfg.dataset, "sequential_view_mode", False)):
         dataloader = DataLoader(
@@ -162,7 +205,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
     num_frames = 0
 
     logger.info("Starting inference on %d frames...", len(dataset))
-
+    empty_memory = [None] * 24
     for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Evaluating")):
         batch = batch_data
         # 数据解包与移动到 GPU (保持原逻辑)
@@ -181,23 +224,21 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
 
         start_time = time.time()
         with torch.no_grad():
-            # 获取原始图像尺寸
+            # 获取原始图像尺寸 (例如 518x518 或 480x640)
             img_h, img_w = batch[0]["img"].shape[-2:]
-
-            # 1. 提取特征 (28x37)
-            fused_feature, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
+            # 1. 提取特征 (例如 37x37 或 28x37)
+            # 注意：这里使用的是下采样后的特征
+            fused_feature, fused_query_feature_noinfo, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
                 query_view=batch,
                 device=str(device),
-                memory_tokens_per_block=memory_tokens_per_block,
+                memory_tokens_per_block=empty_memory,
                 additional_tokens=memory_token,
                 memory_keep_ratio=cfg.fusion.memory_keep_ratio,
                 memory_efficient_inference=cfg.fusion.memory_efficient_inference,
             )
 
-            # [修改] 直接将低分辨率特征送入 Head
-            # fused_feature: [1, C, 28, 37]
-            preds = head(fused_feature, fused_token) # preds: [1, 4, 28, 37]
-
+            # 2. Head 预测 (输出尺寸为低分辨率，例如 [1, 4, 37, 37])
+            preds = head(fused_feature, fused_token)
             # 处理多 Head 输出
             scale = None
             if isinstance(preds, (tuple, list)):
@@ -205,16 +246,10 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             elif isinstance(preds, dict):
                 scale = preds.get("scale", None)
                 preds = preds["preds"]
+            coords_raw = preds[:, :3]  # [1, 3, H_feat, W_feat]
+            # conf_logits = preds[:, 3:4] # 如果需要置信度
 
-            if preds.dim() == 2: # [N, 4] -> [B, 4, H, W]
-                # 这种情况理论上在 dense inference 不会出现，除非 head 写错了
-                # 假设 head 输出已经是 feature map 形状
-                pass
-
-            coords_raw = preds[:, :3] # [1, 3, 28, 37]
-            conf_logits = preds[:, 3:4]
-
-            # 应用 Scale
+            # 3. 应用 Scale (如果有)
             if scale is not None:
                 scale = scale.to(device)
                 while scale.dim() < coords_raw.dim():
@@ -223,26 +258,18 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             else:
                 pred_coords = coords_raw
 
-            # [关键步骤] 将预测的坐标图上采样回原图分辨率
-            # 为什么这样做？因为 DSAC* 需要在图像坐标系下采点 (PnP)。
-            # 直接把 28x37 变回 392x518，相当于告诉 DSAC：
-            # "原图中这 14x14 的区域都对应同一个预测坐标 (即 Patch 中心的预测)"
-            # 使用 'bilinear' 可以让坐标变化更平滑，有助于 RANSAC；'nearest' 则严格遵循训练时的假设。
-            # 推荐使用 'bilinear' 以获得更好的亚像素精度表现。
-            pred_coords_up = F.interpolate(
-                pred_coords,
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=False
-            ) # [1, 3, H, W]
+            # [关键] 动态计算下采样倍率 (Stride)
+            # 例如：原图 518，特征图 37 -> stride = 14
+            feat_h, feat_w = pred_coords.shape[-2:]
+            output_subsample = int(round(img_h / feat_h))
+
+            # 简单校验一下宽高比是否一致，确保 stride 计算正确
+            # assert int(round(img_w / feat_w)) == output_subsample, "Width/Height stride mismatch!"
 
         # 准备数据给 DSAC*
         view = batch[0]
-        # target_world, _ = _prepare_targets(view, device) # 仅用于 check，非必须
-
-        # 获取场景坐标图 (CPU)
-        scene_coordinates = pred_coords_up[0].float().cpu() # [3, H, W]
-
+        # 获取场景坐标图 (CPU) [3, H_feat, W_feat]
+        scene_coordinates = pred_coords[0].float().cpu()
         # 初始化输出 Pose
         out_pose = torch.zeros((4, 4))
 
@@ -254,11 +281,11 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         ppY = intrinsics[1, 2].item()
 
         # [DSAC* Inference]
-        # 注意：这里我们传入了全分辨率的 map (pred_coords_up)
-        # DSAC* 会根据 output_subsample (通常为 8) 再次下采样进行 PnP
-        # 这样流程就和标准 ACE 只有分辨率的区别了
+        # 这里直接传入低分辨率的 scene_coordinates
+        # 关键点：传入计算出的 output_subsample (例如 14)
+        # DSAC* 内部逻辑：像素坐标 (u, v) -> 对应原图 (u * subsample, v * subsample)
         inlier_count = dsacstar.forward_rgb(
-            scene_coordinates.unsqueeze(0),
+            scene_coordinates.unsqueeze(0),  # shape: [1, 3, H_feat, W_feat]
             out_pose,
             hyps,
             threshold,
@@ -267,7 +294,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             ppY,
             inlieralpha,
             maxpixelerror,
-            output_subsample,
+            output_subsample,  # <--- 这里传入 14 (或实际的 stride)
         )
 
         # 计算误差
