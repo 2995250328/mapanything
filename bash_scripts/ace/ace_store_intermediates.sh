@@ -13,7 +13,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 4 benchmark_518_eth3d_snpp_tav2"
 #)
   batch_sizes_and_views=(
-    "1 96 benchmark_518_seven_scenes"
+    "1 24 benchmark_518_seven_scenes"
 )
 
 for combo in "${batch_sizes_and_views[@]}"; do
