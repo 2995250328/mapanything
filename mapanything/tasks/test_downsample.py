@@ -42,7 +42,6 @@ class NumpyEncoder(json.JSONEncoder):
                             np.int16, np.int32, np.int64, np.uint8,
                             np.uint16, np.uint32, np.uint64)):
             return int(obj)
-        elif isinstance(obj, (np.floating, float)):  # np.floating 是所有浮点类型的基类
             return float(obj)
         elif isinstance(obj, (np.ndarray,)):
             return obj.tolist()
@@ -227,6 +226,9 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             img_h, img_w = batch[0]["img"].shape[-2:]
             # 1. 提取特征 (例如 37x37 或 28x37)
             # 注意：这里使用的是下采样后的特征
+            fused_feature, fused_token = model.forward_dense_feats(
+                batch,
+                cfg.training.memory_efficient_inference
             )
 
             # 2. Head 预测 (输出尺寸为低分辨率，例如 [1, 4, 37, 37])
@@ -249,94 +251,7 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
                 pred_coords = coords_raw * scale
             else:
                 pred_coords = coords_raw
-            # ==============================================================================
-            # [DEBUG] 3D Coordinate Verification Block (Fixed Shapes)
-            # ==============================================================================
-            # 1. 准备 Ground Truth (Robust Shape Handling)
-            # ------------------------------------------------------------------------------
-            # 假设 batch[0] 是当前帧的数据字典
-            gt_pts3d_raw = batch[0]["pts3d"].to(device)
 
-            # 自动纠正维度：确保变为 [B, 3, H, W]
-            if gt_pts3d_raw.dim() == 3:  # [H, W, 3] or [3, H, W]
-                if gt_pts3d_raw.shape[-1] == 3:  # HWC -> CHW -> 1CHW
-                    gt_pts3d_full = gt_pts3d_raw.permute(2, 0, 1).unsqueeze(0)
-                else:  # CHW -> 1CHW
-                    gt_pts3d_full = gt_pts3d_raw.unsqueeze(0)
-            elif gt_pts3d_raw.dim() == 4:  # [B, H, W, 3] or [B, 3, H, W]
-                if gt_pts3d_raw.shape[-1] == 3:  # BHWC -> BCHW
-                    gt_pts3d_full = gt_pts3d_raw.permute(0, 3, 1, 2)
-                else:  # BCHW
-                    gt_pts3d_full = gt_pts3d_raw
-            else:
-                raise ValueError(f"Unknown pts3d shape: {gt_pts3d_raw.shape}")
-
-            # 处理 Mask (同理处理 HW/BHW/BHW1)
-            if "valid_mask" in batch[0]:
-                mask_raw = batch[0]["valid_mask"].to(device)
-                if mask_raw.dim() == 2:  # HW -> 11HW
-                    gt_mask_full = mask_raw.unsqueeze(0).unsqueeze(0)
-                elif mask_raw.dim() == 3:  # BHW -> B1HW
-                    gt_mask_full = mask_raw.unsqueeze(1)
-                elif mask_raw.dim() == 4 and mask_raw.shape[-1] == 1:  # BHW1 -> B1HW
-                    gt_mask_full = mask_raw.permute(0, 3, 1, 2)
-                else:
-                    gt_mask_full = mask_raw
-            else:
-                gt_mask_full = torch.ones_like(gt_pts3d_full[:, :1])
-
-            # 2. 执行下采样 (Patch Center Sampling)
-            # ------------------------------------------------------------------------------
-            H_feat, W_feat = pred_coords.shape[-2:]
-            H_img, W_img = gt_pts3d_full.shape[-2:]
-
-            # 构建采样网格 (align_corners=True 对应 Patch Center)
-            i = torch.arange(H_feat, device=device)
-            j = torch.arange(W_feat, device=device)
-            yy, xx = torch.meshgrid(i, j, indexing="ij")
-
-            patch_h = H_img / H_feat
-            patch_w = W_img / W_feat
-
-            u_c = (xx + 0.5) * patch_w
-            v_c = (yy + 0.5) * patch_h
-
-            x_norm = (u_c / (W_img - 1)) * 2 - 1
-            y_norm = (v_c / (H_img - 1)) * 2 - 1
-            grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)  # [1, Hf, Wf, 2]
-
-            # 对 GT 坐标进行采样 (此时 gt_pts3d_full 已经是正确的 1x3xHxW)
-            gt_pts3d_down = F.grid_sample(gt_pts3d_full, grid, mode='bilinear', align_corners=True)  # -> [1, 3, Hf, Wf]
-            gt_mask_down = F.grid_sample(gt_mask_full.float(), grid, mode='nearest', align_corners=True).bool()
-
-            # 3. 计算直接 3D 误差
-            # ------------------------------------------------------------------------------
-            # 确保 pred_coords 加上了 Mean (根据你的情况调整)
-            # 如果是 Homogeneous Head 且正确加载了 Mean，这里 pred_coords 已经是世界坐标
-            # 如果发现误差依然巨大且是偏移，尝试取消注释下面这行：
-            # if scene_mean is not None and not hasattr(head, "mean"):
-            #     pred_coords = pred_coords + scene_mean.view(1, 3, 1, 1)
-
-            diff = pred_coords - gt_pts3d_down
-            dist = diff.norm(dim=1, p=2)  # [1, Hf, Wf]
-
-            valid_dist = dist[gt_mask_down.squeeze(1)]
-
-            if valid_dist.numel() > 0:
-                print(f"\n[DEBUG Frame {batch_idx}] 3D Coordinate Check:")
-                print(f"  > Mean Error:   {valid_dist.mean().item():.4f} m")
-                print(f"  > Median Error: {valid_dist.median().item():.4f} m")
-                print(f"  > Min Error:    {valid_dist.min().item():.4f} m")
-
-                # 抽查中心点数值
-                c_h, c_w = H_feat // 2, W_feat // 2
-                p_val = pred_coords[0, :, c_h, c_w].detach().cpu().numpy()
-                g_val = gt_pts3d_down[0, :, c_h, c_w].detach().cpu().numpy()
-                print(f"  > Center Pred: {p_val}")
-                print(f"  > Center GT:   {g_val}")
-            else:
-                print(f"[DEBUG Frame {batch_idx}] No valid GT points.")
-            # ==============================================================================
             # [关键] 动态计算下采样倍率 (Stride)
             # 例如：原图 518，特征图 37 -> stride = 14
             feat_h, feat_w = pred_coords.shape[-2:]
@@ -363,9 +278,6 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
         # 这里直接传入低分辨率的 scene_coordinates
         # 关键点：传入计算出的 output_subsample (例如 14)
         # DSAC* 内部逻辑：像素坐标 (u, v) -> 对应原图 (u * subsample, v * subsample)
-        offset = output_subsample / 2.0
-        ppX_corrected = ppX - offset
-        ppY_corrected = ppY - offset
         inlier_count = dsacstar.forward_rgb(
             scene_coordinates.unsqueeze(0),  # shape: [1, 3, H_feat, W_feat]
             out_pose,
