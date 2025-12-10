@@ -18,6 +18,10 @@ model:
   head_prefixes: ["", "module.", "head.", "reg_head.", "ace_head."]  # 可覆盖
 head:
   hidden_dim: 256
+  depth: 8
+  # ACE Homogeneous specific params
+  homogeneous_min_scale: 0.01
+  homogeneous_max_scale: 4.0
 
 fusion:
   stored_feature_file: ???
@@ -27,16 +31,16 @@ fusion:
 training:
   device: cuda
   output_dir: ${output_dir}/ace_regression
-  epochs: 48
-  log_interval: 10
+  epochs: 64
+  log_interval: 100
   lr: 1e-4
   weight_decay: 1e-4
   batch_size: 5120
   num_workers: 2
-  buffer_size: 8196000
+  buffer_size: 10240000
   samples_per_view: 1024
-  shuffle: true
-  memory_efficient_inference: false
+  shuffle: True
+  memory_efficient_inference: False
 
 loss:
   depth_min: 1.0e-4          # 投影时的最小深度（防止除零）

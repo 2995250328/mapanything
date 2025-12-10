@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import math
 import torch.nn.functional as F
 from pathlib import Path
 from collections import OrderedDict
@@ -160,6 +162,114 @@ class ACEHead_Pointwise_Decoupled_WithScale(nn.Module):
             out = out.squeeze(-1).squeeze(-1)  # [N,3]
 
         return out, s
+
+
+class ACEHead_Homogeneous_Mean(nn.Module):
+    """
+    ACE-style Regression Head with Homogeneous Coordinates and Mean Centering.
+
+    Outputs:
+        - 3D Coordinates (Absolute, World Frame)
+        - Confidence (Log Sigma)
+
+    Logic:
+        Raw Output: [x, y, z, w, conf]
+        Homogeneous Norm: coords_local = [x, y, z] / softplus(w)
+        Mean Shift: coords_world = coords_local + mean
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 hidden_dim: int = 512,
+                 depth: int = 8,
+                 mean: torch.Tensor = None,  # [3] 场景均值
+                 homogeneous_min_scale: float = 0.01,
+                 homogeneous_max_scale: float = 4.0):
+        super().__init__()
+
+        # 1. Register Mean Buffer
+        if mean is None:
+            # 默认为 0，相当于不使用 Mean Centering
+            mean = torch.zeros(3)
+        # 注册为 buffer，随模型保存但不参与梯度更新
+        # reshape to (1, 3, 1, 1) for broadcasting to (B, 3, H, W)
+        self.register_buffer("mean", mean.clone().detach().view(1, 3, 1, 1))
+
+        # 2. Homogeneous Parameters
+        self.register_buffer("max_scale", torch.tensor([homogeneous_max_scale]))
+        self.register_buffer("min_scale", torch.tensor([homogeneous_min_scale]))
+        self.register_buffer("max_inv_scale", 1. / self.max_scale)
+        self.register_buffer("min_inv_scale", 1. / self.min_scale)
+        # Beta for softplus to ensure smooth transition
+        self.register_buffer("h_beta", math.log(2) / (1. - self.max_inv_scale))
+
+        # 3. Network Architecture
+        # 纯 MLP 结构 (1x1 Conv)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([PointwiseBlock(hidden_dim) for _ in range(depth)])
+
+        # Output Head: 5 Channels
+        # 0-2: XYZ (unnormalized)
+        # 3:   W (homogeneous scale)
+        # 4:   Conf (log sigma)
+        self.head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, 5, 1, bias=True)
+        )
+
+    def forward(self, x: torch.Tensor, scale_token: torch.Tensor = None):
+        # x: [B, C, H, W]
+        # scale_token: 兼容接口，本模块不强制使用它，或者可以作为额外的 condition
+
+        squeeze_hw = False
+        if x.dim() == 2:
+            x = x.unsqueeze(-1).unsqueeze(-1)
+            squeeze_hw = True
+
+        # Backbone
+        h = self.stem(x)
+        for blk in self.blocks:
+            h = blk(h)
+
+        # Prediction: [B, 5, H, W]
+        raw = self.head(h)
+
+        # --- ACE Logic ---
+
+        # 1. Split Channels
+        # xyz_raw: [B, 3, H, W]
+        # w_raw:   [B, 1, H, W]
+        # conf:    [B, 1, H, W]
+        xyz_raw = raw[:, :3, :, :]
+        w_raw = raw[:, 3:4, :, :]
+        conf = raw[:, 4:, :, :]  # 最后一维作为 confidence
+
+        # 2. Homogeneous Normalization
+        # w = Softplus(w_raw) + min_inv_scale
+        # 保证分母为正且有下界
+        w = F.softplus(w_raw, beta=self.h_beta.item()) + self.max_inv_scale
+        w = torch.clamp(w, max=self.min_inv_scale)
+
+        xyz_local = xyz_raw / w
+
+        # 3. Mean Centering (Add Mean)
+        # coords_world = xyz_local + scene_center
+        coords_world = xyz_local + self.mean
+
+        # 4. Re-assemble for Loss
+        # Output: [B, 4, H, W] -> (X, Y, Z, Conf)
+        out = torch.cat([coords_world, conf], dim=1)
+
+        if squeeze_hw:
+            out = out.flatten(1)  # [N, 4]
+
+        return out
 
 
 def load_regression_head(

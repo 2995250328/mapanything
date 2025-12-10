@@ -128,7 +128,7 @@ class DINOv2Encoder(nn.Module):
         # Load the backbone
         self.hub_loader = getattr(
             importlib.import_module(
-                "map-anything.models.external.dinov2.hub.backbones", __package__
+                "mapanything.models.external.dinov2.hub.backbones", __package__
             ),
             backbone,
         )

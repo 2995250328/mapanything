@@ -2685,7 +2685,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             additional_tokens=scale_token,
             memory_keep_ratio=memory_keep_ratio,
         )
-
+        fused_query_feature_noinfo = query_feat
         fused_query_feature = final_feat.features[0]
         fused_scale_token = final_feat.additional_token_features
 
@@ -2724,7 +2724,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 memory_efficient_inference=memory_efficient_inference,
             )
 
-        return fused_query_feature, fused_scale_token, dense_out_feat, pose_out, scale_out
+        return fused_query_feature, fused_query_feature_noinfo, fused_scale_token, dense_out_feat, pose_out, scale_out
 
     def _clone_tensor_for_storage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Detach, clone, and optionally move a tensor for intermediate storage."""
