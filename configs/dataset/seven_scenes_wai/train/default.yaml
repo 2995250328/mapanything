@@ -25,4 +25,4 @@ dataset_metadata_dir: ${mapanything_dataset_metadata_dir}
 overfit_num_sets: null
 variable_num_views: ${dataset.train.variable_num_views}
 num_views: ${dataset.num_views}
-covisibility_thres: 0.0
+covisibility_thres: 0.000025

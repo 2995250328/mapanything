@@ -21,7 +21,6 @@ for combo in "${batch_sizes_and_views[@]}"; do
         batch_size=$batch_size \
         device=cuda:2 \
         head.type="ace_homogeneous"\
-        head.checkpoint="/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace-downsample_task-images_only_head-ace_homogeneous_loss-reproj_scale-on_ep64_buf10240000.pt" \
         model=mapanything_memory \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \

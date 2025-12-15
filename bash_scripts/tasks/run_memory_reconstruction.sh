@@ -6,18 +6,19 @@ batch_sizes_and_views=(
     "1 1 benchmark_518_seven_scenes"
 )
 # 3. 输入特征文件 (使用插值变量 ${root_experiments_dir})
-FEATURE_FILE='/home/xwh/project/map-anything-experiments/ace_tasks/map-anything/benchmark_518_seven_scenes_100v_aa_capture/ACE/aa_blocks/1113T09151762996545/7Scenes_chess_test_100v_intermediates.pt/7Scenes_chess_test_100v_intermediates.pt'
+FEATURE_FILE='/home/xwh/project/map-anything-experiments/ace_tasks/mapanything/benchmark_518_seven_scenes_24v_aa_capture/ACE/aa_blocks/1125T0205/7Scenes_chess_train_24v_batch0000_intermediates.pt/7Scenes_chess_train_24v_batch0000_intermediates.pt'
 
 for combo in "${batch_sizes_and_views[@]}"; do
     read -r batch_size num_views dataset <<< "$combo"
     echo "Running $dataset with batch_size=$batch_size and num_views=$num_views"
     python3  \
-        map-anything/tasks/demo.py \
+        mapanything/tasks/demo.py \
         machine=aws \
         dataset=$dataset \
         dataset.num_workers=1 \
         dataset.num_views=$num_views \
         batch_size=$batch_size \
+        device=cuda:1 \
         model=mapanything_memory \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \

@@ -39,7 +39,7 @@ def move_view_to_device(view: Dict[str, Any], device: torch.device, *, non_block
     """Move tensor-like view entries to the requested device.
 
     Non tensor/metadata entries are kept untouched. This mirrors the filtering
-    strategy used in :mod:`map-anything.tasks.demo` to keep the calling contract
+    strategy used in :mod:`mapanything.tasks.demo` to keep the calling contract
     aligned with existing inference code.
     """
 

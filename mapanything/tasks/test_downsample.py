@@ -42,8 +42,6 @@ class NumpyEncoder(json.JSONEncoder):
                             np.int16, np.int32, np.int64, np.uint8,
                             np.uint16, np.uint32, np.uint64)):
             return int(obj)
-        elif isinstance(obj, (np.float_, np.float16, np.float32,
-                              np.float64)):
             return float(obj)
         elif isinstance(obj, (np.ndarray,)):
             return obj.tolist()
@@ -228,13 +226,9 @@ def run_eval(cfg: DictConfig, _logger=None) -> Dict[str, Any]:
             img_h, img_w = batch[0]["img"].shape[-2:]
             # 1. 提取特征 (例如 37x37 或 28x37)
             # 注意：这里使用的是下采样后的特征
-            fused_feature, fused_query_feature_noinfo, fused_token, _, _, _ = model.forward_with_memory_dense_feature(
-                query_view=batch,
-                device=str(device),
-                memory_tokens_per_block=empty_memory,
-                additional_tokens=memory_token,
-                memory_keep_ratio=cfg.fusion.memory_keep_ratio,
-                memory_efficient_inference=cfg.fusion.memory_efficient_inference,
+            fused_feature, fused_token = model.forward_dense_feats(
+                batch,
+                cfg.training.memory_efficient_inference
             )
 
             # 2. Head 预测 (输出尺寸为低分辨率，例如 [1, 4, 37, 37])
