@@ -16,6 +16,13 @@ model:
   head_checkpoint: null     # "/path/to/head_only.ckpt" 时启用加载
   head_strict: false        # 是否严格加载（通常 false 更稳）
   head_prefixes: ["", "module.", "head.", "reg_head.", "ace_head."]  # 可覆盖
+  # 是否开启基于置信度的特征采样 (CoMe Acceleration)
+  use_confidence_sampling: true
+  # 预训练的置信度预测器权重路径
+  confidence_checkpoint: "/home/xwh/project/CoMe/Model/MapAnything_Accelerator/checkpoint.pth"
+  # 预测器结构配置文件路径
+  confidence_config: "/home/xwh/project/CoMe/Model/MapAnything_Accelerator/config.json"
+
 head:
   hidden_dim: 256
   depth: 8
@@ -38,9 +45,19 @@ training:
   batch_size: 5120
   num_workers: 2
   buffer_size: 10240000
+  # 每次 Buffer 刷新时的目标样本数量。
+  # 这个参数决定了显存占用峰值和数据随机性的平衡。
+  # 默认: 2000000 (2M)。如果设得太小，IO开销变大；设得太大，显存可能溢出。
+  target_features_per_chunk: 2000000
+  buffer_chunk_size: null
   samples_per_view: 1024
   shuffle: true
   memory_efficient_inference: false
+  # 决定如何从置信度图中选择点。
+  # 'topk': 只选置信度最高的点 (推荐用于 ACE 建图，因为只想要高质量点)
+  # 'weighted': 根据置信度加权随机采样 (保留一定探索性)
+  # 'random': 完全随机 (等同于不开启置信度采样)
+  sampling_mode: "topk"
 
 loss:
   depth_min: 1.0e-4          # 投影时的最小深度（防止除零）

@@ -313,7 +313,7 @@ def benchmark(args):
     print("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(", ", ",\n"))
 
-    device = "cuda:3" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
     # Fix the seed

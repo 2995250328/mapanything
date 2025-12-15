@@ -539,13 +539,17 @@ def _collect_buffer(
             with torch.no_grad():
                 # [关键修改]：传入 empty_memory 而不是 memory_feats
                 # 这样模型只提取 Query 自身的特征，不做 Memory 融合
-                fused_feature, fused_query_feature_noinfo, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
-                    query_view=batch,
-                    device=str(device),
-                    memory_tokens_per_block=empty_memory,  # <--- 强制不用 Memory
-                    additional_tokens=memory_token,
-                    memory_keep_ratio=cfg.fusion.memory_keep_ratio,
-                    memory_efficient_inference=cfg.training.memory_efficient_inference,
+                # fused_feature, fused_query_feature_noinfo, fused_token, dense_feat, final_pose, final_scale = model.forward_with_memory_dense_feature(
+                #     query_view=batch,
+                #     device=str(device),
+                #     memory_tokens_per_block=empty_memory,  # <--- 强制不用 Memory
+                #     additional_tokens=memory_token,
+                #     memory_keep_ratio=cfg.fusion.memory_keep_ratio,
+                #     memory_efficient_inference=cfg.training.memory_efficient_inference,
+                # )
+                fused_feature, fused_token = model.forward_dense_feats(
+                    batch,
+                    cfg.training.memory_efficient_inference
                 )
 
                 # [关键修改]：直接使用下采样的特征 (28x37)，不进行上采样
@@ -580,7 +584,7 @@ def _collect_buffer(
 
             # 5. 采样 GT 3D 坐标
             # target_world_full: [1, 3, H0, W0] -> [1, 3, Hf, Wf]
-            target_world_down = F.grid_sample(target_world_full, grid, mode='bilinear', align_corners=True)
+            target_world_down = F.grid_sample(target_world_full, grid, mode='nearest', align_corners=True)
             target_world_for_buffer = target_world_down.squeeze(0).permute(1, 2, 0)  # [Hf, Wf, 3]
 
             # 6. 采样 Mask (使用 nearest 避免无效值扩散)
@@ -784,26 +788,33 @@ def _loss_fn(
 
         return total_loss + reg, float(reg.detach().cpu())
 
-    # =============== main branches ===============
+    # =========================================================================
+    # Branch 1: XYZ Loss (Warmup)
+    # =========================================================================
     if mode == "xyz":
         target_world = batch["target_world"].to(device)  # [N,3]
-        diff = coords - target_world  # [N,3]
-        err = torch.norm(diff, dim=1, p=2)  # [N]
 
-        # [修改] 使用 Huber Loss 增强 XYZ 模式的鲁棒性
-        # loss_vec = log_sigma + sqrt2 * (err / sigma)
+        # 1. 计算 Loss
+        # 使用 Huber Loss 增强鲁棒性
         loss_huber = F.huber_loss(coords, target_world, delta=1.0, reduction='none').sum(dim=1)
-        total = loss_huber.mean()
+        total = loss_huber.mean()*100
 
-        # ---------- scale regularization (optional) ----------
-        sr = getattr(loss_cfg, "scale_reg", None)
-        scale_reg_val = 0.0
-        # ... (此处省略 scale_reg 逻辑，XYZ 模式较少使用)
+        # 2. 计算 Debug 统计量 (关键修复：在这里直接计算并返回)
+        diff_3d = coords - target_world
+        dist_3d = torch.norm(diff_3d, dim=1, p=2)  # [N]
 
         metrics = {
-            "err_mean_m": float(err.mean().detach().cpu()),
             "loss": float(total.detach().cpu()),
             "mode": "xyz-huber",
+            # [修复] 补全 Debug Key
+            "err_3d_mean": float(dist_3d.mean().detach().cpu()),
+            "err_3d_median": float(dist_3d.median().detach().cpu()),
+            "err_3d_min": float(dist_3d.min().detach().cpu()),
+            "err_3d_max": float(dist_3d.max().detach().cpu()),
+            "dbg_pred": coords[0].detach().cpu().tolist(),
+            "dbg_gt": target_world[0].detach().cpu().tolist(),
+            "nuclear_cnt": 0.0,  # XYZ 模式默认无熔断
+            "err_mean_px": 0.0  # XYZ 模式无重投影误差
         }
         return total, metrics
 
@@ -811,6 +822,24 @@ def _loss_fn(
         K = batch["intrinsics"].to(device)  # [N,3,3]
         c2w = batch["c2w"].to(device)  # [N,3,4] or [N,4,4]
         px = batch["pixels"].to(device)  # [N,2]
+        # === [DEBUG START] 验证 GT 数据的自洽性 ===
+        if "target_world" in batch:
+            gt_xyz = batch["target_world"].to(device)  # [N, 3]
+            # 使用你的辅助函数计算
+            R_gt, t_gt = _invert_c2w_to_w2c(c2w)
+            Xc_gt = R_gt @ gt_xyz.unsqueeze(-1) + t_gt
+            uvh_gt = K @ Xc_gt
+            z_gt = Xc_gt[:, 2:3, :]
+            uv_gt_proj = (uvh_gt[:, :2, :] / (z_gt + 1e-6)).squeeze(-1)
+            # 计算 GT 的重投影误差
+            gt_reproj_err = (uv_gt_proj - px).norm(dim=1).mean().item()
+
+            # 如果这个值很大 (比如 > 1.0)，说明 Pose/K/Pixel 不匹配！
+            if gt_reproj_err > 5.0:
+                print(f"[CRITICAL ALARM] GT Mapping Error: {gt_reproj_err:.4f} px")
+                print("这意味着 buffer 中的 (Intrinsics + Pose + 3D点) 无法投影回 (Pixel)！")
+                print("请检查：1. Intrinsics 是否对应原图尺寸？ 2. c2w 是否需要转置？ 3. Pixel offset 是否正确？")
+        # === [DEBUG END] ===
 
         R, t = _invert_c2w_to_w2c(c2w)
         Xw = coords.unsqueeze(-1)  # [N,3,1]
@@ -860,7 +889,6 @@ def _loss_fn(
         # 2. 最终掩码 (剔除 nuclear 点)
         # Valid:  原来 Valid  且  非 Nuclear
         valid_mask = (~base_invalid_mask) & (~nuclear_mask)
-
         # Invalid: 原来 Invalid 且  非 Nuclear (保留这部分做 Proxy Loss)
         invalid_mask = base_invalid_mask & (~nuclear_mask)
 
@@ -934,7 +962,6 @@ def _loss_fn(
                     total, scale_reg_val = _scale_reg_add(
                         total, z_flat_safe, variant="prior", weight=weight, depth_prior=depth_prior
                     )
-
         metrics = {
             "err_mean_px": float(repro_err[~nuclear_mask].mean().detach().cpu()) if (~nuclear_mask).any() else 0.0,
             "loss_val": float(loss_valid.detach().cpu() / coords.shape[0]),
@@ -945,6 +972,33 @@ def _loss_fn(
         }
         if sr and getattr(sr, "enabled", False):
             metrics["scale_reg"] = scale_reg_val
+
+        if "target_world" in batch:
+            target_world_dbg = batch["target_world"].to(device)
+
+            # 计算欧氏距离
+            diff_3d = coords - target_world_dbg
+            dist_3d = torch.norm(diff_3d, dim=1)  # [N]
+            # 仅统计非熔断（Safe）的点
+            safe_indices = ~nuclear_mask
+            if safe_indices.any():
+                d_safe = dist_3d[safe_indices]
+                metrics["err_3d_mean"] = float(d_safe.mean().detach().cpu())
+                metrics["err_3d_median"] = float(d_safe.median().detach().cpu())
+                metrics["err_3d_min"] = float(d_safe.min().detach().cpu())
+                metrics["err_3d_max"] = float(d_safe.max().detach().cpu())
+
+                # 随机抽取一个点查看具体数值 (Pred vs GT)
+                # 这能让你一眼看出是否存在 Grid Sample 错位或 Mean 丢失
+                sample_idx = torch.nonzero(safe_indices, as_tuple=True)[0][0]
+                metrics["dbg_pred"] = coords[sample_idx].detach().cpu().tolist()
+                metrics["dbg_gt"] = target_world_dbg[sample_idx].detach().cpu().tolist()
+
+                # 监控深度范围
+                metrics["depth_mean"] = float(coords[sample_idx].norm().detach().cpu())  # 粗略估计
+            else:
+                # 如果全都被熔断了
+                metrics["err_3d_mean"] = -1.0
 
         return total, metrics
 # ---------------------------------------------------------------------------
@@ -1049,7 +1103,12 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
 
     print(f"Start training: Epochs={cfg.training.epochs}, Batch={cfg.training.batch_size}, "
           f"Use Half={use_half}, Steps/Epoch={len(bufferloader)}")
-
+    debug_log_path = output_dir / "training_debug.txt"
+    # 清空旧日志
+    if debug_log_path.exists():
+        with open(debug_log_path, "w") as f:
+            f.write("Step\tLoss\tPxErr\t3D_Mean\t3D_Med\tSample_Pred\tSample_GT\n")
+    warmup_steps = total_iterations * 0.05  # 或者 total_steps * 0.05
     for epoch in range(cfg.training.epochs):
         head.train()
         # 记录每个 epoch 的开始时间，或者不需要
@@ -1061,6 +1120,12 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
 
             with torch.autocast(device_type=cfg.training.device, dtype=torch.float16, enabled=use_half):
                 preds = head(features, scale)
+                if global_step < warmup_steps:
+                    cfg.loss.mode = "xyz"  # 强制直接回归坐标
+                    cfg.loss.scale_reg.enabled = False  # Warmup 阶段通常不需要 scale reg
+                else:
+                    cfg.loss.mode = "reproj"  # 之后切换回重投影
+                    cfg.loss.scale_reg.enabled = True
                 loss, metrics = _loss_fn(preds, batch, repro_loss, global_step, cfg.loss)
 
             optimizer.zero_grad(set_to_none=True)
@@ -1068,15 +1133,9 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
             scaler.scale(loss).backward()
             # Unscale 之后才能进行梯度裁剪!
             scaler.unscale_(optimizer)
-
-            # 梯度裁剪 (ACE: clip_grad_norm_ max_norm=1.0 or similar)
-            # 你之前的代码是 10.0，建议如果 Loss 还是跳变，可以尝试降到 1.0
-            torch.nn.utils.clip_grad_norm_(head.parameters(), max_norm=10.0)
-
             # Scaler Step & Update
             scaler.step(optimizer)
             scaler.update()
-
             # Scheduler Step (每个 iteration 都更新)
             # 注意：如果 scaler 跳过了这一步（因为 inf/nan），scheduler 通常也应该跳过，
             # 但 standard implementation 通常直接 step，ACE 代码中有个检查 old_optimizer_step 的逻辑。
@@ -1086,22 +1145,26 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
 
             if global_step % cfg.training.log_interval == 0:
                 time_since_start = time.time() - training_start
-
-                # 计算 valid fraction (用于监控几何稳定性)
-                # 注意：metrics 里面需要把相关信息传出来，或者在这里简单估算
-                # 这里直接打印 metrics
-
-                # 添加 LR 到日志
                 current_lr = scheduler.get_last_lr()[0]
-                metrics["lr"] = current_lr
-
-                log_msg = (f"Iter: {global_step:6d} / Epoch {epoch + 1:03d}|{cfg.training.epochs:03d}, "
-                           f"Loss: {metrics['loss']:.1f}, "
-                           f"Err: {metrics.get('err_mean_px', metrics.get('err_mean_m', 0)):.1f}, "
-                           f"Time: {time_since_start:.2f}s")
+                # --- 控制台打印 (精简) ---
+                log_msg = (f"Iter: {global_step:6d} | Loss: {metrics['loss']:.4f} | "
+                           f"PxErr: {metrics.get('err_mean_px', 0):.1f} | "
+                           f"3DMed: {metrics.get('err_3d_median', -1):.3f}m")  # 实时看3D中位数误差
                 print(log_msg)
-                # 如果是 hydra/json logging:
-                # print(json.dumps({"epoch": epoch, "step": global_step, "metrics": metrics}, ensure_ascii=False))
+
+                # --- 文件日志 (详细) ---
+                # 将详细数据追加到文件，方便事后分析
+                with open(debug_log_path, "a") as f:
+                    pred_str = "[" + ",".join([f"{x:.2f}" for x in metrics.get('dbg_pred', [])]) + "]"
+                    gt_str = "[" + ",".join([f"{x:.2f}" for x in metrics.get('dbg_gt', [])]) + "]"
+
+                    f.write(f"Step {global_step}:\n")
+                    f.write(f"  Loss: {metrics['loss']:.6f}\n")
+                    f.write(
+                        f"  3D Error (m): Mean={metrics.get('err_3d_mean', -1):.3f}, Median={metrics.get('err_3d_median', -1):.3f}, Min={metrics.get('err_3d_min', -1):.3f}\n")
+                    f.write(f"  Sample Val  : Pred={pred_str}  vs  GT={gt_str}\n")
+                    f.write(f"  Nuclear Cnt : {metrics.get('nuclear_cnt', 0)}\n")
+                    f.write("-" * 40 + "\n")
 
     # 8. 保存
     try:
@@ -1110,7 +1173,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         task_name = "unknown"
 
     ckpt_name = (
-        f"ace-downsample-clipgrad_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
+        f"ace-downsample-debug_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
         f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"
         f"ep{cfg.training.epochs}_buf{cfg.training.buffer_size}.pt"
     )
