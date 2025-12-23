@@ -6,7 +6,7 @@ dataset_str:
     resolution=${dataset.seven_scenes_wai.train.dataset_resolution},
     principal_point_centered=${dataset.seven_scenes_wai.train.principal_point_centered},
     aug_crop=${dataset.seven_scenes_wai.train.aug_crop},
-    transform='${dataset.seven_scenes_wai.train.transform}',
+    transform='${oc.select:dataset.transform, colorjitter+grayscale+gaublur}',
     data_norm_type='${dataset.seven_scenes_wai.train.data_norm_type}',
     ROOT='${dataset.seven_scenes_wai.train.ROOT}',
     dataset_metadata_dir='${dataset.seven_scenes_wai.train.dataset_metadata_dir}',
@@ -18,7 +18,6 @@ split: 'train'
 dataset_resolution: ${dataset.resolution_train}
 principal_point_centered: ${dataset.principal_point_centered}
 aug_crop: 16
-transform: 'colorjitter+grayscale+gaublur'
 data_norm_type: ${model.data_norm_type}
 ROOT: ${root_data_dir}/7scenes
 dataset_metadata_dir: ${mapanything_dataset_metadata_dir}

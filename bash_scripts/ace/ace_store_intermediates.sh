@@ -12,15 +12,14 @@ export HYDRA_FULL_ERROR=1
 #batch_sizes_and_views=(
 #    "1 4 benchmark_518_eth3d_snpp_tav2"
 #)
-  batch_sizes_and_views=(
-    "1 24 benchmark_518_seven_scenes"
+batch_sizes_and_views=(
+    "1 5 benchmark_518_seven_scenes"
 )
 
 for combo in "${batch_sizes_and_views[@]}"; do
     read -r batch_size num_views dataset <<< "$combo"
 
     echo "Running $dataset with batch_size=$batch_size, num_views=$num_views (ACE AA feature capture enabled)"
-
     run_dir_cli='${root_experiments_dir}/ace_tasks/mapanything/'"${dataset}"'_'"${num_views}"'v_aa_capture'
 
     python3 \
@@ -33,6 +32,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model=mapanything_store_intermediates_ace \
         model/task=images_and_full_geometry \
         model.encoder.uses_torch_hub=True \
+        model.info_sharing.module_args.norm_intermediate=False \
         model.pretrained='${root_pretrained_checkpoints_dir}/facebook_map-anything.pth' \
         memory_efficient_inference=True \
         hydra.run.dir='${root_experiments_dir}/ace_tasks/mapanything/'"${dataset}"'_'"${num_views}"'v_aa_capture'

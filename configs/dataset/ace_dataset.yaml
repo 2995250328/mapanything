@@ -18,6 +18,7 @@ sample_specific_scene: True
 specific_scene_name_train: "chess_train"
 specific_scene_name_test: "chess_test"
 sequential_view_mode: False
+transform: 'colorjitter+grayscale+gaublur'
 
 # Training Set
 train_dataset:

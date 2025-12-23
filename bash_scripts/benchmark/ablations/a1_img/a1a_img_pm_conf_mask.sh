@@ -38,8 +38,8 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model/pred_head=dpt \
         model/pred_head/adaptor_config=pointmap_confidence_mask \
         model.encoder.uses_torch_hub=false \
-        model.pretrained='${root_experiments_dir}/map-anything/training_ablations/a1a_pm_conf_mask/checkpoint-best.pth' \
-        hydra.run.dir='${root_experiments_dir}/map-anything/benchmarking_ablations/dense_'"${num_views}"'_view/a1a_img_pm_conf_mask'
+        model.pretrained='${root_experiments_dir}/mapanything/training_ablations/a1a_pm_conf_mask/checkpoint-best.pth' \
+        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking_ablations/dense_'"${num_views}"'_view/a1a_img_pm_conf_mask'
 
     echo "Finished running with batch_size=$batch_size and num_views=$num_views"
 done

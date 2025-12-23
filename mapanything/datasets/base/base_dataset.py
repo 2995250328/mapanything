@@ -466,8 +466,12 @@ class BaseDataset(EasyDataset):
                 idx, ar_idx, num_views_to_sample_idx = idx
         else:
             assert len(self._resolutions) == 1
-            assert isinstance(self.num_views, int)
             ar_idx = 0
+            # Fix: Handle variable_num_views (list) when accessed with simple int index
+            if isinstance(self.num_views, list):
+                num_views_to_sample_idx = -1 # Default to max views
+            else:
+                assert isinstance(self.num_views, int)
 
         # Setup the rng
         if self.seed:  # reseed for each _getitem_fn
@@ -580,7 +584,7 @@ class BaseDataset(EasyDataset):
             if "non_ambiguous_mask" in view:
                 assert view["depthmap"].shape == view["non_ambiguous_mask"].shape
 
-            # Expand the last dimennsion of the depthmap
+            # Expand the last dimension of the depthmap
             view["depthmap"] = view["depthmap"][..., None]
 
             # Append RNG state to the views, this allows to check whether the RNG is in the same state each time
