@@ -1743,11 +1743,12 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
     def forward(self, views, memory_efficient_inference=False, save_filename="info_sharing_outputs.pt"):
         """
         Forward pass with decoupled logic for feature storage vs. pure inference.
+        Fix: Re-added LayerNorm for Branch A to match Branch B's feature distribution.
         """
         import gc
 
         # ==================================================================================
-        # 1. 图像编码 (Image Encoding) - 保留分批处理优化
+        # 1. 图像编码 (Image Encoding)
         # ==================================================================================
         if views[0]["img"].ndim != 4:
             for v in views:
@@ -1844,25 +1845,49 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             del final_cpu, intermediates_cpu
             torch.cuda.empty_cache()
 
-            # A2. 构建 DPT 输入 (需要根据 dpt_indices 索引)
-            # 因为 intermediate 列表很长（包含了所有层），所以需要用 indices 去挑
+            # A2. 构建 DPT 输入 (关键修复：手动 LayerNorm)
+            # ---------------------------------------------------------------
             if self.pred_head_type == "linear":
                 dense_head_inputs = torch.cat(final_info_sharing_multi_view_feat.features, dim=0)
             elif self.pred_head_type in ["dpt", "dpt+pose"]:
                 if self.use_encoder_features_for_dpt:
                     dense_head_inputs_list.append(torch.cat(all_encoder_features_across_views, dim=0))
 
-                # 偏移量：因为 intermediate[0] 是 Input，所以第 k 层在 k+1
                 offset = 1
                 target_indices = sorted(list(self.dpt_indices)) if self.dpt_indices else []
+
+                # 获取 Normalization Layer (通常是 info_sharing.norm)
+                ln =self.info_sharing.norm# 检查配置是否已经在内部做了 Norm (如果 config 说 false，这里就需要手动做)
+                norm_intermediate_flag = getattr(self.info_sharing, "norm_intermediate", True)
+                # 注意：这里我们假设如果 norm_intermediate=False，我们就手动做。
+                # 如果 Branch B 正常工作而 config 是 False，说明 Branch B 内部有某种机制或者 head 适应了 raw。
+                # 但根据经验，加上 LN 是最稳妥的对齐方式。
 
                 for idx in target_indices:
                     list_idx = idx + offset
                     if list_idx < len(intermediate_info_sharing_multi_view_feat):
-                        feat = intermediate_info_sharing_multi_view_feat[list_idx]
-                        dense_head_inputs_list.append(torch.cat(feat.features, dim=0))
+                        mvt_out = intermediate_info_sharing_multi_view_feat[list_idx]
+
+                        # [关键修复] 手动应用 LayerNorm
+                        if not norm_intermediate_flag:
+                            feats_per_view = mvt_out.features
+                            normed_feats_list = []
+                            # 遍历每个 View (Tensor: B, C, H, W)
+                            for f in feats_per_view:
+                                B_sz, C, H_sz, W_sz = f.shape
+                                # Permute to (B, H*W, C) for LayerNorm
+                                f_seq = f.permute(0, 2, 3, 1).reshape(B_sz, H_sz * W_sz, C)
+                                f_norm = ln(f_seq)
+                                # Back to (B, C, H, W)
+                                f_back = f_norm.reshape(B_sz, H_sz, W_sz, C).permute(0, 3, 1, 2).contiguous()
+                                normed_feats_list.append(f_back)
+
+                            dense_head_inputs_list.append(torch.cat(normed_feats_list, dim=0))
+                        else:
+                            # 已经归一化，直接使用
+                            dense_head_inputs_list.append(torch.cat(mvt_out.features, dim=0))
                     else:
-                        raise IndexError(f"DPT index {list_idx} out of range for intermediates len {len(intermediate_info_sharing_multi_view_feat)}")
+                        raise IndexError(f"DPT index {list_idx} out of range.")
 
                 dense_head_inputs_list.append(torch.cat(final_info_sharing_multi_view_feat.features, dim=0))
 
