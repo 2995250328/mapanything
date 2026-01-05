@@ -9,6 +9,7 @@ from tqdm import tqdm
 from pathlib import Path
 from omegaconf import DictConfig, open_dict
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 from mapanything.tasks.ace.geometry import (
     _prepare_targets, _resolve_intrinsics, _resolve_pose
@@ -194,48 +195,18 @@ class BufferDataset(Dataset):
 
 
 def _collect_buffer(
-        cfg: DictConfig,
-        model,
-        upsampler,
-        dataset,
-        memory_feats,
-        memory_token,
-        device: torch.device,
-        capacity_override: int | None = None,
-        confidence_predictor: torch.nn.Module | None = None,
-        confidence_hook: Any | None = None,
+        cfg: DictConfig, model, upsampler, dataset, memory_feats, memory_token, device: torch.device,
+        capacity_override: int | None = None, confidence_predictor: torch.nn.Module | None = None, confidence_hook: Any | None = None,
 ) -> Tuple[FeatureReplayBuffer, int]:
     buffer: FeatureReplayBuffer | None = None
+    capacity = int(capacity_override) if capacity_override is not None else int(getattr(cfg.training, "buffer_size", 0))
+    if capacity <= 0: raise ValueError("Buffer capacity must be positive.")
 
-    # 1. 确定 Buffer 容量 (优先使用 override 值)
-    if capacity_override is not None:
-        capacity = int(capacity_override)
-    else:
-        capacity = int(getattr(cfg.training, "buffer_size", getattr(cfg.training, "buffer_capacity", 0)))
-
-    if capacity <= 0:
-        raise ValueError("Buffer capacity must be positive.")
-
-    # 2. 进度条与 Debug 路径
     pbar = tqdm(total=capacity, desc="Filling buffer", unit="sample", leave=False)
-    debug_dir = Path("debug_vis")  # 可选：用于保存 Debug 图像
-    debug_dir.mkdir(exist_ok=True)
+    debug_vis_dir = Path("debug_vis_confidence"); debug_vis_dir.mkdir(exist_ok=True, parents=True)
 
     try:
         for batch_id, views in enumerate(dataset):
-
-            # [Debug] 打印前 10 个 Batch 的图片名称 (用于验证数据加载)
-            if batch_id < 10:
-                print(f"\n[Buffer Collection] Batch {batch_id}:")
-                for v_idx, v in enumerate(views):
-                    # 尝试获取文件名，不同数据集 key 可能不同，做兼容处理
-                    img_name = v.get('image_path',
-                                     v.get('file_path', v.get('name', f"Index {v.get('idx', 'Unknown')}")))
-                    # 如果是完整路径，只取最后一部分保持简洁
-                    if isinstance(img_name, (str, Path)):
-                        img_name = Path(img_name).name
-                    print(f"  - View {v_idx}: {img_name}")
-
             batch = views
             for view in batch:
                 if "idx" in view: view["idx"] = view["idx"][2:]
@@ -247,124 +218,181 @@ def _collect_buffer(
                     view[name] = view[name].to(device, non_blocking=True)
 
             with torch.no_grad():
-                # 3. 特征提取 (触发 Hook)
-                fused_feature, fused_token = model.forward_dense_feats(
-                    batch,
-                    cfg.training.memory_efficient_inference
-                )
-                # fused_feature: [1, C, H, W]
+                fused_feature, fused_token = model.forward_dense_feats(batch, cfg.training.memory_efficient_inference)
                 feat_down = fused_feature
-
-                # 4. [置信度推理] (含 Hook 处理与退化机制)
                 importance_map = None
+
                 if confidence_predictor is not None:
                     try:
-                        # 情况 A: 有 Hook 数据 (CoMe 标准逻辑)
                         if confidence_hook is not None and confidence_hook.features is not None:
-                            raw_feat = confidence_hook.features  # [B, N, C_in]
+                            raw_feat = confidence_hook.features
+                            if batch_id == 0:  # 只在第一个 Batch 打印，防止刷屏
+                                B, N, C = raw_feat.shape
+                                Hf, Wf = feat_down.shape[-2:] # MapAnything 输出的特征图高度和宽度
+                                expected_spatial_tokens = Hf * Wf
 
-                            # 解析形状: 将 Sequence 还原为 Spatial
+                                print("\n" + "="*50)
+                                print(f" [DEBUG] Hook Feature Diagnosis")
+                                print(f" > Hook Output Shape (B, N, C): {raw_feat.shape}")
+                                print(f" > MapAnything Feat Shape (H, W): ({Hf}, {Wf})")
+                                print(f" > Expected Spatial Tokens (H*W): {expected_spatial_tokens}")
+                                print(f" > Difference (N - H*W): {N - expected_spatial_tokens}")
+
+                                diff = N - expected_spatial_tokens
+                                if diff == 0:
+                                    print(" > Type: Pure Spatial (No CLS, No Registers)")
+                                elif diff == 1:
+                                    print(" > Type: Standard ViT (1 CLS + Spatial)")
+                                elif diff == 5:
+                                    print(" > Type: DINOv2 with Registers (1 CLS + 4 Registers + Spatial)")
+                                else:
+                                    print(f" > Type: Unknown structure! Diff={diff}")
+                                print("="*50 + "\n")
+                                import matplotlib.pyplot as plt
+
+                                # 尝试按照不同假设进行 Reshape 和可视化
+                                # 假设 1: 只有 CLS (跳过 1 个)
+                                try:
+                                    feat_cls = raw_feat[:, 1:, :].reshape(B, Hf, Wf, C).permute(0, 3, 1, 2)
+                                    # 计算通道平均热力图
+                                    heatmap_cls = feat_cls[0].mean(dim=0).float().cpu().numpy()
+
+                                    plt.figure(figsize=(10, 5))
+                                    plt.subplot(1, 2, 1)
+                                    plt.title("Assumption: Skip 1 (CLS only)")
+                                    plt.imshow(heatmap_cls, cmap='viridis')
+                                    plt.colorbar()
+                                except: pass
+
+                                # 假设 2: DINOv2 (跳过 5 个)
+                                try:
+                                    if N > 5:
+                                        feat_reg = raw_feat[:, 5:, :].reshape(B, Hf, Wf, C).permute(0, 3, 1, 2)
+                                        heatmap_reg = feat_reg[0].mean(dim=0).float().cpu().numpy()
+
+                                        plt.subplot(1, 2, 2)
+                                        plt.title("Assumption: Skip 5 (CLS+4 Reg)")
+                                        plt.imshow(heatmap_reg, cmap='viridis')
+                                        plt.colorbar()
+                                except: pass
+
+                                plt.savefig("debug_hook_feature_alignment.png")
+                                print(" > Saved debug visualization to debug_hook_feature_alignment.png")
                             B_raw, N_raw, C_raw = raw_feat.shape
-                            H_f, W_f = fused_feature.shape[-2:]  # 参考最终特征图的 H, W
-                            num_spatial = H_f * W_f
-
-                            # 简单的 Token 截取策略 (适配 DINOv2 可能存在的 CLS/Register tokens)
-                            if N_raw == num_spatial:
+                            H_f, W_f = fused_feature.shape[-2:]
+                            target_len = H_f * W_f
+                            diff = N_raw - target_len
+                            if diff == 0:
+                                # 情况: 纯空间特征
                                 spatial_tokens = raw_feat
-                            elif N_raw == num_spatial + 1:
-                                spatial_tokens = raw_feat[:, 1:, :]  # Skip CLS
-                            elif N_raw == num_spatial + 5:
-                                spatial_tokens = raw_feat[:, 5:, :]  # Skip CLS + 4 Reg
+                            elif diff == 1:
+                                # 情况: 1 CLS
+                                spatial_tokens = raw_feat[:, 1:, :]
+                            elif diff == 5:
+                                # 情况: 1 CLS + 4 Registers (DINOv2 default)
+                                spatial_tokens = raw_feat[:, 5:, :]
+                            elif diff == 9:
+                                # 情况: 有些变体有 8 个 Registers
+                                spatial_tokens = raw_feat[:, 9:, :]
                             else:
-                                # 形状不匹配时的保底: 取最后 N 个
-                                spatial_tokens = raw_feat[:, -num_spatial:, :]
+                                # 情况: 未知结构，尝试取最后 N 个 (保底策略)
+                                # 警告：这可能还是会导致错位，如果 Register 在最后面的话
+                                if batch_id == 0:
+                                    print(f"[Warning] Unknown token structure! N={N_raw}, HW={target_len}, diff={diff}. Taking last {target_len}.")
+                                spatial_tokens = raw_feat[:, -target_len:, :]
 
-                            # Reshape: [B, H*W, C] -> [B, C, H, W]
+                            # Reshape [B, HW, C] -> [B, H, W, C] -> [B, C, H, W]
+                            # 这一步如果不报错，且上面的切片是对的，那么空间位置就是对齐的
                             spatial_tokens = spatial_tokens.reshape(B_raw, H_f, W_f, C_raw).permute(0, 3, 1, 2)
-
-                            # 推理: [B, 1, H, W]
-                            conf_out = confidence_predictor(spatial_tokens.to(dtype=torch.float32))
-                            importance_map = conf_out[0, 0]  # [H, W]
-
-                        # 情况 B: 没有 Hook 但有 Predictor (尝试直接预测最终特征)
-                        # 注意: 除非 Predictor 是针对最终层训练的，否则效果可能不佳，这里作为一种兼容性保留
+                            importance_map = confidence_predictor(spatial_tokens.to(dtype=torch.float32))[0, 0]
                         elif importance_map is None:
-                            conf_out = confidence_predictor(feat_down)
-                            importance_map = conf_out[0, 0]
-
+                            importance_map = confidence_predictor(feat_down)[0, 0]
                     except Exception as e:
-                        # 仅在第一个 Batch 打印警告，避免刷屏
-                        if batch_id == 0:
-                            print(f"[Warning] Confidence prediction failed: {e}. Fallback to Random Sampling.")
+                        if batch_id == 0: tqdm.write(f"[Warning] Confidence failed: {e}. Fallback to Random.")
                         importance_map = None
                     finally:
-                        # [重要] 必须清理 Hook，否则显存会爆炸
-                        if confidence_hook is not None:
-                            confidence_hook.clear()
+                        if confidence_hook is not None: confidence_hook.clear()
+
+            # --- 可视化修复版 (叠加热力图 + 分辨率处理) ---
+            if batch_id < 5 and importance_map is not None:
+                try:
+                    # 1. 准备原图
+                    img_t = batch[0]["img"].detach().cpu()
+                    if img_t.dim() == 4: img_t = img_t.squeeze(0)
+                    H_img, W_img = img_t.shape[-2:] # 获取原图尺寸
+                    img_np = img_t.permute(1, 2, 0).numpy()
+                    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-6)
+
+                    # 2. 准备原始低分辨率热力图 (用于对比展示)
+                    conf_np_raw = importance_map.detach().cpu().numpy()
+
+                    # 3. 准备高分辨率叠加热力图 (核心逻辑)
+                    # 将 [H_feat, W_feat] 扩展为 [1, 1, H_feat, W_feat] 以进行插值
+                    heatmap_t = importance_map.detach().unsqueeze(0).unsqueeze(0)
+                    # 双线性插值上采样到原图尺寸
+                    heatmap_resized_t = F.interpolate(heatmap_t, size=(H_img, W_img), mode='bilinear', align_corners=False)
+                    conf_np_resized = heatmap_resized_t.squeeze().cpu().numpy() # [H_img, W_img]
+                    # 归一化到 0-1 以便更好地映射颜色
+                    conf_np_resized = (conf_np_resized - conf_np_resized.min()) / (conf_np_resized.max() - conf_np_resized.min() + 1e-6)
+
+                    # 4. 绘图 (3个子图：原图 | 原始热力图 | 叠加图)
+                    plt.figure(figsize=(15, 5))
+
+                    plt.subplot(1, 3, 1); plt.imshow(img_np); plt.title(f"Image ({W_img}x{H_img})"); plt.axis('off')
+
+                    plt.subplot(1, 3, 2); plt.imshow(conf_np_raw, cmap='jet'); plt.colorbar()
+                    plt.title(f"Raw Confidence ({conf_np_raw.shape[1]}x{conf_np_raw.shape[0]})"); plt.axis('off')
+
+                    plt.subplot(1, 3, 3)
+                    plt.imshow(img_np) # 先画背景原图
+                    plt.imshow(conf_np_resized, cmap='jet', alpha=0.5) # 再叠加半透明热力图 (alpha=0.5)
+                    plt.title("Overlay (Superimposed)"); plt.axis('off')
+
+                    # 文件名处理
+                    raw_name = batch[0].get('instance', str(batch_id))
+                    if isinstance(raw_name, list): raw_name = raw_name[0]
+                    if hasattr(raw_name, 'name'): name_str = raw_name.name
+                    elif hasattr(raw_name, 'item'): name_str = str(raw_name.item())
+                    else: name_str = str(raw_name)
+                    safe_name = name_str.replace("/", "_").replace("\\", "_").replace("[", "").replace("]", "").replace("'", "")
+
+                    save_path = debug_vis_dir / f"batch_{batch_id}_{safe_name}_overlay.png"
+                    plt.tight_layout(); plt.savefig(save_path); plt.close()
+                    tqdm.write(f"[Debug] Saved overlay vis: {save_path}")
+                except Exception as e: tqdm.write(f"[Warn] Vis failed: {e}")
+            # ---------------------------
 
             view = batch[0]
             target_world_full, valid_mask_full = _prepare_targets(view, device)
-
-            # 5. 坐标网格生成 (对应 feat_down 的分辨率)
             H0, W0 = target_world_full.shape[-2:]
             Hf, Wf = feat_down.shape[-2:]
 
-            ys, xs = torch.meshgrid(
-                torch.arange(Hf, device=device),
-                torch.arange(Wf, device=device),
-                indexing='ij'
-            )
-            # 计算每个特征点对应的原图中心坐标
-            u_c = (xs + 0.5) * (W0 / Wf)
-            v_c = (ys + 0.5) * (H0 / Hf)
+            ys, xs = torch.meshgrid(torch.arange(Hf, device=device), torch.arange(Wf, device=device), indexing='ij')
+            u_c = (xs + 0.5) * (W0 / Wf); v_c = (ys + 0.5) * (H0 / Hf)
+            grid = torch.stack([(u_c / (W0 - 1)) * 2 - 1, (v_c / (H0 - 1)) * 2 - 1], dim=-1).unsqueeze(0)
 
-            # 构建归一化 Grid 用于 Grid Sample
-            grid_x = (u_c / (W0 - 1)) * 2 - 1
-            grid_y = (v_c / (H0 - 1)) * 2 - 1
-            grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # [1, Hf, Wf, 2]
-
-            # 6. 下采样 GT 和 Mask
             target_world_down = F.grid_sample(target_world_full, grid, mode='nearest', align_corners=True)
-            target_world_for_buffer = target_world_down.squeeze(0).permute(1, 2, 0)
-
             valid_mask_down = F.grid_sample(valid_mask_full.float(), grid, mode='nearest', align_corners=True)
-            valid_mask_for_buffer = valid_mask_down.squeeze(0).squeeze(0).bool()
-
-            pixel_grid_for_buffer = torch.stack([u_c, v_c], dim=-1)
-
+            pixel_grid = torch.stack([u_c, v_c], dim=-1)
             intrinsics = _resolve_intrinsics(view, device).to(torch.float32)
             c2w = _resolve_pose(view, device).to(torch.float32)
 
             if buffer is None:
-                in_channels = int(feat_down.shape[1])
-                buffer = FeatureReplayBuffer(capacity, in_channels, device=torch.device("cpu"))
+                buffer = FeatureReplayBuffer(capacity, int(feat_down.shape[1]), device=torch.device("cpu"))
 
-            # 7. 读取采样模式配置
-            sampling_mode = getattr(cfg.training, "sampling_mode", "topk")
-
-            # 8. 写入 Buffer (核心调用)
-            # add_view 内部逻辑: 如果 importance_map 为 None，自动退化为 torch.randperm
             added = buffer.add_view(
-                feat_down.squeeze(0).detach(),
-                fused_token.squeeze(0).detach(),
-                target_world_for_buffer.detach(),
-                valid_mask_for_buffer.detach(),
-                intrinsics.squeeze(0).detach(),
-                c2w.squeeze(0).detach(),
-                cfg.training.samples_per_view,
-                pixel_grid=pixel_grid_for_buffer.detach(),
+                feat_down.squeeze(0).detach(), fused_token.squeeze(0).detach(),
+                target_world_down.squeeze(0).permute(1, 2, 0).detach(),
+                valid_mask_down.squeeze(0).squeeze(0).bool(),
+                intrinsics.squeeze(0).detach(), c2w.squeeze(0).detach(),
+                cfg.training.samples_per_view, pixel_grid=pixel_grid.detach(),
                 importance_map=importance_map.detach() if importance_map is not None else None,
-                sampling_mode=sampling_mode
+                sampling_mode=getattr(cfg.training, "sampling_mode", "topk")
             )
+            if added > 0: pbar.update(added)
+            if buffer.is_full: break
 
-            if added > 0:
-                pbar.update(added)
-            if buffer.is_full:
-                break
-
-        if buffer is None or buffer.size == 0:
-            raise RuntimeError("Buffer empty. No valid samples collected.")
+        if buffer is None or buffer.size == 0: raise RuntimeError("Buffer empty.")
         return buffer, buffer.storage.features.shape[1]
-
     finally:
         pbar.close()

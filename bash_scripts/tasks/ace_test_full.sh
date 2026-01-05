@@ -6,21 +6,23 @@ batch_sizes_and_views=(
     "1 1 ace_dataset"
 )
 # 3. 输入特征文件 (使用插值变量 ${root_experiments_dir})
-FEATURE_FILE='/home/xwh/project/map-anything-experiments/ace_tasks/mapanything/benchmark_518_seven_scenes_24v_aa_capture/ACE/aa_blocks/1125T0205/7Scenes_chess_train_24v_batch0000_intermediates.pt/7Scenes_chess_train_24v_batch0000_intermediates.pt'
+#FEATURE_FILE='/home/xwh/project/map-anything-experiments/ace_tasks/mapanything/benchmark_518_seven_scenes_24v_aa_capture/ACE/aa_blocks/1125T0205/7Scenes_chess_train_24v_batch0000_intermediates.pt/7Scenes_chess_train_24v_batch0000_intermediates.pt'
+FEATURE_FILE=None
 
 for combo in "${batch_sizes_and_views[@]}"; do
     read -r batch_size num_views dataset <<< "$combo"
     echo "Running $dataset with batch_size=$batch_size and num_views=$num_views"
     python3  \
-        mapanything/tasks/test_downsample.py \
+        mapanything/tasks/test_full.py \
         machine=aws \
         dataset=$dataset \
         dataset.num_workers=1 \
         dataset.num_views=$num_views \
         dataset.sequential_view_mode=True \
         batch_size=$batch_size \
-        device=cuda:3 \
+        device=cuda:2 \
         head.type="ace_homogeneous"\
+        head.checkpoint='/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/ace-full-chunked_task-images_only_head-ace_homogeneous_loss-reproj_scale-on_ep64_buf20480000.pt' \
         model=mapanything_memory \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \

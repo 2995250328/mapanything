@@ -508,14 +508,11 @@ def _collect_buffer(
             if batch_id < 5:
                 view0 = views[0]
                 img = view0["img"]  # 可能是 [1,3,H,W] 或 [3,H,W]
-
                 # 先搬到 CPU，再做后处理
                 img = img.detach().cpu()
-
                 # 如果是 [1,3,H,W]，去掉 batch 维
                 if img.dim() == 4:
                     img = img[0]  # [3,H,W]
-
                 # [3,H,W] -> [H,W,3]
                 img_np = img.permute(1, 2, 0).numpy()
 

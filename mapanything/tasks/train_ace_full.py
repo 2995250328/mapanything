@@ -120,32 +120,47 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         ckpt = torch.load(cfg.model.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    # 2. [修改] 加载置信度预测器并注册 Hook
+    # 2. 加载置信度预测器并注册 Hook
     confidence_predictor = None
     confidence_hook = None
     use_confidence = getattr(cfg.model, "use_confidence_sampling", False)
+
+    # [DEBUG] 检查开关状态
+    print(f"DEBUG: use_confidence_sampling is {use_confidence}")
 
     if use_confidence:
         print("Initializing Confidence Predictor & Hooks...")
         ckpt_path = getattr(cfg.model, "confidence_checkpoint", "/path/to/checkpoint.pth")
         conf_cfg_path = getattr(cfg.model, "confidence_config", "/path/to/config.json")
+
+        # 读取 YAML 中的 probe_loc
+        probe_loc = getattr(cfg.model, "probe_loc", None)
+        if probe_loc is not None:
+            probe_loc = list(probe_loc)
+
+        # [DEBUG] 检查路径
+        print(f"DEBUG: Loading confidence from:\n  ckpt: {ckpt_path}\n  cfg: {conf_cfg_path}")
+
         try:
-            # 需要传入 backbone，通常是 model.encoder.model
-            # 这里的路径取决于 MapAnything 的具体实现结构
             if hasattr(model, "encoder") and hasattr(model.encoder, "model"):
                 backbone = model.encoder.model
             else:
                 raise AttributeError("Could not find 'encoder.model' in MapAnything.")
 
             confidence_predictor, confidence_hook = load_confidence_predictor_and_hook(
-                ckpt_path, conf_cfg_path, device, backbone
+                ckpt_path, conf_cfg_path, device, backbone,
+                probe_loc_override=probe_loc
             )
-            print("Confidence System Ready.")
+            print("Confidence System Ready. (Predictor is NOT None)")
+
         except Exception as e:
-            print(f"[Warning] Failed to setup confidence system: {e}. Fallback to random.")
+            # [DEBUG] 这里的报错会导致 predictor 变回 None
+            print(f"DEBUG: CRITICAL ERROR during loading confidence: {e}")
+            print("[Warning] Failed to setup confidence system. Fallback to random.")
             confidence_predictor = None
             confidence_hook = None
-
+    else:
+        print("DEBUG: Confidence sampling is DISABLED in config.")
     upsampler = None
 
     # 3. 准备数据集与 Memory
@@ -253,9 +268,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
 
     # 外层循环：Buffer Refill (Chunk)
     for chunk_idx, chunk_size in enumerate(chunk_schedule):
-
         chunk_start_time = time.time()
-
         # --- A. Fill Buffer Chunk (Only once per chunk cycle) ---
         print(f"\n[Refill Round {chunk_idx + 1}/{len(chunk_schedule)}] Collecting buffer (Size: {chunk_size})...")
 
@@ -351,7 +364,7 @@ def run_training(cfg: DictConfig) -> Dict[str, str]:
         task_name = "unknown"
 
     ckpt_name = (
-        f"ace-downsample-chunked_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
+        f"ace-full-chunked_task-{task_name}_head-{cfg.model.head_mode}_loss-{cfg.loss.mode}_"
         f"scale-{'on' if cfg.loss.scale_reg.enabled else 'off'}_"
         f"ep{cfg.training.epochs}_buf{total_buffer_samples}.pt"
     )

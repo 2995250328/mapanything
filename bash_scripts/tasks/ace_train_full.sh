@@ -23,7 +23,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         loss.scale_reg.enabled=True \
         loss.scale_reg.variant=unit\
         model.head_mode="ace_homogeneous" \
-        training.device=cuda:0 \
+        training.device=cuda:3 \
         model=mapanything_memory \
         model/task=images_only \
         model.encoder.uses_torch_hub=True \

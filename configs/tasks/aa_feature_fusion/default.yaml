@@ -1,6 +1,6 @@
 # Base configuration for the AA feature fusion task pipeline.
 defaults:
-  - model: map-anything
+  - model: mapanything
   - model/task: single_view_optional_intrinsics
   - dataset: seven_scenes_wai/train/default
   - _self_
