@@ -1,0 +1,97 @@
+defaults:
+  - machine: aws
+  - model: default
+  - dataset: default
+  - _self_
+
+output_dir: ${hydra:run.dir}
+root_data_dir: ${machine.root_data_dir}
+mapanything_dataset_metadata_dir: ${machine.mapanything_dataset_metadata_dir}
+root_pretrained_checkpoints_dir: ${machine.root_pretrained_checkpoints_dir}
+root_experiments_dir: ${machine.root_experiments_dir}
+root_uniception_pretrained_checkpoints_dir: ${machine.root_uniception_pretrained_checkpoints_dir}
+
+model:
+  head_mode: "film"         # film直接得到有尺度结果，Decoupled得到无尺度坐标和尺度信息
+  head_checkpoint: null     # "/path/to/head_only.ckpt" 时启用加载
+  head_strict: false        # 是否严格加载（通常 false 更稳）
+  head_prefixes: ["", "module.", "head.", "reg_head.", "ace_head."]  # 可覆盖
+  # 是否开启基于置信度的特征采样 (CoMe Acceleration)
+  use_confidence_sampling: true
+  # 预训练的置信度预测器权重路径
+  confidence_checkpoint: "/home/xwh/project/CoMe/Model/MapAnything_Accelerator/checkpoint.pth"
+  # 预测器结构配置文件路径
+  confidence_config: "/home/xwh/project/CoMe/Model/MapAnything_Accelerator/config.json"
+
+head:
+  hidden_dim: 256
+  depth: 8
+  # ACE Homogeneous specific params
+  homogeneous_min_scale: 0.01
+  homogeneous_max_scale: 4.0
+
+fusion:
+  stored_feature_file: ???
+  memory_keep_ratio: 1.0
+  memory_efficient_inference: false
+
+training:
+  device: cuda
+  output_dir: ${output_dir}/ace_regression
+  epochs: 64
+  log_interval: 10
+  lr: 1e-4
+  weight_decay: 1e-4
+  batch_size: 5120
+  num_workers: 2
+  buffer_size: 10240000
+  # 每次 Buffer 刷新时的目标样本数量。
+  # 这个参数决定了显存占用峰值和数据随机性的平衡。
+  # 默认: 2000000 (2M)。如果设得太小，IO开销变大；设得太大，显存可能溢出。
+  target_features_per_chunk: 2000000
+  buffer_chunk_size: null
+  samples_per_view: 1024
+  shuffle: true
+  memory_efficient_inference: false
+  # 决定如何从置信度图中选择点。
+  # 'topk': 只选置信度最高的点 (推荐用于 ACE 建图，因为只想要高质量点)
+  # 'weighted': 根据置信度加权随机采样 (保留一定探索性)
+  # 'random': 完全随机 (等同于不开启置信度采样)
+  sampling_mode: "topk"
+
+loss:
+  depth_min: 1.0e-4          # 投影时的最小深度（防止除零）
+  depth_max: 50.0            # 最大深度阈值（过滤远处点）
+  repro_loss_hard_clamp: 100.0  # 重投影误差的硬阈值（像素）
+  depth_target: 10.0         # 无效样本 proxy 的常数深度（米）
+  # 选择误差类型：'reproj'（重投影）或 'xyz'（3D点）
+  mode: reproj
+#  mode: xyz
+  # 置信通道解释：'log_sigma'（推荐，raw -> softplus -> sigma）或 'confidence'（raw->sigmoid=p，再映射到sigma区间）
+  conf_mode: log_sigma
+  # sigma 的下/上界，防止除零或数值爆炸
+  sigma_min: 1.0e-4
+  sigma_max: 10.0
+  # 数值微调项：softplus 与 log 的稳定项
+  eps: 1.0e-8
+  repro_loss_soft_clamp: 50
+  repro_loss_soft_clamp_min: 1
+  repro_loss_type: "dyntanh"  # choices=["l1", "l1+sqrt", "l1+log", "tanh", "dyntanh"]
+  repro_loss_schedule: "circle"  # choices=['circle', 'linear']
+  scale_reg:
+    enabled: true
+    variant: match_to_gt   # 或 unit / prior
+    weight: 1.0e-3
+    depth_prior: 1.0       # 仅 variant=prior 时使用
+
+seed: 0
+# Disable CUDNN Benchmark (Disable for variable resolution & number of view training)
+disable_cudnn_benchmark: true
+# Batch size for inference (Metrics are computed per multi-view set and averaged, not per batch of multi-view sets)
+batch_size: 10
+# Use mixed precision for inference
+amp: 1
+# Floating point type to use for mixed precision
+amp_dtype: "bf16"
+# 显存优化
+memory_efficient_inference: False

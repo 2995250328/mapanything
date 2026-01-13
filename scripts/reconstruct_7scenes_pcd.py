@@ -38,11 +38,11 @@ from mapanything.models import init_model
 from mapanything.utils.geometry import geotrf, inv
 
 # --- 按照你的要求，从 base_dataset 导入自定义 Loader ---
-# (请确保你已完成了步骤 1，将该类添加到了 mapanything/datasets/base/base_dataset.py)
+# (请确保你已完成了步骤 1，将该类添加到了 map-anything/datasets/base/base_dataset.py)
 try:
     from mapanything.datasets.base.base_dataset import ForcedRandomDataLoader
 except ImportError:
-    print("[ERROR] 无法导入 ForcedRandomDataLoader。请确保你已将其添加到 mapanything/datasets/base/base_dataset.py 中。")
+    print("[ERROR] 无法导入 ForcedRandomDataLoader。请确保你已将其添加到 map-anything/datasets/base/base_dataset.py 中。")
     exit(1)
 
 
@@ -105,7 +105,7 @@ def main(args):
     print(f"[INFO] Loader prepared. Will yield {len(loader)} batches from scene '{args.scene}'.")
 
     # 3. 初始化模型
-    model = init_model(model_str="mapanything", model_config="images_only", torch_hub_force_reload=False)
+    model = init_model(model_str="map-anything", model_config="images_only", torch_hub_force_reload=False)
     state_dict = torch.load(args.ckpt, map_location='cpu')
     if "model" in state_dict: state_dict = state_dict["model"]
     model.load_state_dict({k.replace("module.", ""): v for k, v in state_dict.items()}, strict=False)

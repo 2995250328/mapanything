@@ -12,7 +12,7 @@
 
 ```bash
 export DATA_ROOT=/mnt/storage/xwh/7Scenes
-export WAI_ROOT=/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes
+export WAI_ROOT=/mnt/storage/xwh/map-anything-dataset/wai_data/7scenes
 export CONDA_ENV=wai_processing
 mkdir -p "$DATA_ROOT" "$WAI_ROOT"
 ```
@@ -90,7 +90,7 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
 可以直接调用数据集类的 CLI 检查统计信息，确认路径与元数据可用：
 
 ```bash
-python -m mapanything.datasets.wai.seven_scenes \
+python -m map-anything.datasets.wai.seven_scenes \
     --root_dir "$WAI_ROOT" \
     --split test \
     --num_of_views 2
@@ -109,8 +109,8 @@ python -m mapanything.datasets.wai.seven_scenes \
 ```bash
 python benchmarking/dense_n_view/benchmark.py \
     dataset=benchmark_518_seven_scenes \
-    model=mapanything \
-    model.mapanything.checkpoint_path=/path/to/mapanything.ckpt \
+    model=map-anything \
+    model.map-anything.checkpoint_path=/path/to/map-anything.ckpt \
     root_data_dir="$WAI_ROOT" \
     machine.mapanything_dataset_metadata_dir=null \
     dataset.num_views=2
@@ -132,7 +132,7 @@ python scripts/train.py \
     dataset.resolution_val="${dataset.resolution_options.512_4_3_ar}" \
     root_data_dir="$WAI_ROOT" \
     machine.mapanything_dataset_metadata_dir=null \
-    model=mapanything \
+    model=map-anything \
     optimizer=adamw \
     training.max_steps=20000
 ```

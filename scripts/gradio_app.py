@@ -39,7 +39,7 @@ from mapanything.utils.image import load_images, rgb
 
 register_heif_opener()
 
-sys.path.append("mapanything/")
+sys.path.append("map-anything/")
 
 
 def get_logo_base64():
@@ -58,12 +58,12 @@ def get_logo_base64():
 
 # MapAnything Configuration
 high_level_config = {
-    "path": "configs/train.yaml",
+    "path": "configs/ace_train.yaml",
     "hf_model_name": "facebook/map-anything",
-    "model_str": "mapanything",
+    "model_str": "map-anything",
     "config_overrides": [
         "machine=aws",
-        "model=mapanything",
+        "model=map-anything",
         "model/task=images_only",
         "model.encoder.uses_torch_hub=false",
     ],

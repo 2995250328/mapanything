@@ -10,17 +10,24 @@ mapanything_dataset_metadata_dir: ${machine.mapanything_dataset_metadata_dir}
 root_pretrained_checkpoints_dir: ${machine.root_pretrained_checkpoints_dir}
 root_experiments_dir: ${machine.root_experiments_dir}
 root_uniception_pretrained_checkpoints_dir: ${machine.root_uniception_pretrained_checkpoints_dir}
-device: cuda:1
+device: cuda
 
 fusion:
-  stored_feature_file: ???  # 必须在命令行指定
+  stored_feature_file: ???
+  memory_keep_ratio: 1.0
+  memory_efficient_inference: false
 
-# [Pipeline 参数 (默认值)]
-single_view:
-  include_intrinsics: True
-  include_depth: False
-  include_pose: True
-  include_scale: False
+loss:
+  reprojection_weight: 1.0
+  xyz_weight: 0.1
+  confidence_weight: 1.0
+
+head:
+  type: "decoulped"
+  hidden_dim: 256
+  in_channels: 768
+  token_dim: 768
+  checkpoint: "/home/xwh/project/map-anything-experiments/mapanything/memory/ace_dataset/ace_regression/no_info_ace-queryonly_task-images_only_head-film_loss-reproj_scale-off_var-match_to_gt_ep48_buf8196000.pt"
 
 seed: 0
 # Disable CUDNN Benchmark (Disable for variable resolution & number of view training)
@@ -33,3 +40,4 @@ amp: 1
 amp_dtype: "bf16"
 # 显存优化
 memory_efficient_inference: False
+

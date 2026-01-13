@@ -313,7 +313,7 @@ def benchmark(args):
     print("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(", ", ",\n"))
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
     # Fix the seed
@@ -346,7 +346,7 @@ def benchmark(args):
         dataset.split("(")[0]: build_dataset(
             dataset, args.batch_size, args.dataset.num_workers
         )
-        for dataset in args.dataset.test_dataset.split("+")
+        for dataset in args.dataset.train_dataset.split("+")
         if "(" in dataset
     }# 这里得到的是一个字典，键是场景的名称，值是对应的dataset
 
@@ -390,7 +390,7 @@ def benchmark(args):
             }
 
         # Loop over the batches
-        for batch in data_loader:
+        for loader_idx, batch in enumerate(data_loader):
             n_views = len(batch)
             # Remove unnecessary indices
             for view in batch:
@@ -401,7 +401,19 @@ def benchmark(args):
             # 提取场景标签 (例如 'chess')
             scene_name = batch[0].get("label", ["unknown"])[0]
             if isinstance(scene_name, torch.Tensor): scene_name = scene_name.item()
-            current_save_filename = f"{ds_name}_{scene_name}_{n_views}v_intermediates.pt"
+            # ========================= 新增：打印文件名 =========================
+            print(f"\n[Debug] Processing Batch: Dataset={ds_name}, Scene={scene_name}, Views={n_views}")
+            for i, view in enumerate(batch):
+                # 获取 instance 字段，它通常包含文件名或相对路径
+                file_path = view.get("instance", ["unknown"])
+
+                # DataLoader 可能会把字符串打包成列表 (例如 ['path/to/img.jpg'])，这里解包取第一个
+                if isinstance(file_path, (list, tuple)):
+                    file_path = file_path[0]
+
+                print(f"  View {i}: {file_path}")
+            # ===================================================================
+            current_save_filename = f"{ds_name}_{scene_name}_{n_views}v_batch{loader_idx:04d}_intermediates.pt"
             current_save_filename = current_save_filename.replace("/", "_").replace(" ", "")
 
             # Transfer batch to device

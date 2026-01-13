@@ -85,8 +85,8 @@ git clone https://github.com/facebookresearch/map-anything.git
 cd map-anything
 
 # Create and activate conda environment
-conda create -n mapanything python=3.12 -y
-conda activate mapanything
+conda create -n map-anything python=3.12 -y
+conda activate map-anything
 
 # Optional: Install torch, torchvision & torchaudio specific to your system
 # Install MapAnything
@@ -275,7 +275,7 @@ views_example = [
 
 Note that MapAnything expects the input camera poses to follow the OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world convention.
 
-<!-- TODO: We provide a helper function `mapanything.utils.geometry.convert_cam_convention` to convert from other conventions to OpenCV (see the function in [geometry utils](./mapanything/utils/geometry.py) for more details). -->
+<!-- TODO: We provide a helper function `map-anything.utils.geometry.convert_cam_convention` to convert from other conventions to OpenCV (see the function in [geometry utils](./map-anything/utils/geometry.py) for more details). -->
 
 <details>
 <summary>Expand to show more examples</summary>

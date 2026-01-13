@@ -57,7 +57,7 @@ bash bash_scripts/data_processing/seven_scenes_to_wai.sh \
     --moge-batch-size 8 \
     --moge-model Ruicheng/moge-2-vitl-normal \
     /mnt/storage/xwh/7Scenes \
-    /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
+    /mnt/storage/xwh/map-anything-dataset/wai_data/7scenes \
     wai_processing
 ```
 

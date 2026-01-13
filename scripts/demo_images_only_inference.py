@@ -166,7 +166,7 @@ def main():
         viz_string = "MapAnything_Visualization"
         rr.script_setup(args, viz_string)
         rr.set_time("stable_time", sequence=0)
-        rr.log("mapanything", rr.ViewCoordinates.RDF, static=True)
+        rr.log("map-anything", rr.ViewCoordinates.RDF, static=True)
 
     # Loop through the outputs
     for view_idx, pred in enumerate(outputs):
@@ -201,8 +201,8 @@ def main():
                 intrinsics=intrinsics_torch.cpu().numpy(),
                 pts3d=pts3d_np,
                 mask=mask,
-                base_name=f"mapanything/view_{view_idx}",
-                pts_name=f"mapanything/pointcloud_view_{view_idx}",
+                base_name=f"map-anything/view_{view_idx}",
+                pts_name=f"map-anything/pointcloud_view_{view_idx}",
                 viz_mask=mask,
             )
 

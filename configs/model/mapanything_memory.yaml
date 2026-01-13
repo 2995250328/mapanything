@@ -15,7 +15,7 @@ model_config:
   pred_head_config: ${model.pred_head}
   geometric_input_config: ${model.task}
   # Toggle caching of alternating-attention features from MapAnything's info-sharing transformer.
-  store_info_sharing_intermediate_features: false
+  store_info_sharing_intermediate_features: False
   # Optional device where cached info-sharing tensors should be moved (e.g., "cpu").
   info_sharing_storage_device: null
   # Optional directory where cached info-sharing tensors should be serialized to disk.

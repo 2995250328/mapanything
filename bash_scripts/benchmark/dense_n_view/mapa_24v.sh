@@ -19,7 +19,7 @@ export HYDRA_FULL_ERROR=1
 #    "1 100 benchmark_518_eth3d_snpp_tav2"
 #)
 batch_sizes_and_views=(
-    "2 4 benchmark_518_eth3d_snpp_tav2"
+    "1 4 benchmark_518_seven_scenes"
 )
 
 # Loop through each combination
@@ -41,7 +41,7 @@ for combo in "${batch_sizes_and_views[@]}"; do
         model.encoder.uses_torch_hub=True \
         model.pretrained='${root_pretrained_checkpoints_dir}/facebook_map-anything.pth' \
         +model.memory_efficient_inference=True \
-        hydra.run.dir='${root_experiments_dir}/mapanything/benchmarking/dense_'"${num_views}"'_view/mapa_24v'
+        hydra.run.dir='${root_experiments_dir}/map-anything/benchmarking/dense_'"${num_views}"'_view/mapa_24v'
 
     echo "Finished running $dataset with batch_size=$batch_size and num_views=$num_views"
 done

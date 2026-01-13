@@ -1,6 +1,9 @@
 dataset_str:
   "SevenScenesWAI(
     split='${dataset.seven_scenes_wai.test.split}',
+    sample_specific_scene='${oc.select:dataset.sample_specific_scene, False}',
+    specific_scene_name='${oc.select:dataset.specific_scene_name_test, None}',
+    sequential_view_mode=${oc.select:dataset.sequential_view_mode, None},
     resolution=${dataset.seven_scenes_wai.test.dataset_resolution},
     principal_point_centered=${dataset.seven_scenes_wai.test.principal_point_centered},
     seed=${dataset.seven_scenes_wai.test.seed},
@@ -12,7 +15,7 @@ dataset_str:
     num_views=${dataset.seven_scenes_wai.test.num_views},
     covisibility_thres=${dataset.seven_scenes_wai.test.covisibility_thres})"
 split: 'test'
-dataset_resolution: ${dataset.resolution_options.518_1_33_ar}
+dataset_resolution: ${dataset.resolution_test_seven_scenes}
 principal_point_centered: ${dataset.principal_point_centered}
 seed: 777
 transform: 'imgnorm'
